@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { canPlace, ghostPiece, rotateWithKicks, kicksFor, spawnTetromino } from 'miaoda-game-fallblock-core';
-import { Game, HEIGHT, WIDTH, placementsFor, refreshPlacement, scoreClear } from '../shared/game.ts';
+import { Game, HEIGHT, WIDTH, placementsFor, refreshPlacement, scoreClear, tokenLabel, tokenShape } from '../shared/game.ts';
 import type { Cell } from '../shared/game.ts';
 
 test('the board is ten columns by twenty visible rows and two spawn rows', () => {
@@ -21,6 +21,56 @@ test('every seven-bag contains all seven pieces with deterministic seeding', () 
   assert.deepEqual(pieces, replayed);
   assert.equal(new Set(pieces.slice(0, 7)).size, 7);
   assert.equal(new Set(pieces.slice(7, 14)).size, 7);
+});
+
+test('text tokens determine labeled piece order, repeat, and survive replay', () => {
+  const tokens = [{ id: 24912, text: 'hello' }, { id: 2375, text: ' world' }, { id: 0, text: '!' }];
+  const game = new Game('token-run', tokens);
+  assert.equal(game.piece, tokenShape(tokens[0].id));
+  assert.deepEqual(game.view().activeToken, tokens[0]);
+  assert.deepEqual(game.view().nextTokens, [tokens[1], tokens[2], tokens[0], tokens[1], tokens[2]]);
+  for (let index = 0; index < 4; index += 1) {
+    assert.deepEqual(game.view().activeToken, tokens[index % tokens.length]);
+    game.act('hardDrop');
+  }
+  assert.equal(game.view().tokenBoard.filter(index => index === 0).length, 4);
+  assert.deepEqual(Game.restore(game.replay()).view(), game.view());
+  assert.equal(tokenLabel(' hi\n'), '\u2423hi\\n');
+  assert.equal(tokenLabel(' '.repeat(128)), '128 spaces');
+  assert.throws(() => new Game('invalid', [{ id: -1, text: 'bad' }]));
+});
+
+test('hold transfers token identity without consuming or relabeling the wrong token', () => {
+  const tokens = [{ id: 7, text: 'first' }, { id: 8, text: 'second' }, { id: 9, text: 'third' }];
+  const game = new Game('token-hold', tokens);
+  game.act('hold');
+  assert.deepEqual(game.view().holdToken, tokens[0]);
+  assert.deepEqual(game.view().activeToken, tokens[1]);
+  game.act('hardDrop');
+  game.act('hold');
+  assert.deepEqual(game.view().activeToken, tokens[0]);
+  assert.deepEqual(game.view().holdToken, tokens[2]);
+  assert.equal(game.tokensTaken, 3);
+  game.act('hardDrop');
+  assert.deepEqual(Game.restore(game.replay()).view(), game.view());
+});
+
+test('clearing rows moves the token labels with their surviving cells', () => {
+  const game = new Game('token-clear', [{ id: 0, text: 'label' }]);
+  for (let row = HEIGHT - 4; row < HEIGHT; row += 1) {
+    for (let column = 0; column < WIDTH; column += 1) if (column !== 4) {
+      game.well.set(column, row, 'J');
+      game.tokenWell.set(column, row, 50);
+    }
+  }
+  game.well.set(0, HEIGHT - 5, 'T');
+  game.tokenWell.set(0, HEIGHT - 5, 99);
+  const spawned = spawnTetromino<Cell>('I', 'I', 2, 1);
+  game.active = { ...spawned, rot: 1, cells: spawned.orientations![1] };
+  game.act('hardDrop');
+  assert.equal(game.lines, 4);
+  assert.equal(game.tokenWell.get(0, HEIGHT - 1), 99);
+  assert.equal(game.tokenWell.toArray().filter(index => index !== null).length, 1);
 });
 
 test('I uses SRS kicks when rotating away from the left wall', () => {

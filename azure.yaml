@@ -1,7 +1,27 @@
 name: tokenfall
 metadata:
-  template: tokenfall-local-first
+  template: tokenfall-container-apps
 infra:
   provider: bicep
   path: infra
   module: main
+services:
+  web:
+    project: .
+    language: docker
+    host: containerapp
+    docker:
+      path: Dockerfile
+      context: .
+      platform: linux/amd64
+    hooks:
+      prepackage:
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          npm ci
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          npm --prefix web ci
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          npm run build
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }

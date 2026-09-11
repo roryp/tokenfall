@@ -3,12 +3,12 @@ import { existsSync, mkdirSync, readFileSync } from 'node:fs';
 import path from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { Game, FPS, placementsFor } from '../shared/game.ts';
-import { emptyMetrics } from '../shared/protocol.ts';
-import type { AiOptions, InputAck, InputBatch, JoinResult, LeaderboardEntry, Metrics, RoomView } from '../shared/protocol.ts';
+import { costForUsage, emptyMetrics, pointsPerCent, tokenCreditsUsed } from '../shared/protocol.ts';
+import type { AiOptions, InputAck, InputBatch, JoinResult, LeaderboardEntry, Metrics, RoomView, TokenPricing } from '../shared/protocol.ts';
 import type { AppConfig } from './config.ts';
-import { AI_COOLDOWN_MS, MAX_OUTPUT_TOKENS, ModelGate, PLAYER_TOKEN_BUDGET, PREFIX_TOKENS, ROOM_TOKEN_BUDGET, RequestError } from './model.ts';
+import { AI_COOLDOWN_MS, AUTOPILOT_COOLDOWN_MS, MAX_OUTPUT_TOKENS, ModelGate, PLAYER_TOKEN_BUDGET, PREFIX_TOKENS, ROOM_TOKEN_BUDGET, RequestError } from './model.ts';
 import type { ModelGateway } from './model.ts';
-import { addUsage, buildPrompts } from './tokens.ts';
+import { addUsage, buildPrompts, gameTokens } from './tokens.ts';
 
 interface PlayerRecord {
   id: string;
@@ -20,6 +20,7 @@ interface PlayerRecord {
   metrics: string;
   attempts: number;
   updated: number;
+  token_text: string;
 }
 export interface Player {
   record: PlayerRecord;
@@ -39,6 +40,7 @@ export class Room {
   players = new Map<string, Player>();
   code: string;
   gate = new ModelGate();
+  pricing: TokenPricing = { status: 'loading', snapshot: null };
   config: AppConfig;
   gateway: ModelGateway;
 
@@ -48,16 +50,18 @@ export class Room {
     mkdirSync(config.dataDirectory, { recursive: true });
     this.database = new DatabaseSync(path.join(config.dataDirectory, 'tokenfall.sqlite'));
     this.database.exec(`
-      PRAGMA journal_mode = WAL;
-      PRAGMA synchronous = NORMAL;
+      PRAGMA journal_mode = ${config.sqliteJournalMode ?? 'WAL'};
+      PRAGMA synchronous = ${config.sqliteJournalMode === 'DELETE' ? 'FULL' : 'NORMAL'};
+      PRAGMA busy_timeout = 5000;
       CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS players (
         id TEXT PRIMARY KEY, token_hash TEXT NOT NULL UNIQUE, name TEXT NOT NULL,
         best_score INTEGER NOT NULL DEFAULT 0, best_lines INTEGER NOT NULL DEFAULT 0,
         best_level INTEGER NOT NULL DEFAULT 1, metrics TEXT NOT NULL, attempts INTEGER NOT NULL DEFAULT 0,
-        updated INTEGER NOT NULL
+        updated INTEGER NOT NULL, token_text TEXT NOT NULL DEFAULT ''
       );
     `);
+    if (!this.database.prepare('PRAGMA table_info(players)').all().some(column => column.name === 'token_text')) this.database.exec("ALTER TABLE players ADD COLUMN token_text TEXT NOT NULL DEFAULT ''");
     const saved = this.database.prepare("SELECT value FROM settings WHERE key = 'room'").get() as { value: string } | undefined;
     this.code = saved?.value ?? randomBytes(3).toString('hex').toUpperCase();
     if (!saved) this.database.prepare("INSERT INTO settings (key, value) VALUES ('room', ?)").run(this.code);
@@ -69,11 +73,11 @@ export class Room {
   save(player: Player) {
     player.record.metrics = JSON.stringify(player.metrics);
     const record = player.record;
-    this.database.prepare(`INSERT INTO players (id, token_hash, name, best_score, best_lines, best_level, metrics, attempts, updated)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    this.database.prepare(`INSERT INTO players (id, token_hash, name, best_score, best_lines, best_level, metrics, attempts, updated, token_text)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       ON CONFLICT(id) DO UPDATE SET name=excluded.name, best_score=excluded.best_score, best_lines=excluded.best_lines,
-      best_level=excluded.best_level, metrics=excluded.metrics, attempts=excluded.attempts, updated=excluded.updated`)
-      .run(record.id, record.token_hash, record.name, record.best_score, record.best_lines, record.best_level, record.metrics, record.attempts, record.updated);
+      best_level=excluded.best_level, metrics=excluded.metrics, attempts=excluded.attempts, updated=excluded.updated, token_text=excluded.token_text`)
+      .run(record.id, record.token_hash, record.name, record.best_score, record.best_lines, record.best_level, record.metrics, record.attempts, record.updated, record.token_text);
   }
 
   totals() {
@@ -87,7 +91,12 @@ export class Room {
     return { metrics, attempts };
   }
 
-  join(name: string, code: string, token: string | undefined, socketId: string): JoinResult {
+  gameFor(text: string) {
+    try { return new Game(`tokenfall:${this.code}`, text ? gameTokens(text) : []); }
+    catch { throw new RequestError('Use 1 to 500 characters and at most 256 tokens.', 'token-setup'); }
+  }
+
+  join(name: string, code: string, token: string | undefined, socketId: string, text?: string): JoinResult {
     if (code !== this.code) throw new RequestError('That room code is not active.', 'room');
     const now = Date.now();
     for (const [id, player] of this.players) if (!player.socketId && now - player.lastSeen > 15 * 60000) this.players.delete(id);
@@ -102,10 +111,11 @@ export class Room {
     if (!player?.socketId && this.online >= 50) throw new RequestError('The room has 50 players. A spot opens when someone leaves.', 'full');
     if (!record) {
       if (this.records().length >= 500) throw new RequestError('This workshop has reached its registration limit.', 'full');
-      record = { id: randomUUID(), token_hash: tokenHash, name, best_score: 0, best_lines: 0, best_level: 1, metrics: JSON.stringify(emptyMetrics()), attempts: 0, updated: now };
+      if (text !== undefined && text.length === 0) throw new RequestError('Enter some text to make your token blocks.', 'token-setup');
+      record = { id: randomUUID(), token_hash: tokenHash, name, best_score: 0, best_lines: 0, best_level: 1, metrics: JSON.stringify(emptyMetrics()), attempts: 0, updated: now, token_text: text ?? '' };
     }
     if (!player) {
-      player = { record, metrics: JSON.parse(record.metrics), game: new Game(`tokenfall:${this.code}`), runId: randomUUID(), started: now, sequence: 0, socketId: null, lastSeen: now, inputWindow: now, inputCount: 0 };
+      player = { record, metrics: JSON.parse(record.metrics), game: this.gameFor(record.token_text), runId: randomUUID(), started: now, sequence: 0, socketId: null, lastSeen: now, inputWindow: now, inputCount: 0 };
       this.players.set(record.id, player);
     }
     player.socketId = socketId;
@@ -115,7 +125,7 @@ export class Room {
   }
 
   joinResult(player: Player, token = ''): JoinResult {
-    return { token, playerId: player.record.id, name: player.record.name, runId: player.runId, sequence: player.sequence, replay: player.game.replay(), metrics: { ...player.metrics } };
+    return { token, playerId: player.record.id, name: player.record.name, runId: player.runId, sequence: player.sequence, replay: player.game.replay(), metrics: { ...player.metrics }, tokenText: player.record.token_text };
   }
 
   playerFor(socketId: string) {
@@ -165,15 +175,19 @@ export class Room {
     return { sequence: player.sequence, score: player.game.score, lines: player.game.lines, pieceId: player.game.pieceId, frame: player.game.frame };
   }
 
-  restart(player: Player) {
+  restart(player: Player, text?: string) {
     const now = Date.now();
     if (now - player.started < 2000) throw new RequestError('Wait a moment before restarting.', 'cooldown', 2000);
-    player.game = new Game(`tokenfall:${this.code}`);
+    if (text !== undefined && text.length === 0) throw new RequestError('Enter some text to make your token blocks.', 'token-setup');
+    const tokenText = text ?? player.record.token_text;
+    player.game = this.gameFor(tokenText);
+    player.record.token_text = tokenText;
     player.runId = randomUUID();
     player.started = now;
     player.sequence = 0;
     player.inputCount = 0;
     player.inputWindow = now;
+    this.save(player);
     return this.joinResult(player);
   }
 
@@ -183,7 +197,7 @@ export class Room {
     if (player.record.attempts >= 40 || totals.attempts >= 1000) throw new RequestError('The AI request allowance is used. Manual play is still available.', 'budget');
     const prompts = buildPrompts(player.game, placementsFor(player.game));
     const reservation = PREFIX_TOKENS + (options.compression ? prompts.packedTokens : prompts.rawTokens) + MAX_OUTPUT_TOKENS + 1024;
-    const release = this.gate.acquire(player.record.id, reservation, player.metrics.input + player.metrics.output, totals.metrics.input + totals.metrics.output);
+    const release = this.gate.acquire(player.record.id, reservation, tokenCreditsUsed(player.metrics), totals.metrics.input + totals.metrics.output, Date.now(), options.autopilot);
     const runId = player.runId;
     player.record.attempts += 1;
     this.save(player);
@@ -217,14 +231,24 @@ export class Room {
   }
 
   view(): RoomView {
-    const leaderboard: LeaderboardEntry[] = this.records().slice(0, 50).map(record => ({
-      id: record.id, name: record.name, score: record.best_score, lines: record.best_lines, level: record.best_level,
-      online: Boolean(this.players.get(record.id)?.socketId), metrics: JSON.parse(record.metrics),
-    }));
+    const rates = this.pricing.snapshot?.usdPerMillion;
+    const totals = this.totals();
+    const leaderboard: LeaderboardEntry[] = this.records().map(record => {
+      const metrics = JSON.parse(record.metrics) as Metrics;
+      const unmeteredRequests = Math.max(0, record.attempts - metrics.requests);
+      const costUsd = rates ? costForUsage(metrics, rates).total : null;
+      return {
+        id: record.id, name: record.name, score: record.best_score, costUsd, unmeteredRequests,
+        challengeScore: costUsd !== null && unmeteredRequests === 0 ? pointsPerCent(record.best_score, costUsd) : null,
+        lines: record.best_lines, level: record.best_level, online: Boolean(this.players.get(record.id)?.socketId), metrics,
+      };
+    }).sort((first, second) => (second.challengeScore ?? -1) - (first.challengeScore ?? -1) || second.score - first.score || second.lines - first.lines).slice(0, 50);
     return {
-      code: this.code, online: this.online, capacity: 50, leaderboard, metrics: this.totals().metrics,
+      code: this.code, online: this.online, capacity: 50, leaderboard, metrics: totals.metrics,
       joinUrl: this.publicUrl(), model: this.config.deployment, prefixTokens: PREFIX_TOKENS,
       tokenBudget: ROOM_TOKEN_BUDGET, playerTokenBudget: PLAYER_TOKEN_BUDGET,
+      pricing: this.pricing, unmeteredRequests: Math.max(0, totals.attempts - totals.metrics.requests),
+      aiCooldownMs: AI_COOLDOWN_MS, autopilotCooldownMs: AUTOPILOT_COOLDOWN_MS,
     };
   }
 

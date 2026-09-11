@@ -1,9 +1,9 @@
 import { startTransition, useEffect, useEffectEvent, useRef, useState } from 'react';
 import { io } from 'socket.io-client';
 import type { Socket } from 'socket.io-client';
-import { Game, FPS, refreshPlacement } from '../../shared/game.ts';
+import { DEFAULT_TOKEN_TEXT, Game, FPS, refreshPlacement } from '../../shared/game.ts';
 import type { Action, GameView } from '../../shared/game.ts';
-import { emptyMetrics } from '../../shared/protocol.ts';
+import { costForUsage, emptyMetrics, pointsPerCent } from '../../shared/protocol.ts';
 import type { AiOptions, ClientEvents, Insight, InputAck, InputBatch, JoinResult, Metrics, Reply, RoomView, ServerEvents } from '../../shared/protocol.ts';
 
 type GameSocket = Socket<ServerEvents, ClientEvents>;
@@ -29,7 +29,18 @@ export function useGame() {
   const [busy, setBusy] = useState(false);
   const [cooldownUntil, setCooldownUntil] = useState(0);
   const [notice, setNotice] = useState('');
-  const [options, setOptions] = useState<AiOptions>({ cache: true, compression: true });
+  const [options, setOptions] = useState<AiOptions>({ cache: false, compression: false });
+  const [tokenText, setTokenText] = useState(DEFAULT_TOKEN_TEXT);
+  const configuredTokenText = useRef(DEFAULT_TOKEN_TEXT);
+  const [editingTokens, setEditingTokens] = useState(false);
+  const [autopilot, setAutopilot] = useState(false);
+  const [pilotStatus, setPilotStatus] = useState('Manual control');
+  const [requestOptions, setRequestOptions] = useState<AiOptions | null>(null);
+  const pilotActive = useRef(false);
+  const pilotEpoch = useRef(0);
+  const requestPending = useRef(false);
+  const requestSerial = useRef(0);
+  const lastRequestAt = useRef(0);
   const socket = useRef<GameSocket | null>(null);
   const game = useRef<Game | null>(null);
   const roomRef = useRef<RoomView | null>(null);
@@ -47,8 +58,43 @@ export function useGame() {
 
   function refresh() { if (game.current) setView(game.current.view()); }
 
+  function stopAutopilot(message = 'Manual control') {
+    pilotActive.current = false;
+    pilotEpoch.current += 1;
+    setAutopilot(false);
+    setPilotStatus(message);
+  }
+
+  function toggleAutopilot(enabled: boolean) {
+    if (!enabled) {
+      stopAutopilot(requestPending.current ? 'Stopped. The in-flight request still counts toward cost.' : 'Stopped. Resume for manual play.');
+      if (game.current?.status === 'playing') { game.current.act('pause'); refresh(); void flush(); }
+      return;
+    }
+    if (!active.current || !socket.current?.connected || !game.current || game.current.status === 'over' || editingTokens) return;
+    pilotEpoch.current += 1;
+    pilotActive.current = true;
+    setAutopilot(true);
+    setPilotStatus('Luna is driving');
+    setNotice('');
+    if (game.current.status === 'playing') game.current.act('pause');
+    setCooldownUntil(lastRequestAt.current + (roomRef.current?.autopilotCooldownMs ?? 1000));
+    refresh();
+    void flush();
+  }
+
   function installSession(data: JoinResult) {
+    stopAutopilot();
+    requestSerial.current += 1;
+    requestPending.current = false;
+    setBusy(false);
+    setRequestOptions(null);
+    const needsTokenSetup = !data.replay.tokens?.length;
+    setEditingTokens(needsTokenSetup);
+    setTokenText(data.tokenText || DEFAULT_TOKEN_TEXT);
+    configuredTokenText.current = data.tokenText || DEFAULT_TOKEN_TEXT;
     game.current = Game.restore(data.replay);
+    if (needsTokenSetup && game.current.status === 'playing') game.current.act('pause');
     runId.current = data.runId;
     sequence.current = data.sequence;
     sentEvents.current = data.replay.events.length;
@@ -66,6 +112,7 @@ export function useGame() {
 
   function resync(message: string) {
     if (!active.current) return;
+    stopAutopilot('Stopped because the connection changed.');
     active.current = false;
     reconnectMessage.current = message;
     setNotice(message);
@@ -109,6 +156,10 @@ export function useGame() {
 
   function act(action: Action) {
     if (!active.current || !game.current || !socket.current?.connected) return;
+    if (pilotActive.current) {
+      if (action !== 'pause') return;
+      stopAutopilot('Stopped. Resume for manual play.');
+    }
     const accepted = game.current.act(action);
     if (accepted) refresh();
     if (action === 'hardDrop' || action === 'hold' || action === 'pause' || action === 'resume') void flush();
@@ -121,7 +172,7 @@ export function useGame() {
     setJoining(true);
     setNotice('');
     const requestedCode = new URLSearchParams(window.location.search).get('room') ?? roomRef.current.code;
-    socket.current.timeout(8000).emit('join', { name: chosenName, room: session?.room ?? requestedCode, ...(session ? { token: session.token } : {}) }, (error: Error | null, reply: Reply<JoinResult>) => {
+    socket.current.timeout(8000).emit('join', { name: chosenName, room: session?.room ?? requestedCode, ...(session ? { token: session.token } : { text: tokenText }) }, (error: Error | null, reply: Reply<JoinResult>) => {
       autoJoining.current = false;
       if (error) { setJoining(false); setNotice('The room did not answer. Try joining again.'); return; }
       if (!reply.ok) {
@@ -136,57 +187,111 @@ export function useGame() {
     });
   }
 
-  async function assist() {
-    if (busy || !game.current || !active.current) return;
+  async function assist(automatic = false) {
+    if (requestPending.current || Date.now() < cooldownUntil || !game.current || !active.current || !socket.current?.connected) return;
+    if (automatic && (!pilotActive.current || document.hidden)) return;
     if (game.current.status === 'over') { setNotice('Start a new game before asking Luna.'); return; }
+    requestPending.current = true;
+    const serial = ++requestSerial.current;
+    const epoch = pilotEpoch.current;
+    const selectedOptions = { cache: options.cache, compression: options.compression, autopilot: automatic };
+    setRequestOptions(selectedOptions);
     setBusy(true);
     setNotice('');
     const originalRun = runId.current;
-    if (!await flushAll()) { setBusy(false); return; }
-    setCooldownUntil(Date.now() + 8000);
-    socket.current!.timeout(25000).emit('assist', options, (error: Error | null, response: Reply<{ insight: Insight; metrics: Metrics }>) => {
+    if (automatic && game.current.status === 'playing') { game.current.act('pause'); refresh(); }
+    if (!await flushAll() || serial !== requestSerial.current || originalRun !== runId.current || (automatic && (!pilotActive.current || epoch !== pilotEpoch.current))) {
+      if (serial === requestSerial.current) { requestPending.current = false; setBusy(false); setRequestOptions(null); }
+      return;
+    }
+    lastRequestAt.current = Date.now();
+    const delay = automatic ? roomRef.current?.autopilotCooldownMs ?? 1000 : roomRef.current?.aiCooldownMs ?? 8000;
+    setCooldownUntil(lastRequestAt.current + delay);
+    if (automatic) setPilotStatus('Luna is choosing the next landing');
+    socket.current!.timeout(25000).emit('assist', selectedOptions, (error: Error | null, response: Reply<{ insight: Insight; metrics: Metrics }>) => {
+      if (serial !== requestSerial.current) return;
+      requestPending.current = false;
+      setRequestOptions(null);
       setBusy(false);
-      if (error) { setNotice('Luna took too long. Keep playing; usage will sync with the room.'); return; }
+      if (error) { stopAutopilot('Stopped after a timeout. Usage may still be charged.'); setNotice('Luna took too long. Keep playing; usage will sync with the room.'); return; }
       if (!response.ok) {
         setNotice(response.error);
         if (response.retryAfterMs) setCooldownUntil(Date.now() + response.retryAfterMs);
+        if (response.code !== 'busy' && response.code !== 'cooldown') stopAutopilot(`Stopped: ${response.error}`);
+        else if (pilotActive.current) setPilotStatus('Waiting for the room request slot');
         return;
       }
       setMetrics(response.data.metrics);
       const insight = response.data.insight;
       if (originalRun !== runId.current || game.current?.pieceId !== insight.pieceId) insight.status = 'stale';
       setInsights(current => [insight, ...current].slice(0, 12));
+      if (automatic && pilotActive.current && epoch === pilotEpoch.current && !document.hidden) {
+        if (!applyInsight(insight)) { stopAutopilot('Stopped: the model move could not be applied.'); return; }
+        if (game.current?.status === 'over') stopAutopilot('Run complete');
+        else setPilotStatus('Move played. Preparing the next request.');
+      }
     });
   }
 
-  function applySuggestion() {
-    if (!currentInsight?.placement || !game.current || game.current.status === 'over' || currentInsight.status !== 'ready') return;
-    if (currentInsight.pieceId !== game.current.pieceId) { setNotice('That move belongs to a previous piece.'); return; }
-    const refreshed = refreshPlacement(game.current, currentInsight.placement);
-    if (!refreshed) { setNotice('That landing is no longer reachable.'); return; }
+  function applyInsight(insight: Insight) {
+    if (!insight.placement || !game.current || !active.current || !socket.current?.connected || game.current.status === 'over' || insight.status !== 'ready') return false;
+    if (insight.pieceId !== game.current.pieceId) { setNotice('That move belongs to a previous piece.'); return false; }
+    const refreshed = refreshPlacement(game.current, insight.placement);
+    if (!refreshed) { setNotice('That landing is no longer reachable.'); return false; }
     const paused = game.current.status === 'paused';
     if (paused) game.current.act('resume');
     for (const action of refreshed.path) game.current.act(action);
-    if (paused) game.current.act('pause');
-    setInsights(current => current.map(insight => insight.id === currentInsight.id ? { ...insight, status: 'stale' } : insight));
+    if (paused && game.current.view().status !== 'over') game.current.act('pause');
+    setInsights(current => current.map(entry => entry.id === insight.id ? { ...entry, status: 'stale' } : entry));
     refresh();
     void flush();
+    return true;
   }
 
-  async function restart() {
-    if (!socket.current?.connected || !game.current || busy) return;
+  function applySuggestion() { if (currentInsight && !pilotActive.current) applyInsight(currentInsight); }
+
+  function editTokens() {
+    toggleAutopilot(false);
+    if (game.current?.status === 'playing') act('pause');
+    setTokenText(configuredTokenText.current);
+    setEditingTokens(true);
+  }
+
+  function cancelTokenSetup() {
+    setTokenText(configuredTokenText.current);
+    setEditingTokens(false);
+  }
+
+  async function restart(newText?: string) {
+    if (!socket.current?.connected || !game.current || requestPending.current) return;
+    stopAutopilot();
     if (!await flushAll()) return;
-    socket.current.timeout(8000).emit('restart', (error: Error | null, response: Reply<JoinResult>) => {
+    setJoining(true);
+    const receive = (error: Error | null, response: Reply<JoinResult>) => {
+      setJoining(false);
       if (error) { setNotice('Could not restart. Check your connection.'); return; }
       if (!response.ok) { setNotice(response.error); return; }
       installSession(response.data);
       setNotice('');
-    });
+    };
+    if (newText === undefined) socket.current.timeout(8000).emit('restart', receive);
+    else socket.current.timeout(8000).emit('configure', { text: newText }, receive);
   }
 
   const onFlush = useEffectEvent(flush);
   const onAct = useEffectEvent(act);
   const onJoin = useEffectEvent(join);
+  const onStopPilot = useEffectEvent(stopAutopilot);
+  const onPilotStep = useEffectEvent(() => {
+    if (!pilotActive.current || document.hidden || !active.current) return;
+    if (game.current?.status === 'over') { stopAutopilot('Run complete'); return; }
+    void assist(true);
+  });
+
+  useEffect(() => {
+    const timer = setInterval(() => onPilotStep(), 100);
+    return () => clearInterval(timer);
+  }, []);
 
   useEffect(() => {
     const connection: GameSocket = io({ transports: ['websocket', 'polling'], reconnection: true, reconnectionDelay: 750, reconnectionDelayMax: 4000 });
@@ -194,6 +299,10 @@ export function useGame() {
     connection.on('connect', () => { setConnected(true); autoJoining.current = false; });
     connection.on('connect_error', () => { setConnected(false); setNotice('Cannot reach the room. Reconnecting.'); });
     connection.on('disconnect', () => {
+      onStopPilot('Stopped because the connection changed.');
+      requestSerial.current += 1;
+      requestPending.current = false;
+      setRequestOptions(null);
       active.current = false;
       setConnected(false);
       setJoined(false);
@@ -211,7 +320,7 @@ export function useGame() {
       }
     });
     connection.on('notice', setNotice);
-    return () => { active.current = false; connection.disconnect(); socket.current = null; };
+    return () => { active.current = false; pilotActive.current = false; pilotEpoch.current += 1; connection.disconnect(); socket.current = null; };
   }, [isProjector]);
 
   useEffect(() => {
@@ -231,18 +340,26 @@ export function useGame() {
       request = requestAnimationFrame(animate);
     };
     request = requestAnimationFrame(animate);
-    const onVisibility = () => { if (document.hidden && game.current?.status === 'playing') onAct('pause'); };
+    const onVisibility = () => { if (document.hidden) { onStopPilot('Stopped while the page is hidden.'); if (game.current?.status === 'playing') onAct('pause'); } };
     document.addEventListener('visibilitychange', onVisibility);
     return () => { cancelAnimationFrame(request); document.removeEventListener('visibilitychange', onVisibility); };
   }, []);
 
-  const roomMetrics = room?.leaderboard.find(candidate => candidate.id === playerId)?.metrics;
+  const playerEntry = room?.leaderboard.find(candidate => candidate.id === playerId);
+  const roomMetrics = playerEntry?.metrics;
   const currentMetrics = roomMetrics && roomMetrics.requests >= metrics.requests ? roomMetrics : metrics;
+  const rates = room?.pricing?.snapshot?.usdPerMillion;
+  const cost = rates ? costForUsage(currentMetrics, rates) : null;
+  const unmeteredRequests = playerEntry?.unmeteredRequests ?? 0;
+  const efficiencyScore = cost && unmeteredRequests === 0 ? pointsPerCent(view.score, cost.total) : null;
 
   return {
     room, connected, joined, joining, name, setName, playerId, view, metrics: currentMetrics, insights,
+    cost, efficiencyScore, unmeteredRequests,
     busy, cooldownUntil, notice, setNotice, options, setOptions, game, isProjector,
-    join: () => join(), act, assist, applySuggestion, restart,
+    tokenText, setTokenText, editingTokens, editTokens, cancelTokenSetup,
+    autopilot, pilotStatus, toggleAutopilot, requestOptions,
+    join: () => join(), startTokenRun: () => joined ? void restart(tokenText) : join(), act, assist: () => assist(), applySuggestion, restart,
   };
 }
 

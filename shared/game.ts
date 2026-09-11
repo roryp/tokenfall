@@ -12,12 +12,20 @@ export const VISIBLE_HEIGHT = 20;
 export const HIDDEN_ROWS = 2;
 export const HEIGHT = VISIBLE_HEIGHT + HIDDEN_ROWS;
 export const FPS = 60;
+export const DEFAULT_TOKEN_TEXT = 'Hello world! Tokens make my blocks.';
 export const ACTIONS = ['left', 'right', 'softDrop', 'rotateCW', 'rotateCCW', 'hardDrop', 'hold', 'pause', 'resume'] as const;
 export type Action = typeof ACTIONS[number];
 export type Cell = TetrominoId | null;
 export type Spin = 'none' | 'mini' | 'full';
+export interface PieceToken { id: number; text: string }
+export const tokenShape = (id: number): TetrominoId => TETROMINOES[id % TETROMINOES.length];
+export const tokenLabel = (text: string) => /^ {2,}$/.test(text) ? `${text.length} spaces` : text.replaceAll(' ', '\u2423').replaceAll('\n', '\\n').replaceAll('\r', '\\r').replaceAll('\t', '\\t');
+function tokenSequence(tokens: readonly PieceToken[]) {
+  let index = 0;
+  return { next: () => tokenShape(tokens[index++ % tokens.length].id) };
+}
 export interface InputEvent { frame: number; action: Action }
-export interface Replay { seed: string; frame: number; events: InputEvent[] }
+export interface Replay { seed: string; frame: number; events: InputEvent[]; tokens?: PieceToken[] }
 export interface ClearEvent {
   lines: number;
   points: number;
@@ -43,10 +51,15 @@ export function scoreClear(lines: number, spin: Spin, level: number, previousCom
 
 export class Game {
   seed: string;
+  tokens: PieceToken[];
   well = new Grid<Cell>({ width: WIDTH, height: HEIGHT, empty: null });
+  tokenWell = new Grid<number | null>({ width: WIDTH, height: HEIGHT, empty: null });
   queue: PieceQueue<TetrominoId>;
   active: ActivePiece<Cell>;
   held: ActivePiece<Cell> | null = null;
+  activeTokenIndex = 0;
+  heldTokenIndex: number | null = null;
+  tokensTaken = 0;
   usedHold = false;
   lock = new LockDelay({ delayFrames: 30, maxResets: 15 });
   status: 'playing' | 'paused' | 'over' = 'playing';
@@ -64,13 +77,21 @@ export class Game {
   lastClear: ClearEvent | null = null;
   events: InputEvent[] = [];
 
-  constructor(seed: string) {
+  constructor(seed: string, tokens: PieceToken[] = []) {
+    if (tokens.length > 256 || tokens.some(token => !Number.isSafeInteger(token.id) || token.id < 0 || typeof token.text !== 'string' || token.text.length > 256)) throw new Error('Invalid token sequence.');
     this.seed = seed;
-    this.queue = new PieceQueue(bagRandomizer(TETROMINOES, seedrandom(seed)), 5);
-    this.active = this.newPiece(this.queue.take());
+    this.tokens = tokens.map(token => ({ ...token }));
+    this.queue = new PieceQueue(this.tokens.length ? tokenSequence(this.tokens) : bagRandomizer(TETROMINOES, seedrandom(seed)), 5);
+    this.active = this.takePiece();
   }
 
   newPiece(type: TetrominoId) { return spawnTetromino<Cell>(type, type, 3, 1); }
+  takePiece() {
+    this.activeTokenIndex = this.tokensTaken;
+    this.tokensTaken += 1;
+    return this.newPiece(this.queue.take());
+  }
+  tokenAt(index: number) { return this.tokens[index % this.tokens.length] ?? null; }
   get piece() { return this.active.cells[0].value as TetrominoId; }
   get hold() { return (this.held?.cells[0].value ?? null) as Cell; }
 
@@ -82,9 +103,13 @@ export class Game {
     if (this.status !== 'playing') return false;
     if (action === 'hold') {
       if (this.usedHold) return false;
-      const swapped = holdSwap(this.active, this.held, 3, 1, () => this.newPiece(this.queue.take()));
+      const currentTokenIndex = this.activeTokenIndex;
+      const previousHeldTokenIndex = this.heldTokenIndex;
+      const swapped = holdSwap(this.active, this.held, 3, 1, () => this.takePiece());
       this.active = swapped.active;
       this.held = swapped.held;
+      if (previousHeldTokenIndex !== null) this.activeTokenIndex = previousHeldTokenIndex;
+      this.heldTokenIndex = currentTokenIndex;
       this.usedHold = true;
       this.resetPiece();
       if (!canPlace(this.well, this.active)) this.status = 'over';
@@ -137,10 +162,12 @@ export class Game {
     const spin = this.detectSpin();
     const cells = pieceCells(this.active);
     lockPiece(this.well, this.active);
+    if (this.tokens.length) for (const cell of cells) this.tokenWell.set(cell.x, cell.y, this.activeTokenIndex);
     this.pieces += 1;
     if (cells.every(cell => cell.y < HIDDEN_ROWS)) { this.status = 'over'; return; }
     const rows = fullRows(this.well);
     clearRows(this.well, rows);
+    clearRows(this.tokenWell, rows);
     const result = scoreClear(rows.length, rows.length === 3 && spin === 'mini' ? 'full' : spin, this.level, this.combo, this.backToBack, this.well.toArray().every(cell => cell === null));
     this.score += result.points;
     this.combo = result.combo;
@@ -148,7 +175,7 @@ export class Game {
     if (result.points > 0) this.lastClear = { ...result, lines: rows.length, frame: this.frame, rows };
     this.lines += rows.length;
     this.level = 1 + Math.floor(this.lines / 10);
-    this.active = this.newPiece(this.queue.take());
+    this.active = this.takePiece();
     this.usedHold = false;
     this.resetPiece();
     if (!canPlace(this.well, this.active)) this.status = 'over';
@@ -176,10 +203,10 @@ export class Game {
     while (this.frame < frame) this.tick();
   }
 
-  replay(): Replay { return { seed: this.seed, frame: this.frame, events: this.events.map(event => ({ ...event })) }; }
+  replay(): Replay { return { seed: this.seed, frame: this.frame, events: this.events.map(event => ({ ...event })), ...(this.tokens.length ? { tokens: this.tokens.map(token => ({ ...token })) } : {}) }; }
 
   static restore(replay: Replay) {
-    const game = new Game(replay.seed);
+    const game = new Game(replay.seed, replay.tokens);
     for (const event of replay.events) {
       game.advanceTo(event.frame);
       game.act(event.action);
@@ -191,6 +218,10 @@ export class Game {
   view() {
     return {
       board: this.well.toArray(), active: pieceCells(this.active), ghost: ghostCells(this.well, this.active),
+      tokenBoard: this.tokenWell.toArray(), tokens: this.tokens,
+      activeToken: this.tokenAt(this.activeTokenIndex), activeTokenIndex: this.activeTokenIndex,
+      holdToken: this.heldTokenIndex === null ? null : this.tokenAt(this.heldTokenIndex),
+      nextTokens: this.queue.peek().map((_piece, index) => this.tokenAt(this.tokensTaken + index)),
       piece: this.piece, pieceId: this.pieceId, hold: this.hold, canHold: !this.usedHold,
       next: this.queue.peek(), score: this.score, lines: this.lines, level: this.level,
       pieces: this.pieces, status: this.status, frame: this.frame, lastClear: this.lastClear,

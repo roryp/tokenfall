@@ -16,6 +16,11 @@ export function tokenChips(text: string, limit = 96): TokenChip[] {
   });
 }
 
+export function gameTokens(text: string): TokenChip[] {
+  if (text.length < 1 || text.length > 500 || countTokens(text) > 256) throw new Error('Use 1 to 500 characters and at most 256 tokens.');
+  return tokenChips(text, 256);
+}
+
 export function packBoard(board: Cell[]): string[] {
   if (board.length !== WIDTH * HEIGHT || board.some(cell => cell !== null && !symbols.has(cell))) throw new Error('Invalid board.');
   return Array.from({ length: HEIGHT }, (_, row) => board.slice(row * WIDTH, (row + 1) * WIDTH).map(cell => cell ?? '.').join(''));

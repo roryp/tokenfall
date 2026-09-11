@@ -1,0 +1,10 @@
+**
+!package.json
+!package-lock.json
+!server/
+!server/**
+!shared/
+!shared/**
+!web/
+!web/dist/
+!web/dist/**

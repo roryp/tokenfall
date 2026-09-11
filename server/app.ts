@@ -13,12 +13,13 @@ import { Room } from './room.ts';
 import { countTokens, tokenChips } from './tokens.ts';
 
 const nameSchema = z.string().trim().min(2).max(16).regex(/^[\p{L}\p{N} _-]+$/u, 'Use letters, numbers, spaces, underscores or hyphens.');
-const joinSchema = z.object({ name: nameSchema, room: z.string().length(6), token: z.string().length(64).optional() }).strict();
+const setupSchema = z.object({ text: z.string().min(1).max(500) }).strict();
+const joinSchema = z.object({ name: nameSchema, room: z.string().length(6), token: z.string().length(64).optional(), text: z.string().min(1).max(500).optional() }).strict();
 const inputSchema = z.object({
   runId: z.string().uuid(), sequence: z.number().int().positive(), frame: z.number().int().nonnegative().max(216000),
   events: z.array(z.object({ frame: z.number().int().nonnegative(), action: z.enum(ACTIONS) }).strict()).max(64),
 }).strict();
-const aiSchema = z.object({ cache: z.boolean(), compression: z.boolean() }).strict();
+const aiSchema = z.object({ cache: z.boolean(), compression: z.boolean(), autopilot: z.boolean().optional() }).strict();
 
 export function errorReply(error: unknown): Reply<never> {
   if (error instanceof RequestError) return { ok: false, error: error.message, code: error.code, retryAfterMs: error.retryAfterMs };
@@ -91,7 +92,7 @@ export function createApplication(config: AppConfig, gateway: ModelGateway = new
         window.count += 1;
         joinWindows.set(address, window);
         if (window.count > 150) throw new RequestError('Too many join attempts. Try again shortly.', 'rate', 30000);
-        respond({ ok: true, data: room.join(data.name, data.room, data.token, socket.id) });
+        respond({ ok: true, data: room.join(data.name, data.room, data.token, socket.id, data.text) });
         io.emit('room', room.view());
       } catch (error) { respond(errorReply(error)); }
     });
@@ -103,6 +104,11 @@ export function createApplication(config: AppConfig, gateway: ModelGateway = new
     socket.on('restart', respond => {
       if (typeof respond !== 'function') return;
       try { respond({ ok: true, data: room.restart(room.playerFor(socket.id)) }); }
+      catch (error) { respond(errorReply(error)); }
+    });
+    socket.on('configure', (payload, respond) => {
+      if (typeof respond !== 'function') return;
+      try { respond({ ok: true, data: room.restart(room.playerFor(socket.id), setupSchema.parse(payload).text) }); }
       catch (error) { respond(errorReply(error)); }
     });
     socket.on('assist', async (payload, respond) => {

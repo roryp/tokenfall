@@ -6,14 +6,18 @@ import { parse } from 'dotenv';
 export const ROOT = fileURLToPath(new URL('../', import.meta.url));
 export interface AppConfig {
   port: number;
+  host?: '127.0.0.1' | '0.0.0.0';
   endpoint: string;
   deployment: string;
   tenantId: string;
   dataDirectory: string;
   publicUrl?: string;
+  pricingRegion?: string;
+  managedIdentityClientId?: string;
+  sqliteJournalMode?: 'WAL' | 'DELETE';
 }
 
-export function loadConfig(): AppConfig {
+export function loadConfig(environment: NodeJS.ProcessEnv = process.env): AppConfig {
   const configPath = path.join(ROOT, '.azure', 'config.json');
   let azd: Record<string, string> = {};
   if (existsSync(configPath)) {
@@ -26,12 +30,18 @@ export function loadConfig(): AppConfig {
   }
   const localPath = path.join(ROOT, '.env');
   const local = existsSync(localPath) ? parse(readFileSync(localPath)) : {};
-  const values = { ...azd, ...local, ...process.env };
+  const values = { ...azd, ...local, ...environment };
   if (!values.AZURE_OPENAI_ENDPOINT || !values.AZURE_OPENAI_DEPLOYMENT || !values.AZURE_TENANT_ID) throw new Error('Azure configuration is missing. Provision with azd or configure the server environment.');
   const port = Number(values.PORT ?? 3100);
   if (!Number.isInteger(port) || port < 1 || port > 65535) throw new Error('PORT must be a valid TCP port.');
+  const host = values.HOST ?? '127.0.0.1';
+  if (host !== '127.0.0.1' && host !== '0.0.0.0') throw new Error('HOST must be loopback or 0.0.0.0.');
+  const sqliteJournalMode = values.SQLITE_JOURNAL_MODE ?? 'WAL';
+  if (sqliteJournalMode !== 'WAL' && sqliteJournalMode !== 'DELETE') throw new Error('Unsupported SQLite journal mode.');
   return {
-    port, endpoint: values.AZURE_OPENAI_ENDPOINT, deployment: values.AZURE_OPENAI_DEPLOYMENT,
-    tenantId: values.AZURE_TENANT_ID, dataDirectory: path.join(ROOT, 'data'), publicUrl: values.PUBLIC_BASE_URL,
+    port, host, endpoint: values.AZURE_OPENAI_ENDPOINT, deployment: values.AZURE_OPENAI_DEPLOYMENT,
+    tenantId: values.AZURE_TENANT_ID, dataDirectory: path.resolve(values.DATA_DIRECTORY ?? path.join(ROOT, 'data')), publicUrl: values.PUBLIC_BASE_URL,
+    pricingRegion: values.AZURE_LOCATION,
+    managedIdentityClientId: values.AZURE_CLIENT_ID, sqliteJournalMode,
   };
 }
