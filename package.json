@@ -1,0 +1,35 @@
+{
+  "name": "tokenfall",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=24"
+  },
+  "scripts": {
+    "dev": "node --watch server/index.ts",
+    "start": "node server/index.ts",
+    "typecheck": "tsc --noEmit",
+    "build": "npm run typecheck && npm --prefix web run build",
+    "test": "node --test tests/*.test.ts"
+  },
+  "dependencies": {
+    "@azure/identity": "4.13.2",
+    "dotenv": "17.4.2",
+    "express": "5.2.1",
+    "js-tiktoken": "1.0.21",
+    "miaoda-game-fallblock-core": "0.3.2",
+    "miaoda-game-grid-core": "0.3.2",
+    "openai": "7.9.0",
+    "seedrandom": "3.0.5",
+    "socket.io": "4.8.3",
+    "socket.io-client": "4.8.3",
+    "zod": "4.5.4"
+  },
+  "devDependencies": {
+    "@types/express": "5.0.6",
+    "@types/node": "26.4.1",
+    "@types/seedrandom": "3.0.8",
+    "typescript": "6.0.2"
+  }
+}

@@ -1,0 +1,7 @@
+name: tokenfall
+metadata:
+  template: tokenfall-local-first
+infra:
+  provider: bicep
+  path: infra
+  module: main
