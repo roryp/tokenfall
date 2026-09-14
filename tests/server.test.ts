@@ -4,12 +4,13 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { io as connect } from 'socket.io-client';
+import { TETROMINOES } from 'miaoda-game-fallblock-core';
 import { Game, placementsFor } from '../shared/game.ts';
 import { emptyMetrics, tokenCreditsUsed } from '../shared/protocol.ts';
 import type { Insight, JoinResult, Reply, RoomView, TokenPricing } from '../shared/protocol.ts';
 import { createApplication } from '../server/app.ts';
 import { loadConfig } from '../server/config.ts';
-import { AI_COOLDOWN_MS, ModelGate, PLAYER_TOKEN_BUDGET, PREFIX_TOKENS, ROOM_TOKEN_BUDGET } from '../server/model.ts';
+import { AI_COOLDOWN_MS, AUTOPILOT_COOLDOWN_MS, LunaGateway, MAX_OUTPUT_TOKENS, ModelGate, PLAYER_REQUEST_LIMIT, PLAYER_TOKEN_BUDGET, POLICY, PREFIX_TOKENS, ROOM_TOKEN_BUDGET } from '../server/model.ts';
 import type { ModelGateway } from '../server/model.ts';
 import { Room } from '../server/room.ts';
 import { buildPrompts, gameTokens } from '../server/tokens.ts';
@@ -52,6 +53,63 @@ test('inference gate enforces concurrency, cooldown and token budgets', () => {
   assert.throws(() => gate.acquire('budget', 3000, PLAYER_TOKEN_BUDGET, 0, 10000));
   assert.throws(() => gate.acquire('room', 3000, 0, ROOM_TOKEN_BUDGET, 10000));
   assert.equal(gate.reserved, 0);
+});
+
+test('the gateway passes Luna\'s Hold choice unchanged and never substitutes an invalid model choice', async context => {
+  const setup = fixture();
+  const gateway = new LunaGateway(setup.config);
+  const game = new Game('gateway-hold');
+  const before = game.view();
+  const candidates = placementsFor(game);
+  const selected = candidates.find(candidate => candidate.useHold && !candidate.gameOver)!;
+  let selectedId = selected.id;
+  let sent: unknown;
+  const mock = context.mock.method(gateway['client'].chat.completions, 'create', async (request: unknown) => {
+    sent = request;
+    return { choices: [{ finish_reason: 'stop', message: { content: JSON.stringify({ placementId: selectedId, tip: 'Use the held piece.' }) } }], usage: { prompt_tokens: 4000, completion_tokens: 20, total_tokens: 4020, prompt_tokens_details: { cached_tokens: 0, cache_write_tokens: 0 }, completion_tokens_details: { reasoning_tokens: 0 } } };
+  });
+  try {
+    const insight = await gateway.complete(game, { compression: true, cache: false }, 'test');
+    assert.equal(insight.status, 'ready');
+    assert.deepEqual(insight.placement, { column: selected.column, row: selected.row, rotation: selected.rotation, piece: selected.piece, useHold: true });
+    const request = JSON.parse(JSON.stringify(sent));
+    assert.equal(insight.systemPrompt, POLICY);
+    assert.equal(insight.systemPrompt, request.messages[0].content[0].text);
+    const comparison = buildPrompts(game, candidates);
+    assert.deepEqual(insight.promptComparison, { verbose: comparison.verbose, packed: comparison.packed });
+    assert.equal(insight.promptComparison?.packed, request.messages[1].content);
+    assert.equal(insight.rawTokens, comparison.rawTokens);
+    assert.equal(insight.packedTokens, comparison.packedTokens);
+    assert.equal(request.messages[0].content[0].prompt_cache_breakpoint, undefined);
+    assert.deepEqual(JSON.parse(request.messages[1].content).placements.map((candidate: { id: string }) => candidate.id), candidates.map(candidate => candidate.id));
+    assert.equal(request.reasoning_effort, 'none');
+    assert.deepEqual(game.view(), before);
+    selectedId = 'not-a-legal-placement';
+    const invalid = await gateway.complete(new Game('different-board'), { compression: false, cache: true }, 'test');
+    assert.equal(invalid.status, 'invalid');
+    assert.equal(invalid.placement, null);
+    assert.equal(invalid.usage.total, 4020);
+    assert.equal(invalid.systemPrompt, POLICY);
+    assert.equal(invalid.promptComparison?.verbose, JSON.parse(JSON.stringify(sent)).messages[1].content);
+    assert.equal(invalid.savedTokens, 0);
+    assert.deepEqual(JSON.parse(JSON.stringify(sent)).messages[0].content[0].prompt_cache_breakpoint, { mode: 'explicit' });
+    assert.deepEqual(JSON.parse(JSON.stringify(sent)).response_format, request.response_format);
+    assert.equal(mock.mock.callCount(), 2);
+  } finally { rmSync(setup.dataDirectory, { recursive: true, force: true }); }
+});
+
+test('all normal active and Hold combinations fit the request guard in both encodings', () => {
+  assert.ok(PREFIX_TOKENS >= 1024);
+  for (const active of TETROMINOES) for (const held of [null, ...TETROMINOES]) {
+    const game = new Game('prompt-size');
+    game.active = game.newPiece(active);
+    game.held = held ? game.newPiece(held) : null;
+    const prompts = buildPrompts(game, placementsFor(game));
+    for (const count of [prompts.rawTokens, prompts.packedTokens]) {
+      const reservation = PREFIX_TOKENS + count + MAX_OUTPUT_TOKENS + 1024;
+      assert.ok(reservation <= 16000, `${active}/${held ?? 'empty'} needs ${reservation} reserved tokens`);
+    }
+  }
 });
 
 test('container settings enable external binding and managed identity without changing local defaults', () => {
@@ -99,6 +157,67 @@ test('token setup is authoritative, private, replayable, and persistent without 
     assert.deepEqual(next.replay.tokens, gameTokens('New tokens.'));
     assert.equal(next.metrics.input, 1234);
     assert.throws(() => room.restart(current, ''), /Wait|Enter/);
+  } finally { room.close(); rmSync(setup.dataDirectory, { recursive: true, force: true }); }
+});
+
+test('classic play replaces prototype token sequences without erasing usage and restarts with a fresh bag', () => {
+  const setup = fixture();
+  const room = new Room(setup.config, setup.gateway);
+  try {
+    const original = room.join('Returning Player', room.code, undefined, 'old', 'Prototype pieces');
+    const player = room.playerFor('old');
+    player.metrics = { ...emptyMetrics(), requests: 1, input: 1234, output: 20 };
+    player.record.attempts = 1;
+    player.record.best_score = 120;
+    room.disconnect('old');
+    const joined = room.join('Returning Player', room.code, original.token, 'classic', undefined, true);
+    assert.equal(joined.playerId, original.playerId);
+    assert.notEqual(joined.runId, original.runId);
+    assert.equal(joined.tokenText, '');
+    assert.equal(joined.replay.tokens, undefined);
+    assert.equal(joined.metrics.input, 1234);
+    assert.equal(player.record.attempts, 1);
+    assert.equal(player.record.best_score, 120);
+    const client = Game.restore(joined.replay);
+    const pieces = [];
+    for (let index = 0; index < 7; index += 1) { pieces.push(client.piece); client.act('hardDrop'); }
+    assert.equal(new Set(pieces).size, 7);
+    room.inputs(player, { runId: joined.runId, sequence: 1, frame: 0, events: client.events });
+    assert.deepEqual(player.game.view(), client.view());
+    player.started -= 3000;
+    const restarted = room.restart(player);
+    assert.notEqual(restarted.replay.seed, joined.replay.seed);
+    assert.equal(restarted.replay.tokens, undefined);
+    assert.equal(restarted.metrics.input, 1234);
+    assert.throws(() => room.join('Invalid', room.code, undefined, 'invalid', 'Text', true), /Classic/);
+  } finally { room.close(); rmSync(setup.dataDirectory, { recursive: true, force: true }); }
+});
+
+test('cache outcomes persist without inventing hit or miss history for older usage', async () => {
+  const setup = fixture();
+  let room = new Room(setup.config, setup.gateway);
+  try {
+    const joined = room.join('Cache History', room.code, undefined, 'socket', undefined, true);
+    const legacy = { requests: 2, input: 4500, output: 40, cached: 1500, cacheWrites: 1500, reasoning: 0, compressionSaved: 5000 };
+    room.database.prepare('UPDATE players SET metrics = ?, attempts = ? WHERE id = ?').run(JSON.stringify(legacy), 2, joined.playerId);
+    room.close();
+    room = new Room(setup.config, setup.gateway);
+    const restored = room.join('Cache History', room.code, joined.token, 'restored', undefined, true);
+    assert.equal(restored.metrics.requests, 2);
+    assert.equal(restored.metrics.cacheHits, 0);
+    assert.equal(restored.metrics.cacheMisses, 0);
+    assert.equal(restored.metrics.cacheBypassed, 0);
+    assert.equal(room.totals().metrics.cacheHits, 0);
+    await room.assist(room.playerFor('restored'), { compression: true, cache: true, autopilot: true });
+    room.close();
+    room = new Room(setup.config, setup.gateway);
+    const after = room.join('Cache History', room.code, joined.token, 'after', undefined, true);
+    assert.equal(after.metrics.requests, 3);
+    assert.equal(after.metrics.cacheHits, 1);
+    assert.equal(after.metrics.cacheMisses, 0);
+    assert.equal(after.metrics.input, legacy.input + 2000);
+    assert.equal(after.metrics.requests - after.metrics.cacheHits - after.metrics.cacheMisses - after.metrics.cacheBypassed, 2);
+    assert.equal(room.totals().metrics.cacheHits, 1);
   } finally { room.close(); rmSync(setup.dataDirectory, { recursive: true, force: true }); }
 });
 
@@ -162,6 +281,24 @@ test('fast autopilot remains single-flight, paced, and bound by the same budgets
   assert.throws(() => gate.acquire('pilot', 3000, PLAYER_TOKEN_BUDGET, 0, 2000, true), /credits/);
 });
 
+test('standard Luna play continues beyond prototype player limits while retaining the global spending guard', async () => {
+  const setup = fixture();
+  const room = new Room(setup.config, setup.gateway);
+  try {
+    room.join('Continuous Player', room.code, undefined, 'socket', undefined, true);
+    const player = room.playerFor('socket');
+    player.record.attempts = PLAYER_REQUEST_LIMIT + 10;
+    player.metrics = { ...emptyMetrics(), requests: player.record.attempts, input: PLAYER_TOKEN_BUDGET + 10000, output: 1000 };
+    room.save(player);
+    const result = await room.assist(player, { compression: true, cache: false, autopilot: true });
+    assert.equal(result.metrics.requests, PLAYER_REQUEST_LIMIT + 11);
+    assert.equal(player.record.attempts, PLAYER_REQUEST_LIMIT + 11);
+    const gate = new ModelGate();
+    assert.throws(() => gate.acquire('global', 3000, 0, ROOM_TOKEN_BUDGET, 0, true, ROOM_TOKEN_BUDGET), /room model token limit/);
+    assert.throws(() => gate.acquire('large', 16001, 0, 0, 0, true, ROOM_TOKEN_BUDGET), /credits/);
+  } finally { room.close(); rmSync(setup.dataDirectory, { recursive: true, force: true }); }
+});
+
 test('single-instance rollback journal storage retains scores across process restarts', () => {
   const setup = fixture();
   const config = { ...setup.config, sqliteJournalMode: 'DELETE' as const };
@@ -178,9 +315,10 @@ test('single-instance rollback journal storage retains scores across process res
   } finally { room.close(); rmSync(setup.dataDirectory, { recursive: true, force: true }); }
 });
 
-test('a tight credit bank permits one raw request and substantially more compressed and cached requests', async context => {
+test('legacy token runs retain their original bank without erasing the cost of inefficient requests', async context => {
   context.mock.timers.enable({ apis: ['Date'], now: 20000 });
   const requestCounts: number[] = [];
+  const creditsSpent: number[] = [];
   for (const options of [{ compression: false, cache: false }, { compression: true, cache: false }, { compression: true, cache: true }]) {
     const setup = fixture();
     let requests = 0;
@@ -197,10 +335,10 @@ test('a tight credit bank permits one raw request and substantially more compres
     } };
     const room = new Room(setup.config, gateway);
     try {
-      room.join('Budget Player', room.code, undefined, 'socket');
+      room.join('Budget Player', room.code, undefined, 'socket', 'Hello world! Tokens make my blocks.');
       const player = room.playerFor('socket');
-      player.game = new Game('compression');
-      for (let attempt = 0; attempt < 20; attempt += 1) {
+      player.game = new Game('compression', gameTokens(player.record.token_text));
+      for (let attempt = 0; attempt <= PLAYER_REQUEST_LIMIT; attempt += 1) {
         context.mock.timers.tick(AI_COOLDOWN_MS);
         try { await room.assist(player, options); }
         catch (error) { assert.equal((error as { code: string }).code, 'budget'); break; }
@@ -211,9 +349,72 @@ test('a tight credit bank permits one raw request and substantially more compres
       room.restart(player);
       assert.equal(tokenCreditsUsed(player.metrics), spent);
       requestCounts.push(requests);
+      creditsSpent.push(spent);
     } finally { room.close(); rmSync(setup.dataDirectory, { recursive: true, force: true }); }
   }
-  assert.deepEqual(requestCounts, [1, 4, 7]);
+  assert.ok(requestCounts[0] < requestCounts[1]);
+  assert.ok(requestCounts[1] <= requestCounts[2]);
+  assert.ok(requestCounts.every(count => count <= PLAYER_REQUEST_LIMIT));
+  assert.ok(creditsSpent[2] / requestCounts[2] < creditsSpent[1] / requestCounts[1]);
+});
+
+test('standard play permits thirty richer compressed requests after prior spend without cache hits', async context => {
+  context.mock.timers.enable({ apis: ['Date'], now: 20000 });
+  const setup = fixture();
+  const gateway: ModelGateway = { complete: async game => {
+    const prompts = buildPrompts(game, placementsFor(game));
+    const input = PREFIX_TOKENS + prompts.packedTokens + 128;
+    return {
+      ...insightFor(game), cacheEnabled: false,
+      usage: { input, output: MAX_OUTPUT_TOKENS, total: input + MAX_OUTPUT_TOKENS, cached: 0, cacheWrites: 0, reasoning: 0 },
+    };
+  } };
+  const room = new Room(setup.config, gateway);
+  try {
+    room.join('Returning Pilot', room.code, undefined, 'socket', undefined, true);
+    const player = room.playerFor('socket');
+    player.record.attempts = 2;
+    player.metrics = { ...emptyMetrics(), requests: 2, input: 15000, output: 100 };
+    room.save(player);
+    player.game.act('pause');
+    for (let request = 0; request < 30; request += 1) {
+      context.mock.timers.tick(AUTOPILOT_COOLDOWN_MS);
+      const response = await room.assist(player, { cache: false, compression: true, autopilot: true });
+      assert.equal(response.insight.status, 'ready');
+    }
+    assert.equal(player.metrics.requests, 32);
+    assert.equal(player.metrics.cached, 0);
+    assert.ok(tokenCreditsUsed(player.metrics) > 16000);
+    assert.ok(tokenCreditsUsed(player.metrics) < ROOM_TOKEN_BUDGET);
+    assert.equal(room.view().playerTokenBudget, 160000);
+    assert.equal(room.view().metrics.input, player.metrics.input);
+  } finally { room.close(); rmSync(setup.dataDirectory, { recursive: true, force: true }); }
+});
+
+test('free board comparisons use the same prompt encoding without spending tokens or moving pieces', () => {
+  const setup = fixture();
+  let modelCalls = 0;
+  const room = new Room(setup.config, { complete: async game => { modelCalls += 1; return insightFor(game); } });
+  try {
+    room.join('Compare Player', room.code, undefined, 'socket', 'Tokens teach costs.');
+    const player = room.playerFor('socket');
+    player.game.act('pause');
+    const before = player.game.view();
+    const preview = room.inspect(player, 0);
+    const prompts = buildPrompts(player.game, placementsFor(player.game));
+    assert.equal(preview.rawTokens, prompts.rawTokens);
+    assert.equal(preview.packedTokens, prompts.packedTokens);
+    assert.ok(preview.packedTokens < preview.rawTokens);
+    assert.equal(preview.rawReservation - preview.packedReservation, prompts.rawTokens - prompts.packedTokens);
+    assert.equal(preview.runId, player.runId);
+    assert.equal(preview.pieceId, player.game.pieceId);
+    assert.equal(modelCalls, 0);
+    assert.equal(player.record.attempts, 0);
+    assert.deepEqual(player.metrics, emptyMetrics());
+    assert.deepEqual(player.game.view(), before);
+    assert.throws(() => room.inspect(player, 999), /cooling/);
+    assert.doesNotThrow(() => room.inspect(player, 1000));
+  } finally { room.close(); rmSync(setup.dataDirectory, { recursive: true, force: true }); }
 });
 
 test('real priced usage determines the efficiency leaderboard while base scores remain intact', async () => {
@@ -243,6 +444,36 @@ test('real priced usage determines the efficiency leaderboard while base scores 
   } finally { room.close(); rmSync(setup.dataDirectory, { recursive: true, force: true }); }
 });
 
+test('points ranking includes manual winners independently of the top fifty cost scores', () => {
+  const setup = fixture();
+  const room = new Room(setup.config, setup.gateway);
+  try {
+    room.pricing = setup.pricing;
+    for (let index = 0; index < 50; index += 1) {
+      const socketId = `paid-${index}`;
+      room.join(`Paid ${index}`, room.code, undefined, socketId);
+      const player = room.playerFor(socketId);
+      player.record.best_score = index + 1;
+      player.record.attempts = 1;
+      player.metrics = { ...emptyMetrics(), requests: 1, input: 100, output: 10 };
+      room.save(player);
+      room.disconnect(socketId);
+    }
+    room.join('Manual Winner', room.code, undefined, 'manual');
+    const player = room.playerFor('manual');
+    player.record.best_score = 5000;
+    room.save(player);
+    const view = room.view();
+    assert.equal(view.leaderboard.length, 50);
+    assert.equal(view.leaderboard.some(entry => entry.name === 'Manual Winner'), false);
+    assert.equal(view.pointsLeaderboard.length, 50);
+    assert.equal(view.pointsLeaderboard[0].name, 'Manual Winner');
+    assert.equal(view.pointsLeaderboard[0].score, 5000);
+    assert.equal(view.pointsLeaderboard[0].costUsd, 0);
+    assert.equal(view.pointsLeaderboard[0].challengeScore, null);
+  } finally { room.close(); rmSync(setup.dataDirectory, { recursive: true, force: true }); }
+});
+
 test('missing rates, zero spend, and missing provider usage cannot produce a cost-ranked score', async () => {
   const setup = fixture();
   const room = new Room(setup.config, setup.gateway);
@@ -268,6 +499,22 @@ test('missing rates, zero spend, and missing provider usage cannot produce a cos
     assert.equal(room.view().leaderboard[0].unmeteredRequests, 1);
     assert.equal(room.view().unmeteredRequests, 1);
     assert.ok(room.view().leaderboard[0].costUsd! > 0);
+  } finally { room.close(); rmSync(setup.dataDirectory, { recursive: true, force: true }); }
+});
+
+test('a game can continue past the old hour cap while rejecting oversized synchronization jumps', () => {
+  const setup = fixture();
+  const room = new Room(setup.config, setup.gateway);
+  try {
+    room.join('Untimed Player', room.code, undefined, 'socket', undefined, true);
+    const player = room.playerFor('socket');
+    player.game.act('pause');
+    player.game.advanceTo(216000);
+    player.started -= 3600000;
+    const ack = room.inputs(player, { runId: player.runId, sequence: 1, frame: 216001, events: [] });
+    assert.equal(ack.frame, 216001);
+    assert.equal(player.game.status, 'paused');
+    assert.throws(() => room.inputs(player, { runId: player.runId, sequence: 2, frame: 220000, events: [] }, Date.now() + 120000), /clock/);
   } finally { room.close(); rmSync(setup.dataDirectory, { recursive: true, force: true }); }
 });
 

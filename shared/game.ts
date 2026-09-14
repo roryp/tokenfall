@@ -199,7 +199,7 @@ export class Game {
   }
 
   advanceTo(frame: number) {
-    if (!Number.isSafeInteger(frame) || frame < this.frame || frame > 216000) throw new Error('Invalid game clock.');
+    if (!Number.isSafeInteger(frame) || frame < this.frame) throw new Error('Invalid game clock.');
     while (this.frame < frame) this.tick();
   }
 
@@ -233,18 +233,22 @@ export class Game {
 export type GameView = ReturnType<Game['view']>;
 export interface Placement {
   id: string;
+  piece: TetrominoId;
+  useHold: boolean;
   column: number;
   row: number;
   rotation: number;
+  gameOver: boolean;
   clearedLines: number;
   holes: number;
+  columnHeights: number[];
   aggregateHeight: number;
   maxHeight: number;
   bumpiness: number;
   path: Action[];
 }
 
-function boardMetrics(well: Grid<Cell>) {
+export function boardMetrics(well: Grid<Cell>) {
   const heights: number[] = [];
   let holes = 0;
   for (let column = 0; column < WIDTH; column += 1) {
@@ -256,40 +260,50 @@ function boardMetrics(well: Grid<Cell>) {
     }
     heights.push(height);
   }
-  return { holes, aggregateHeight: heights.reduce((sum, height) => sum + height, 0), maxHeight: Math.max(...heights), bumpiness: heights.slice(1).reduce((sum, height, index) => sum + Math.abs(height - heights[index]), 0) };
+  return { holes, columnHeights: heights, aggregateHeight: heights.reduce((sum, height) => sum + height, 0), maxHeight: Math.max(...heights), bumpiness: heights.slice(1).reduce((sum, height, index) => sum + Math.abs(height - heights[index]), 0) };
 }
 
 export function placementsFor(game: Game): Placement[] {
   if (game.status === 'over') return [];
-  const pending: { piece: ActivePiece<Cell>; path: Action[] }[] = [{ piece: game.active, path: [] }];
-  const visited = new Set<string>();
-  const landings = new Set<string>();
   const placements: Placement[] = [];
+  const preview = game.queue.peek();
+  const choices = [{ active: game.active, useHold: false, nextPiece: preview[0] }];
+  if (!game.usedHold) choices.push({ active: game.newPiece(game.hold ?? preview[0]), useHold: true, nextPiece: preview[game.hold ? 0 : 1] });
   const moves = ['left', 'right', 'rotateCW', 'rotateCCW', 'softDrop'] as const;
-  for (let cursor = 0; cursor < pending.length && cursor < 1800; cursor += 1) {
-    const { piece, path } = pending[cursor];
-    const poseKey = `${piece.x},${piece.y},${piece.rot}`;
-    if (visited.has(poseKey)) continue;
-    visited.add(poseKey);
-    const landed = ghostPiece(game.well, piece);
-    const landingKey = pieceCells(landed).map(cell => `${cell.x},${cell.y}`).sort().join(';');
-    if (!landings.has(landingKey)) {
-      landings.add(landingKey);
-      const copy = new Grid<Cell>({ width: WIDTH, height: HEIGHT, empty: null }).fill(({ x, y }) => game.well.get(x, y));
-      lockPiece(copy, landed);
-      const clearedLines = clearRows(copy).cleared.length;
-      placements.push({ id: `P${placements.length}`, column: landed.x, row: landed.y, rotation: landed.rot ?? 0, clearedLines, ...boardMetrics(copy), path: [...path, 'hardDrop'] });
-    }
-    for (const action of moves) {
-      const next = action === 'rotateCW' || action === 'rotateCCW'
-        ? rotateWithKicks(game.well, piece, action === 'rotateCW' ? 1 : -1, kicksFor(game.piece))
-        : tryMove(game.well, piece, action === 'left' ? -1 : action === 'right' ? 1 : 0, action === 'softDrop' ? 1 : 0);
-      if (next && !visited.has(`${next.x},${next.y},${next.rot}`)) pending.push({ piece: next, path: [...path, action] });
+  for (const choice of choices) {
+    if (!canPlace(game.well, choice.active)) continue;
+    const type = choice.active.cells[0].value as TetrominoId;
+    const pending: { piece: ActivePiece<Cell>; path: Action[] }[] = [{ piece: choice.active, path: choice.useHold ? ['hold'] : [] }];
+    const visited = new Set<string>();
+    const landings = new Set<string>();
+    for (let cursor = 0; cursor < pending.length && cursor < 1800; cursor += 1) {
+      const { piece, path } = pending[cursor];
+      const poseKey = `${piece.x},${piece.y},${piece.rot}`;
+      if (visited.has(poseKey)) continue;
+      visited.add(poseKey);
+      const landed = ghostPiece(game.well, piece);
+      const cells = pieceCells(landed);
+      const landingKey = cells.map(cell => `${cell.x},${cell.y}`).sort().join(';');
+      if (!landings.has(landingKey)) {
+        landings.add(landingKey);
+        const copy = new Grid<Cell>({ width: WIDTH, height: HEIGHT, empty: null }).fill(({ x, y }) => game.well.get(x, y));
+        lockPiece(copy, landed);
+        const lockOut = cells.every(cell => cell.y < HIDDEN_ROWS);
+        const clearedLines = lockOut ? 0 : clearRows(copy).cleared.length;
+        const gameOver = lockOut || !canPlace(copy, game.newPiece(choice.nextPiece));
+        placements.push({ id: `${choice.useHold ? 'H' : 'P'}${placements.length}`, piece: type, useHold: choice.useHold, column: landed.x, row: landed.y, rotation: landed.rot ?? 0, gameOver, clearedLines, ...boardMetrics(copy), path: [...path, 'hardDrop'] });
+      }
+      for (const action of moves) {
+        const next = action === 'rotateCW' || action === 'rotateCCW'
+          ? rotateWithKicks(game.well, piece, action === 'rotateCW' ? 1 : -1, kicksFor(type))
+          : tryMove(game.well, piece, action === 'left' ? -1 : action === 'right' ? 1 : 0, action === 'softDrop' ? 1 : 0);
+        if (next && !visited.has(`${next.x},${next.y},${next.rot}`)) pending.push({ piece: next, path: [...path, action] });
+      }
     }
   }
   return placements;
 }
 
-export function refreshPlacement(game: Game, target: Pick<Placement, 'column' | 'row' | 'rotation'>) {
-  return placementsFor(game).find(placement => placement.column === target.column && placement.row === target.row && placement.rotation === target.rotation);
+export function refreshPlacement(game: Game, target: Pick<Placement, 'column' | 'row' | 'rotation'> & { useHold?: boolean }) {
+  return placementsFor(game).find(placement => placement.useHold === Boolean(target.useHold) && placement.column === target.column && placement.row === target.row && placement.rotation === target.rotation);
 }

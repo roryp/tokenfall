@@ -12,8 +12,10 @@ import { buildPrompts, countTokens, normalizeUsage, tokenChips } from './tokens.
 export const POLICY = readFileSync(new URL('./policy.md', import.meta.url), 'utf8');
 export const PREFIX_TOKENS = countTokens(POLICY);
 export const MAX_OUTPUT_TOKENS = 128;
-export const PLAYER_TOKEN_BUDGET = 16000;
-export const ROOM_TOKEN_BUDGET = 2000000;
+export const PLAYER_TOKEN_BUDGET = 160000;
+export const ROOM_TOKEN_BUDGET = 8000000;
+export const PLAYER_REQUEST_LIMIT = 40;
+export const ROOM_REQUEST_LIMIT = 2000;
 export const AI_COOLDOWN_MS = 8000;
 export const AUTOPILOT_COOLDOWN_MS = 1000;
 
@@ -38,14 +40,14 @@ export class ModelGate {
   private activePlayers = new Set<string>();
   private requestTimes: { time: number; tokens: number }[] = [];
 
-  acquire(playerId: string, reservation: number, playerSpent: number, roomSpent: number, now = Date.now(), autopilot = false) {
+  acquire(playerId: string, reservation: number, playerSpent: number, roomSpent: number, now = Date.now(), autopilot = false, playerBudget = PLAYER_TOKEN_BUDGET) {
     if (this.activePlayers.has(playerId)) throw new RequestError('Luna is already choosing your move.', 'busy', 1000);
     const remaining = (autopilot ? AUTOPILOT_COOLDOWN_MS : AI_COOLDOWN_MS) - (now - (this.lastRequest.get(playerId) ?? -Infinity));
     if (remaining > 0) throw new RequestError('Luna is cooling down.', 'cooldown', remaining);
     this.requestTimes = this.requestTimes.filter(entry => now - entry.time < 60000);
     const scheduledTokens = this.requestTimes.reduce((sum, entry) => sum + entry.tokens, 0);
     if (this.inFlight >= 4 || this.requestTimes.length >= 90 || scheduledTokens + reservation > 400000) throw new RequestError('The room is busy. Keep playing and try again shortly.', 'busy', 3000);
-    if (reservation > 16000 || playerSpent + reservation > PLAYER_TOKEN_BUDGET) throw new RequestError('Not enough token credits for this request. Compression lowers the cost; manual play is still available.', 'budget');
+    if (reservation > 16000 || playerSpent + reservation > playerBudget) throw new RequestError('Not enough token credits for this request. Compression lowers the cost; manual play is still available.', 'budget');
     if (roomSpent + this.reserved + reservation > ROOM_TOKEN_BUDGET) throw new RequestError('The room model token limit is reached. Manual play is still available.', 'budget');
     this.inFlight += 1;
     this.reserved += reservation;
@@ -99,7 +101,7 @@ export class LunaGateway implements ModelGateway {
       reasoning_effort: 'none' as const,
       max_completion_tokens: MAX_OUTPUT_TOKENS,
       store: false,
-      prompt_cache_key: `tokenfall-policy-v2:${cacheBucket}`,
+      prompt_cache_key: `tokenfall-policy-v4:${cacheBucket}`,
       prompt_cache_options: { mode: 'explicit', ttl: '30m' },
       messages: [
         { role: 'system' as const, content: [content] },
@@ -124,13 +126,14 @@ export class LunaGateway implements ModelGateway {
     const valid = selected && selection && usage.reasoning === 0 && result.choices[0]?.finish_reason === 'stop';
     return {
       id: randomUUID(), pieceId,
-      placement: valid ? { column: selected.column, row: selected.row, rotation: selected.rotation } : null,
+      placement: valid ? { column: selected.column, row: selected.row, rotation: selected.rotation, piece: selected.piece, useHold: selected.useHold } : null,
       tip: valid && selection ? selection.tip : usage.reasoning !== 0 ? 'The service did not confirm zero reasoning. This move was rejected.' : 'The model did not return a valid legal move.',
       status: valid ? 'ready' : 'invalid', usage, latencyMs,
       rawTokens: prompts.rawTokens, packedTokens: prompts.packedTokens,
       savedTokens: options.compression ? Math.max(0, prompts.rawTokens - prompts.packedTokens) : 0,
       compression: options.compression, cacheEnabled: options.cache,
-      prompt, outputText, inputChips: tokenChips(prompt), outputChips: tokenChips(outputText),
+      prompt, systemPrompt: POLICY, outputText, inputChips: tokenChips(prompt), outputChips: tokenChips(outputText),
+      promptComparison: { verbose: prompts.verbose, packed: prompts.packed },
     };
   }
 }

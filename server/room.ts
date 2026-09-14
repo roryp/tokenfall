@@ -4,9 +4,9 @@ import path from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { Game, FPS, placementsFor } from '../shared/game.ts';
 import { costForUsage, emptyMetrics, pointsPerCent, tokenCreditsUsed } from '../shared/protocol.ts';
-import type { AiOptions, InputAck, InputBatch, JoinResult, LeaderboardEntry, Metrics, RoomView, TokenPricing } from '../shared/protocol.ts';
+import type { AiOptions, InputAck, InputBatch, JoinResult, LeaderboardEntry, Metrics, PlayerUsage, PromptPreview, RoomView, TokenPricing } from '../shared/protocol.ts';
 import type { AppConfig } from './config.ts';
-import { AI_COOLDOWN_MS, AUTOPILOT_COOLDOWN_MS, MAX_OUTPUT_TOKENS, ModelGate, PLAYER_TOKEN_BUDGET, PREFIX_TOKENS, ROOM_TOKEN_BUDGET, RequestError } from './model.ts';
+import { AI_COOLDOWN_MS, AUTOPILOT_COOLDOWN_MS, MAX_OUTPUT_TOKENS, ModelGate, PLAYER_REQUEST_LIMIT, PLAYER_TOKEN_BUDGET, PREFIX_TOKENS, ROOM_REQUEST_LIMIT, ROOM_TOKEN_BUDGET, RequestError } from './model.ts';
 import type { ModelGateway } from './model.ts';
 import { addUsage, buildPrompts, gameTokens } from './tokens.ts';
 
@@ -41,6 +41,7 @@ export class Room {
   code: string;
   gate = new ModelGate();
   pricing: TokenPricing = { status: 'loading', snapshot: null };
+  private previewTimes = new Map<string, number>();
   config: AppConfig;
   gateway: ModelGateway;
 
@@ -85,19 +86,20 @@ export class Room {
     let attempts = 0;
     for (const record of this.records()) {
       const saved = JSON.parse(record.metrics) as Metrics;
-      for (const key of Object.keys(metrics) as (keyof Metrics)[]) metrics[key] += saved[key];
+      for (const key of Object.keys(metrics) as (keyof Metrics)[]) metrics[key] += saved[key] ?? 0;
       attempts += record.attempts;
     }
     return { metrics, attempts };
   }
 
   gameFor(text: string) {
-    try { return new Game(`tokenfall:${this.code}`, text ? gameTokens(text) : []); }
+    try { return new Game(text ? `tokenfall:${this.code}` : randomUUID(), text ? gameTokens(text) : []); }
     catch { throw new RequestError('Use 1 to 500 characters and at most 256 tokens.', 'token-setup'); }
   }
 
-  join(name: string, code: string, token: string | undefined, socketId: string, text?: string): JoinResult {
+  join(name: string, code: string, token: string | undefined, socketId: string, text?: string, classic = false): JoinResult {
     if (code !== this.code) throw new RequestError('That room code is not active.', 'room');
+    if (classic && text !== undefined) throw new RequestError('Classic games do not use token text.', 'validation');
     const now = Date.now();
     for (const [id, player] of this.players) if (!player.socketId && now - player.lastSeen > 15 * 60000) this.players.delete(id);
     const sessionToken = token ?? randomBytes(32).toString('hex');
@@ -115,8 +117,17 @@ export class Room {
       record = { id: randomUUID(), token_hash: tokenHash, name, best_score: 0, best_lines: 0, best_level: 1, metrics: JSON.stringify(emptyMetrics()), attempts: 0, updated: now, token_text: text ?? '' };
     }
     if (!player) {
-      player = { record, metrics: JSON.parse(record.metrics), game: this.gameFor(record.token_text), runId: randomUUID(), started: now, sequence: 0, socketId: null, lastSeen: now, inputWindow: now, inputCount: 0 };
+      player = { record, metrics: { ...emptyMetrics(), ...JSON.parse(record.metrics) }, game: this.gameFor(record.token_text), runId: randomUUID(), started: now, sequence: 0, socketId: null, lastSeen: now, inputWindow: now, inputCount: 0 };
       this.players.set(record.id, player);
+    }
+    if (classic && player.record.token_text) {
+      player.game = this.gameFor('');
+      player.record.token_text = '';
+      player.runId = randomUUID();
+      player.started = now;
+      player.sequence = 0;
+      player.inputWindow = now;
+      player.inputCount = 0;
     }
     player.socketId = socketId;
     player.lastSeen = now;
@@ -125,7 +136,11 @@ export class Room {
   }
 
   joinResult(player: Player, token = ''): JoinResult {
-    return { token, playerId: player.record.id, name: player.record.name, runId: player.runId, sequence: player.sequence, replay: player.game.replay(), metrics: { ...player.metrics }, tokenText: player.record.token_text };
+    return { token, playerId: player.record.id, name: player.record.name, runId: player.runId, sequence: player.sequence, replay: player.game.replay(), ...this.usage(player), tokenText: player.record.token_text };
+  }
+
+  usage(player: Player): PlayerUsage {
+    return { metrics: { ...player.metrics }, unmeteredRequests: Math.max(0, player.record.attempts - player.metrics.requests) };
   }
 
   playerFor(socketId: string) {
@@ -147,7 +162,7 @@ export class Room {
     if (batch.runId !== player.runId) throw new RequestError('This input belongs to an earlier game. Reconnect to sync.', 'resync');
     if (batch.sequence <= player.sequence) return this.ack(player);
     if (batch.sequence !== player.sequence + 1) throw new RequestError('An input batch is missing. Reconnect to sync.', 'resync');
-    if (batch.frame < player.game.frame || batch.frame > Math.min(216000, Math.floor((now - player.started) * FPS / 1000) + 120)) throw new RequestError('The game clock is out of sync.', 'resync');
+    if (batch.frame < player.game.frame || batch.frame - player.game.frame > FPS * 60 || batch.frame > Math.floor((now - player.started) * FPS / 1000) + 120) throw new RequestError('The game clock is out of sync.', 'resync');
     let previousFrame = player.game.frame;
     for (const event of batch.events) {
       if (event.frame < previousFrame || event.frame > batch.frame) throw new RequestError('Inputs must be ordered by game frame.', 'resync');
@@ -191,20 +206,33 @@ export class Room {
     return this.joinResult(player);
   }
 
+  inspect(player: Player, now = Date.now()): PromptPreview {
+    if (now - (this.previewTimes.get(player.record.id) ?? -Infinity) < 1000) throw new RequestError('Preview is cooling down. Try again in a moment.', 'cooldown', 1000);
+    this.previewTimes.set(player.record.id, now);
+    const prompts = buildPrompts(player.game, placementsFor(player.game));
+    const overhead = PREFIX_TOKENS + MAX_OUTPUT_TOKENS + 1024;
+    return {
+      runId: player.runId, pieceId: player.game.pieceId, rawTokens: prompts.rawTokens,
+      packedTokens: prompts.packedTokens, prefixTokens: PREFIX_TOKENS, maxOutputTokens: MAX_OUTPUT_TOKENS,
+      rawReservation: overhead + prompts.rawTokens, packedReservation: overhead + prompts.packedTokens,
+    };
+  }
+
   async assist(player: Player, options: AiOptions) {
     if (player.game.status === 'over') throw new RequestError('Start a new game before asking Luna.', 'game-over');
     const totals = this.totals();
-    if (player.record.attempts >= 40 || totals.attempts >= 1000) throw new RequestError('The AI request allowance is used. Manual play is still available.', 'budget');
+    const classic = player.game.tokens.length === 0;
+    if ((!classic && player.record.attempts >= PLAYER_REQUEST_LIMIT) || totals.attempts >= ROOM_REQUEST_LIMIT) throw new RequestError('The AI request allowance is used. Manual play is still available.', 'budget');
     const prompts = buildPrompts(player.game, placementsFor(player.game));
     const reservation = PREFIX_TOKENS + (options.compression ? prompts.packedTokens : prompts.rawTokens) + MAX_OUTPUT_TOKENS + 1024;
-    const release = this.gate.acquire(player.record.id, reservation, tokenCreditsUsed(player.metrics), totals.metrics.input + totals.metrics.output, Date.now(), options.autopilot);
+    const release = this.gate.acquire(player.record.id, reservation, tokenCreditsUsed(player.metrics), totals.metrics.input + totals.metrics.output, Date.now(), options.autopilot, classic ? ROOM_TOKEN_BUDGET : PLAYER_TOKEN_BUDGET);
     const runId = player.runId;
     player.record.attempts += 1;
     this.save(player);
     try {
       const bucket = parseInt(player.record.id.slice(0, 2), 16) % 8;
       const insight = await this.gateway.complete(player.game, options, `${this.code}:${bucket}`);
-      player.metrics = addUsage(player.metrics, insight.usage, insight.savedTokens);
+      player.metrics = addUsage(player.metrics, insight.usage, insight.savedTokens, options.cache);
       const current = player.game.view();
       if (insight.status === 'ready' && (runId !== player.runId || insight.pieceId !== current.pieceId || current.status === 'over')) insight.status = 'stale';
       this.save(player);
@@ -233,8 +261,8 @@ export class Room {
   view(): RoomView {
     const rates = this.pricing.snapshot?.usdPerMillion;
     const totals = this.totals();
-    const leaderboard: LeaderboardEntry[] = this.records().map(record => {
-      const metrics = JSON.parse(record.metrics) as Metrics;
+    const entries: LeaderboardEntry[] = this.records().map(record => {
+      const metrics: Metrics = { ...emptyMetrics(), ...JSON.parse(record.metrics) };
       const unmeteredRequests = Math.max(0, record.attempts - metrics.requests);
       const costUsd = rates ? costForUsage(metrics, rates).total : null;
       return {
@@ -242,9 +270,11 @@ export class Room {
         challengeScore: costUsd !== null && unmeteredRequests === 0 ? pointsPerCent(record.best_score, costUsd) : null,
         lines: record.best_lines, level: record.best_level, online: Boolean(this.players.get(record.id)?.socketId), metrics,
       };
-    }).sort((first, second) => (second.challengeScore ?? -1) - (first.challengeScore ?? -1) || second.score - first.score || second.lines - first.lines).slice(0, 50);
+    });
+    const leaderboard = [...entries].sort((first, second) => (second.challengeScore ?? -1) - (first.challengeScore ?? -1) || second.score - first.score || second.lines - first.lines).slice(0, 50);
+    const pointsLeaderboard = entries.sort((first, second) => second.score - first.score || second.lines - first.lines).slice(0, 50);
     return {
-      code: this.code, online: this.online, capacity: 50, leaderboard, metrics: totals.metrics,
+      code: this.code, online: this.online, capacity: 50, leaderboard, pointsLeaderboard, metrics: totals.metrics,
       joinUrl: this.publicUrl(), model: this.config.deployment, prefixTokens: PREFIX_TOKENS,
       tokenBudget: ROOM_TOKEN_BUDGET, playerTokenBudget: PLAYER_TOKEN_BUDGET,
       pricing: this.pricing, unmeteredRequests: Math.max(0, totals.attempts - totals.metrics.requests),

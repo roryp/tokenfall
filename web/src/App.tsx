@@ -1,122 +1,194 @@
 import { useEffect, useRef, useState } from 'react';
-import { ArrowRight, ArrowUpRight, BookOpen, Bot, Check, Copy, Expand, Gamepad2, Layers3, Maximize2, Moon, Pause, Play, QrCode, RotateCcw, ScanText, Sparkles, Square, Sun, Trophy, Users, Volume2, VolumeX, Wifi, WifiOff, X } from 'lucide-react';
-import { QRCodeSVG } from 'qrcode.react';
-import { GameBoard, GameControls, PiecePreview } from './GameBoard.tsx';
-import { GameRules, LiveRates, LunaControls, TokenLab, TokenPowerups, TokenSetup } from './TokenLab.tsx';
-import { formatEfficiency, formatMoney } from './format.ts';
-import { useGame } from './useGame.ts';
-import type { GameController } from './useGame.ts';
-import { tokenLabel } from '../../shared/game.ts';
+import { Bot, Columns2, FileJson2, History, Layers3, Pause, Play, RotateCcw, Wifi, WifiOff, X } from 'lucide-react';
+import type { LucideIcon } from 'lucide-react';
 import { costForUsage } from '../../shared/protocol.ts';
-import type { RoomView } from '../../shared/protocol.ts';
+import type { Insight, TokenRates } from '../../shared/protocol.ts';
+import { GameBoard, GameControls, PiecePreview } from './GameBoard.tsx';
+import { formatMoney } from './format.ts';
+import { useGame } from './useGame.ts';
+import type { RequestRecord } from './useGame.ts';
 import './App.css';
 
 const number = (value: number) => value.toLocaleString();
-function Mark() { return <div className="brand-mark" aria-hidden="true"><i /><i /><i /><i /></div>; }
+const signedMoney = (value: number | null) => value === null ? '--' : `${value < 0 ? '-' : value > 0 ? '+' : ''}${formatMoney(Math.abs(value))}`;
+const cacheLabel = (insight: Insight) => insight.usage.cached > 0 ? 'Hit' : insight.usage.cacheWrites > 0 ? 'Miss / written' : insight.cacheEnabled ? 'Miss' : 'Off';
+const cacheEffect = (insight: Insight, rates: TokenRates | undefined) => rates ? (insight.usage.cached * (rates.cachedInput - rates.input) + insight.usage.cacheWrites * (rates.cacheWrite - rates.input)) / 1000000 : null;
 
-function JoinQr({ room, large = false }: { room: RoomView | null; large?: boolean }) {
-  const [copied, setCopied] = useState(false);
-  return <div className={`join-qr ${large ? 'large-qr' : ''}`}>
-    <div className="qr-heading"><QrCode size={19} /><h3>You're next.</h3><span className="tiny-label">JOIN THE ROOM</span></div>
-    <div className="qr-body">{room?.joinUrl ? <QRCodeSVG value={room.joinUrl} size={large ? 244 : 132} level="M" marginSize={3} title="Join the Tokenfall game" bgColor="var(--cp-qr-bg)" fgColor="var(--cp-qr-fg)" /> : <div className="qr-pending"><QrCode size={48} /><span>Join link pending</span></div>}<div><span className="eyebrow">ROOM CODE</span><strong className="room-code">{room?.code ?? '------'}</strong><span className="room-count"><Users size={13} />{room?.online ?? 0} / 50 online</span></div></div>
-    {room?.joinUrl && <div className="join-link"><a href={room.joinUrl} target="_blank" rel="noreferrer">{new URL(room.joinUrl).hostname}<ArrowUpRight size={14} /></a><button className="icon-button" title="Copy audience link" aria-label="Copy audience link" onClick={() => { void navigator.clipboard.writeText(room.joinUrl!).then(() => { setCopied(true); setTimeout(() => setCopied(false), 2000); }).catch(() => setCopied(false)); }}>{copied ? <Check size={15} /> : <Copy size={15} />}</button></div>}
-  </div>;
+function CacheActivity({ records, selected, rates, pending, unknown, onSelect }: {
+  records: RequestRecord[]; selected: Insight; rates: TokenRates | undefined;
+  pending: boolean; unknown: number; onSelect: (insight: Insight) => void;
+}) {
+  const record = records.find(entry => entry.insight.id === selected.id);
+  return <>
+    <div className="activity-meta"><span>Latest {records.length} replies / since page load / max 20</span><span role="status" data-testid="cache-activity-pending">{pending ? 'Request in flight / outcome pending' : 'No request in flight'}</span></div>
+    {unknown > 0 && <p className="activity-warning">{number(unknown)} request(s) without usage. Their cache outcomes are unknown.</p>}
+    <div className="activity-table" tabIndex={0} aria-label="Recent cache requests"><table><thead><tr><th scope="col">Reply</th><th scope="col">Fixed instructions</th><th scope="col">Read / written</th><th scope="col">USD effect <small>est.</small></th></tr></thead><tbody>{records.map(entry => {
+      const result = entry.insight;
+      const effect = cacheEffect(result, rates);
+      const selectedRow = result.id === selected.id;
+      return <tr key={result.id} data-testid="cache-activity-row" data-reply={entry.number} data-outcome={cacheLabel(result)} className={selectedRow ? 'selected-reply' : ''}>
+        <th scope="row"><button className="reply-button" aria-label={`Inspect cache reply ${entry.number}`} aria-pressed={selectedRow} title={new Date(entry.receivedAt).toLocaleTimeString()} onClick={() => onSelect(result)}>#{entry.number}<FileJson2 size={13} /></button></th>
+        <td><strong>{cacheLabel(result)}</strong><small>{result.usage.cached > 0 ? 'Prefix reused' : result.usage.cacheWrites > 0 ? 'Prefix stored, not reused' : result.cacheEnabled ? 'Prefix not reused' : 'Cache bypassed'}</small></td>
+        <td>{number(result.usage.cached)}<small>{number(result.usage.cacheWrites)} written</small></td>
+        <td className={effect !== null && effect < 0 ? 'saved-cost' : effect !== null && effect > 0 ? 'write-premium' : ''}>{signedMoney(effect)}</td>
+      </tr>;
+    })}</tbody></table></div>
+    <h3 className="activity-selection" data-testid="cache-selected-reply">{record ? `Reply #${record.number}` : 'Selected reply'} / {cacheLabel(selected)}</h3>
+    <p data-testid="inspected-cache-result">{selected.usage.cached > 0 ? `Cache hit: ${number(selected.usage.cached)} input tokens reused${selected.usage.cacheWrites > 0 ? `; ${number(selected.usage.cacheWrites)} tokens also written` : ''}` : selected.usage.cacheWrites > 0 ? `Cache miss: ${number(selected.usage.cacheWrites)} tokens written, none reused` : selected.cacheEnabled ? 'Cache miss: no input tokens reused' : 'Cache was off for this request'}</p>
+    <dl className="cache-content-breakdown"><div><dt>Fixed instructions</dt><dd>{selected.usage.cached > 0 ? 'Reused from the cached prefix' : selected.usage.cacheWrites > 0 ? 'Stored for later reuse; this was a miss' : selected.cacheEnabled ? 'Sent without a cache match' : 'Sent with caching disabled'}</dd></div><div><dt>Board and legal moves</dt><dd>Fresh input for this request, not a cache hit</dd></div><div><dt>New answer</dt><dd>{number(selected.usage.output)} output tokens generated, not cached</dd></div></dl>
+    <h3>Instruction text for this reply</h3>
+    {selected.systemPrompt ? <pre tabIndex={0} data-testid="cached-instructions">{selected.systemPrompt}</pre> : <p>Instruction text is unavailable for this earlier reply.</p>}
+    <small>Provider-confirmed token counts, not word-level cache offsets. Replies missing from this tab's history are not reconstructed.</small>
+  </>;
 }
 
-function Leaderboard({ controller, large = false }: { controller: GameController; large?: boolean }) {
-  const entries = controller.room?.leaderboard ?? [];
-  return <section className={`leaderboard ${large ? 'large-leaderboard' : ''}`} aria-labelledby="leaderboard-title">
-    <header className="section-heading"><span className="section-number">03</span><h2 id="leaderboard-title">The leaderboard</h2><span className="live-label"><i />LIVE</span></header>
-    <div className="leaderboard-columns"><span>RANK / PLAYER</span><span>POINTS / CENT</span></div>
-    {entries.length ? <ol>{entries.slice(0, large ? 15 : 7).map((entry, index) => <li key={entry.id} className={entry.id === controller.playerId ? 'your-entry' : ''}><span className={`rank rank-${index}`}>{entry.challengeScore === null ? '--' : index === 0 && entry.challengeScore > 0 ? <Trophy size={17} /> : String(index + 1).padStart(2, '0')}</span><span className={`avatar avatar-${index % 5}`}>{entry.name.slice(0, 2).toUpperCase()}</span><div className="entry-name"><strong>{entry.name}{entry.id === controller.playerId && <small>YOU</small>}</strong><span><i className={entry.online ? 'online-marker' : 'offline-marker'} />{number(entry.score)} Tetris points</span><span className="entry-cost">{entry.costUsd == null ? 'Rates pending' : `${formatMoney(entry.costUsd)} est. spend`}</span></div><div className="entry-result"><strong className="entry-score">{formatEfficiency(entry.challengeScore)}</strong><span>{entry.unmeteredRequests > 0 ? 'Usage missing' : entry.costUsd === 0 ? 'No AI spend' : entry.costUsd == null ? 'Rates pending' : 'pts / cent'}</span></div></li>)}</ol> : <div className="leaderboard-empty"><Trophy size={36} /><strong>The top spot is open.</strong><span>0 players / 0 scores</span></div>}
-    <footer><span><Check size={13} />Verified points + usage</span><span>Current USD rates</span></footer>
+function CompressionComparison({ insight }: { insight: Insight }) {
+  const comparison = insight.promptComparison;
+  const reduction = insight.rawTokens > 0 ? Math.round(100 * (1 - insight.packedTokens / insight.rawTokens)) : 0;
+  if (!comparison) return <><p>Before/after data is unavailable for this earlier reply. Exact sent prompt:</p><pre tabIndex={0} data-testid="sent-prompt">{insight.prompt}</pre></>;
+  return <>
+    <p className="compression-verdict" data-testid="compression-verdict">{insight.compression ? 'Compression was ON. The after version was sent.' : 'Compression was OFF. The before version was sent; the after version was not.'}</p>
+    <div className="comparison-metrics"><strong>{number(insight.rawTokens)} <span>-&gt;</span> {number(insight.packedTokens)} tokens</strong><span>{number(insight.rawTokens - insight.packedTokens)} fewer / {reduction}% reduction</span></div>
+    <p className="prompt-comparison">Same board, occupied positions, and legal choices. Local board-token estimates; fixed instructions and output are separate.</p>
+    <div className="prompt-pair">
+      <section data-testid="compression-before"><header><h3>Before / cell JSON</h3><span>{insight.compression ? 'Equivalent, not sent' : 'Sent to Luna'}</span></header><pre tabIndex={0} data-testid={insight.compression ? 'verbose-prompt' : 'sent-prompt'}>{comparison.verbose}</pre></section>
+      <section data-testid="compression-after"><header><h3>After / packed rows</h3><span>{insight.compression ? 'Sent to Luna' : 'Alternative, not sent'}</span></header><pre tabIndex={0} data-testid={insight.compression ? 'sent-prompt' : 'packed-prompt'}>{comparison.packed}</pre></section>
+    </div>
+    <small>Exact encodings from the same request snapshot. Opening this comparison makes no model call.</small>
+  </>;
+}
+
+function CacheReceipt({ insight, rates, pending, enabled, hasHistory, canInspect, onInspect }: {
+  insight: Insight | null; rates: TokenRates | undefined; pending: boolean;
+  enabled: boolean; hasHistory: boolean; canInspect: boolean; onInspect: () => void;
+}) {
+  const usage = insight?.usage;
+  const state = usage && usage.cached > 0 ? 'hit' : usage && usage.cacheWrites > 0 ? 'write' : insight?.cacheEnabled ? 'miss' : insight ? 'off' : 'pending';
+  const label = state === 'hit' ? 'Cache hit' : state === 'write' ? 'Cache miss / written' : state === 'miss' ? 'Cache miss' : state === 'off' ? 'Cache was off' : pending ? 'Checking cache' : hasHistory ? 'No recent cache receipt' : enabled ? 'Cache ready' : 'Cache off';
+  const adjustment = usage && rates ? (usage.cached * (rates.cachedInput - rates.input) + usage.cacheWrites * (rates.cacheWrite - rates.input)) / 1000000 : null;
+  const instructions = usage ? usage.cached > 0 ? usage.cacheWrites > 0 ? `${number(usage.cached)} reused + ${number(usage.cacheWrites)} written` : `${number(usage.cached)} input tokens reused` : usage.cacheWrites > 0 ? `${number(usage.cacheWrites)} written; none reused` : '0 tokens reused' : pending ? 'Awaiting usage' : hasHistory ? 'Awaiting a new receipt' : enabled ? 'Eligible next request' : 'Reuse disabled';
+  return <section className={`cache-receipt cache-${state}`} aria-label="Latest cache result" data-testid="cache-receipt" data-cache-state={state}>
+    <header><Layers3 size={15} /><strong data-testid="cache-result-label">{label}</strong><small>{insight ? 'Last reply' : 'Next request'}</small><button className="icon-button" aria-label="Inspect cached instructions" title="Live cache activity and instruction text" disabled={!canInspect} onClick={onInspect}><History size={17} /></button></header>
+    <div className="cache-parts"><div className="cached-part"><span>Fixed Tetris instructions</span><b data-testid="cache-reused">{instructions}</b></div><div><span>Board + next move</span><b>{insight ? 'Processed fresh' : 'Always processed fresh'}</b></div></div>
+    {insight && <footer><span>Cache effect, this reply <small>est.</small></span><b data-testid="cache-request-adjustment" className={adjustment !== null && adjustment < 0 ? 'saved-cost' : adjustment !== null && adjustment > 0 ? 'write-premium' : ''}>{signedMoney(adjustment)}</b></footer>}
   </section>;
 }
 
-function RoomStats({ controller }: { controller: GameController }) {
-  const metrics = controller.room?.metrics;
-  const hitRate = metrics?.input ? Math.round(100 * metrics.cached / metrics.input) : 0;
-  const rates = controller.room?.pricing?.snapshot?.usdPerMillion;
-  const costUsd = metrics && rates ? costForUsage(metrics, rates).total : null;
-  const missingUsage = controller.room?.unmeteredRequests ?? 0;
-  return <div className="room-stats"><div><Users size={19} /><span>Players online</span><strong>{controller.room?.online ?? 0}</strong></div><div><Sparkles size={19} /><span>Model requests</span><strong>{metrics?.requests ?? 0}</strong></div><div><Layers3 size={19} /><span>Cache-read share</span><strong>{hitRate}%</strong></div><div><Expand size={19} /><span>Reported AI cost<small>{missingUsage ? `incomplete: ${missingUsage} request(s) without usage` : 'retail estimate'}</small></span><strong className="room-cost">{formatMoney(costUsd)}</strong></div></div>;
+function Switch({ label, icon: Icon, checked, disabled, onChange, title, detail }: {
+  label: string; icon: LucideIcon; checked: boolean; disabled?: boolean;
+  onChange: (checked: boolean) => void; title: string; detail?: string;
+}) {
+  return <label className={`game-switch ${checked ? 'is-on' : ''}`} title={title}>
+    <Icon size={17} /><span>{label}{detail && <small id={`${label}-next`} data-testid={`${label.toLowerCase()}-next`}>{detail}</small>}</span>
+    <input type="checkbox" aria-label={label} aria-describedby={detail ? `${label}-next` : undefined} checked={checked} disabled={disabled} onChange={event => onChange(event.target.checked)} />
+    <i aria-hidden="true" />
+  </label>;
 }
 
-function App() {
-  const controller = useGame();
-  const [mobileTab, setMobileTab] = useState<'game' | 'lab' | 'scores' | 'rules'>('game');
-  const [theme, setTheme] = useState(document.documentElement.dataset.theme ?? 'light');
-  const [sound, setSound] = useState(false);
-  const [restartOpen, setRestartOpen] = useState(false);
-  const audio = useRef<AudioContext | null>(null);
-  const lastPieces = useRef(0);
-  const lastLines = useRef(0);
-  const insight = controller.insights[0] ?? null;
-  const settingUp = !controller.joined || controller.editingTokens;
-  const visibleTab = settingUp && mobileTab !== 'rules' ? 'game' : mobileTab;
-  const rank = (controller.room?.leaderboard.filter(entry => entry.challengeScore !== null).findIndex(entry => entry.id === controller.playerId) ?? -1) + 1;
-  useEffect(() => {
-    const changed = controller.view.pieces > lastPieces.current;
-    const cleared = controller.view.lines > lastLines.current;
-    lastPieces.current = controller.view.pieces;
-    lastLines.current = controller.view.lines;
-    if (!sound || !changed) return;
-    try {
-      audio.current ??= new AudioContext();
-      void audio.current.resume();
-      const oscillator = audio.current.createOscillator();
-      const gain = audio.current.createGain();
-      oscillator.connect(gain);
-      gain.connect(audio.current.destination);
-      oscillator.frequency.value = cleared ? 880 : 210;
-      gain.gain.setValueAtTime(0.04, audio.current.currentTime);
-      gain.gain.exponentialRampToValueAtTime(0.001, audio.current.currentTime + 0.12);
-      oscillator.start();
-      oscillator.stop(audio.current.currentTime + 0.13);
-    } catch { audio.current = null; }
-  }, [controller.view.pieces, controller.view.lines, sound]);
-  function toggleTheme() {
-    const next = theme === 'dark' ? 'light' : 'dark';
-    document.documentElement.dataset.theme = next;
-    setTheme(next);
-  }
-  function showRules() {
-    if (controller.autopilot) controller.toggleAutopilot(false);
-    if (controller.view.status === 'playing' && controller.joined) controller.act('pause');
-    setMobileTab('rules');
-  }
-  return <div className={`app ${controller.isProjector ? 'projector-app' : ''} ${controller.view.tokens.length ? 'token-game' : ''}`} data-mobile-tab={visibleTab} data-setup={settingUp && !controller.isProjector}>
-    <header className="topbar"><a className="brand" href="/"><Mark /><div><h1>TOKENFALL<span>.</span></h1><span className="brand-caption">THE TOKEN ARCADE</span></div></a><div className="session-label"><span className="live-label"><i />LIVE SESSION</span><span>ROOM {controller.room?.code ?? '------'}</span></div><div className="top-actions"><span className={`connection-label ${controller.connected ? '' : 'disconnected'}`}>{controller.connected ? <Wifi size={15} /> : <WifiOff size={15} />}<span>{controller.connected ? 'Connected' : 'Reconnecting'}</span></span><button className="icon-button" aria-label={sound ? 'Mute sound' : 'Enable sound'} title={sound ? 'Mute sound' : 'Enable sound'} onClick={() => { if (!sound) { audio.current ??= new AudioContext(); void audio.current.resume(); } setSound(current => !current); }}>{sound ? <Volume2 size={18} /> : <VolumeX size={18} />}</button><button className="icon-button" onClick={toggleTheme} aria-label="Toggle color theme" title="Toggle color theme">{theme === 'dark' ? <Sun size={18} /> : <Moon size={18} />}</button><a className="icon-button projector-link" href={controller.isProjector ? '/' : '/?view=room'} target={controller.isProjector ? undefined : '_blank'} rel="noreferrer" title={controller.isProjector ? 'Play game' : 'Open projector view'} aria-label={controller.isProjector ? 'Play game' : 'Open projector view'}>{controller.isProjector ? <Gamepad2 size={18} /> : <Maximize2 size={18} />}</a></div></header>
-    <div className="spectrum-rule"><i /><i /><i /><i /><i /><i /><i /></div>
-    {controller.isProjector ? <main className="projector-main"><div className="projector-heading"><div><span className="eyebrow">THE POINTS-PER-CENT CHALLENGE</span><h2>More points.<br />Less AI spend.</h2></div><span className="projector-model"><Sparkles size={18} />GPT-5.6 LUNA<span>REASONING OFF</span></span></div><RoomStats controller={controller} /><div className="projector-columns"><Leaderboard controller={controller} large /><aside><JoinQr room={controller.room} large /><div className="projector-facts"><span>HOW TO WIN</span><strong>Best Tetris points<br />/ AI cost in cents</strong><p>1,000 points at $0.002 = 5,000 points per cent. Actual usage, current retail rates, no flat bonuses.</p></div><LiveRates pricing={controller.room?.pricing} /></aside></div></main> : <>
-      <nav className="mobile-tabs" aria-label="Game views"><button aria-current={visibleTab === 'game' ? 'page' : undefined} onClick={() => setMobileTab('game')}><Gamepad2 size={17} />{settingUp ? 'Setup' : 'Play'}</button><button disabled={settingUp} aria-current={visibleTab === 'lab' ? 'page' : undefined} onClick={() => { if (controller.view.status === 'playing' && controller.joined) controller.act('pause'); setMobileTab('lab'); }}><Sparkles size={17} />Token lab</button><button disabled={settingUp} aria-current={visibleTab === 'scores' ? 'page' : undefined} onClick={() => { if (controller.view.status === 'playing' && controller.joined) controller.act('pause'); setMobileTab('scores'); }}><Trophy size={17} />Scores</button><button aria-current={visibleTab === 'rules' ? 'page' : undefined} onClick={showRules}><BookOpen size={17} />Rules</button></nav>
-      {controller.autopilot && <div className="autopilot-banner"><span><Bot size={18} />Luna is playing your run</span><button className="text-action" onClick={() => controller.toggleAutopilot(false)}><Square size={15} />Stop AI</button></div>}
-      <main className="arcade-layout">
-        <section className="play-area" aria-labelledby="play-title"><header className="section-heading"><span className="section-number">01</span><h2 id="play-title">{settingUp ? 'Build your token run.' : 'Make your move.'}</h2><a className="rules-link" href="#game-rules" onClick={showRules}><BookOpen size={15} />Rules</a><span className="tiny-label">{controller.joined ? controller.name : 'TEXT TO TETRIS'}</span></header>
-          {settingUp ? <TokenSetup controller={controller} onStart={() => setMobileTab('game')} /> : <>
-          <p className="game-objective"><strong>Goal:</strong> the most Tetris points per cent of AI cost.</p>
-          <div className="scoreboard"><div className="main-score"><span>THIS RUN / POINTS PER CENT</span><strong data-testid="game-score">{formatEfficiency(controller.efficiencyScore)}</strong><small data-testid="base-score">{number(controller.view.score)} Tetris points</small></div><div><span>LINES</span><strong>{String(controller.view.lines).padStart(2, '0')}</strong></div><div><span>LEVEL</span><strong>{String(controller.view.level).padStart(2, '0')}</strong></div><button className="icon-button" disabled={controller.view.status === 'over'} title={controller.autopilot ? 'Stop AI and pause' : controller.view.status === 'paused' ? 'Resume game (P)' : 'Pause game (P)'} aria-label={controller.autopilot ? 'Stop AI and pause' : controller.view.status === 'paused' ? 'Resume game' : 'Pause game'} onClick={() => controller.autopilot ? controller.toggleAutopilot(false) : controller.act(controller.view.status === 'paused' ? 'resume' : 'pause')}>{controller.view.status === 'paused' && !controller.autopilot ? <Play size={19} /> : <Pause size={19} />}</button><button className="icon-button" disabled={controller.busy} title="Restart game" aria-label="Restart game" onClick={() => { controller.act('pause'); setRestartOpen(true); }}><RotateCcw size={18} /></button></div>
-          <div className="token-run-heading"><span data-testid="current-token">{controller.view.activeToken ? <><strong>{tokenLabel(controller.view.activeToken.text)}</strong><small>Token {controller.view.activeTokenIndex % controller.view.tokens.length + 1} / {controller.view.tokens.length} / ID {controller.view.activeToken.id}</small></> : 'Classic piece sequence'}</span><span data-testid="piece-count">{controller.view.pieces} placed</span>{controller.view.status === 'paused' && !controller.autopilot && <span className="paused-marker">Paused</span>}<button className="icon-button" title="Edit text for next run" aria-label="Edit text for next run" disabled={controller.busy} onClick={controller.editTokens}><ScanText size={18} /></button></div>
-          <TokenPowerups controller={controller} />
-          <div className="play-well"><div className="piece-rail hold-rail"><span className="eyebrow">HOLD</span><button className="hold-slot" disabled={controller.autopilot || !controller.view.canHold || controller.view.status !== 'playing'} title="Hold piece (C)" aria-label="Hold current piece" onClick={() => controller.act('hold')}><PiecePreview piece={controller.view.hold} token={controller.view.holdToken} /></button><div className="rail-rank"><Trophy size={17} /><span>RANK</span><strong>{rank ? `#${rank}` : '--'}</strong></div></div>
-            <div className="board-column"><GameBoard key={theme} view={controller.view} joined={controller.joined} suggestion={insight}>
-              {controller.view.status === 'paused' && !controller.autopilot && !controller.view.tokens.length ? <div className="board-overlay pause-overlay"><Pause size={35} /><h3>Take a breath.</h3><span>GAME PAUSED</span><button className="primary-button" onClick={() => controller.act('resume')}><Play size={16} />Resume game</button></div> : controller.view.status === 'over' ? <div className="board-overlay gameover-overlay"><Trophy size={38} /><span className="eyebrow">RUN COMPLETE / TETRIS POINTS</span><h3>{number(controller.view.score)}</h3><span>{controller.view.lines} LINES / LEVEL {controller.view.level}</span><button className="primary-button" onClick={() => void controller.restart()} disabled={controller.busy}><RotateCcw size={16} />Play again</button><button className="text-action" onClick={controller.editTokens}><ScanText size={15} />Change token text</button></div> : null}
-            </GameBoard><GameControls act={controller.act} disabled={controller.autopilot || !controller.connected || controller.view.status === 'over'} paused={controller.view.status === 'paused'} /></div>
-            <div className="piece-rail next-rail"><span className="eyebrow">NEXT TOKENS</span>{controller.view.next.slice(0, 4).map((piece, index) => <div className="next-piece" key={index}><PiecePreview piece={piece} token={controller.view.nextTokens[index]} /></div>)}<span className="bag-label">{controller.view.tokens.length ? 'REPEATING' : '7-BAG'}</span></div>
-          </div>
-          <div className="play-bottom"><span><i className="status-dot" />{controller.joined ? 'YOUR RUN IS LIVE' : 'READY WHEN YOU ARE'}</span><span>10 x 20 / SRS / HOLD</span></div>
-          <div className="mobile-luna"><LunaControls controller={controller} compact /></div>
-          </>}
-        </section>
-        <div className="lab-column"><TokenLab controller={controller} /></div>
-        <aside className="audience-column"><Leaderboard controller={controller} /><JoinQr room={controller.room} /><div className="session-totals"><span className="eyebrow">TOGETHER, THIS SESSION</span><div><strong>{number(controller.room?.metrics.cached ?? 0)}</strong><span>input tokens read from cache</span></div><div><strong>{number(controller.room?.metrics.compressionSaved ?? 0)}</strong><span>payload tokens saved <small>estimated</small></span></div></div></aside>
-      </main>
-    </>}
-    <GameRules budget={controller.room?.playerTokenBudget ?? 16000} pricing={controller.room?.pricing} />
-    <footer className="site-footer"><span><Mark />TOKENFALL / LIVE TOKEN ARCADE</span><span>STANDARD TETRIS RULES<span className="footer-separator"> / </span>REAL MODEL USAGE</span></footer>
-    {controller.notice && <div className="notice" role="status"><span>{controller.notice}</span><button className="icon-button" title="Dismiss message" aria-label="Dismiss message" onClick={() => controller.setNotice('')}><X size={16} /></button></div>}
-    {restartOpen && <div className="modal-backdrop"><div className="restart-dialog" role="dialog" aria-modal="true" aria-labelledby="restart-title"><RotateCcw size={28} /><h2 id="restart-title">Start a fresh run?</h2><p>Your best Tetris score stays. Session AI spend and the remaining token allowance do not reset.</p><div><button className="secondary-button" onClick={() => { setRestartOpen(false); controller.act('resume'); }}>Keep playing</button><button className="primary-button" onClick={() => { setRestartOpen(false); void controller.restart(); }}>New game<ArrowRight size={15} /></button></div></div></div>}
-  </div>;
-}
+export default function App() {
+  const game = useGame();
+  const [inspectedPrompt, setInspectedPrompt] = useState<Insight | null>(null);
+  const [inspectInstructions, setInspectInstructions] = useState(false);
+  const promptDialog = useRef<HTMLDialogElement | null>(null);
+  const latest = game.insight;
+  const rates = game.room?.pricing.snapshot?.usdPerMillion;
+  const compressionSaving = rates ? game.metrics.compressionSaved * rates.input / 1000000 : null;
+  const cacheSaving = rates ? (game.metrics.cached * (rates.input - rates.cachedInput) - game.metrics.cacheWrites * (rates.cacheWrite - rates.input)) / 1000000 : null;
+  const savings = compressionSaving !== null && cacheSaving !== null ? compressionSaving + cacheSaving : null;
+  const compressionAdjustment = compressionSaving === null ? null : -compressionSaving;
+  const cacheAdjustment = cacheSaving === null ? null : -cacheSaving;
+  const beforeOptimizations = game.cost && savings !== null ? game.cost.total + savings : null;
+  const cacheHits = game.metrics.cacheHits ?? 0;
+  const cacheMisses = game.metrics.cacheMisses ?? 0;
+  const unclassified = Math.max(0, game.metrics.requests - cacheHits - cacheMisses - (game.metrics.cacheBypassed ?? 0));
+  const lastCost = latest && rates ? costForUsage(latest.usage, rates).total : null;
+  const lastReduction = latest?.compression && latest.rawTokens > 0 ? Math.round(100 * latest.savedTokens / latest.rawTokens) : 0;
+  const incomplete = game.busy || game.unmeteredRequests > 0;
+  const pricing = game.room?.pricing.status;
+  const status = !game.connected ? 'Connecting' : !game.joined ? 'Ready' : game.busy ? 'Luna is thinking' : game.autopilot ? 'Luna playing' : game.view.status === 'over' ? 'Game over' : game.view.status === 'paused' ? 'Paused' : 'Manual play';
+  const cacheResult = latest ? latest.usage.cached > 0 ? `${number(latest.usage.cached)} cached` : latest.usage.cacheWrites > 0 ? `${number(latest.usage.cacheWrites)} cache write` : latest.cacheEnabled ? 'Cache miss' : 'Cache off' : '';
+  useEffect(() => { if (inspectedPrompt) promptDialog.current?.showModal(); }, [inspectedPrompt]);
 
-export default App;
+  function inspect(instructions = false) {
+    const selected = latest ?? (instructions ? game.requestHistory[0]?.insight : null);
+    if (!selected) return;
+    if (!instructions || !game.autopilot) game.act('pause');
+    setInspectInstructions(instructions);
+    setInspectedPrompt(selected);
+  }
+
+  return <main className="tetris-app" data-playing={game.joined} data-autopilot={game.autopilot}>
+    <header className="game-header">
+      <h1><span className="tetris-mark" aria-hidden="true"><i /><i /><i /><i /></span>TETRIS</h1>
+      <div className="header-actions">
+        <span className={`connection ${game.connected ? 'connected' : ''}`} title={game.connected ? 'Connected' : 'Reconnecting'} aria-label={game.connected ? 'Connected' : 'Reconnecting'}>{game.connected ? <Wifi size={16} /> : <WifiOff size={16} />}</span>
+        <button className="icon-button" aria-label={game.autopilot ? 'Stop Luna' : game.view.status === 'paused' ? 'Resume game' : 'Pause game'} title={game.autopilot ? 'Stop Luna' : game.view.status === 'paused' ? 'Resume (P)' : 'Pause (P)'} disabled={!game.joined || game.view.status === 'over'} onClick={() => game.autopilot ? game.toggleAutopilot(false) : game.act(game.view.status === 'paused' ? 'resume' : 'pause')}>
+          {game.view.status === 'paused' && !game.autopilot ? <Play size={20} /> : <Pause size={20} />}
+        </button>
+        <button className="icon-button" aria-label="New game" title="New game" disabled={!game.joined || game.busy || game.joining} onClick={() => void game.restart()}><RotateCcw size={19} /></button>
+      </div>
+    </header>
+
+    <section className="cost-ticker" aria-label="AI cost ticker" aria-live="polite" aria-atomic="true">
+      <div className="total-cost" title="Total reported AI spend across your games, at published USD rates. This is an estimate, not an invoice.">
+        <span>{incomplete ? 'AI COST / PENDING USAGE' : 'AI COST / USD EST.'}</span>
+        <strong data-testid="ai-cost" key={`cost-${game.metrics.requests}`}>{formatMoney(game.cost?.total ?? null)}</strong>
+        <small>{pricing === 'live' ? 'Live rates' : pricing === 'stale' ? 'Last verified rates' : 'Rates unavailable'}</small>
+      </div>
+      <div><span>TOKENS</span><strong data-testid="ai-tokens">{number(game.metrics.input + game.metrics.output)}</strong><small data-testid="ai-requests">{number(game.metrics.requests)} requests</small></div>
+      <div title={`Estimated compression saving: ${formatMoney(compressionSaving)}. Cache-read saving minus cache-write premium: ${formatMoney(cacheSaving)}.`}>
+        <span>{savings !== null && savings < 0 ? 'EXTRA WRITE COST' : 'SAVED / EST.'}</span>
+        <strong className={savings !== null && savings < 0 ? 'write-premium' : 'saved-cost'} data-testid="ai-savings">{formatMoney(savings !== null ? Math.abs(savings) : null)}</strong>
+        <small>Compression + cache</small>
+      </div>
+      <dl className="cost-adjustments" aria-label="Session cost adjustments">
+        <div><dt>Compression <small>est.</small></dt><dd className="saved-cost" data-testid="compression-adjustment">{signedMoney(compressionAdjustment)}</dd><span>{number(game.metrics.compressionSaved)} tokens removed</span></div>
+        <div><dt>Cache <small>net</small></dt><dd className={cacheAdjustment !== null && cacheAdjustment > 0 ? 'write-premium' : 'saved-cost'} data-testid="cache-adjustment">{signedMoney(cacheAdjustment)}</dd><span data-testid="cache-totals" title="Cache-enabled requests only. A write without a read is a miss.">{number(cacheHits)} {cacheHits === 1 ? 'hit' : 'hits'} / {number(cacheMisses)} {cacheMisses === 1 ? 'miss' : 'misses'}</span></div>
+      </dl>
+      <p className="cost-baseline"><span>Before optimizations <small>est.</small> <b data-testid="unoptimized-cost">{formatMoney(beforeOptimizations)}</b></span>{unclassified > 0 && <span data-testid="cache-unclassified">{number(unclassified)} earlier {unclassified === 1 ? 'request' : 'requests'} unclassified</span>}</p>
+      <CacheReceipt insight={latest} rates={rates} pending={game.busy} enabled={game.options.cache} hasHistory={game.metrics.requests > 0} canInspect={game.requestHistory.length > 0} onInspect={() => inspect(true)} />
+    </section>
+
+    <div className="luna-controls" aria-label="Luna controls">
+      <Switch label="Ask Luna" icon={Bot} checked={game.autopilot} disabled={!game.joined || !game.connected || game.view.status === 'over'} onChange={game.toggleAutopilot} title="Let Luna play the game automatically. Uses paid AI requests. Switch off to stop." />
+      <Switch label="Compression" icon={FileJson2} checked={game.options.compression} onChange={compression => game.setOptions(current => ({ ...current, compression }))} detail={game.options.compression ? 'Packed rows next' : 'Cell JSON next'} title="Send the same board in fewer tokens. Applies to the next request, not past costs." />
+      <Switch label="Cache" icon={Layers3} checked={game.options.cache} onChange={cache => game.setOptions(current => ({ ...current, cache }))} detail={game.options.cache ? 'Reuse rules next' : 'Full input next'} title="Reuse fixed instructions at the cache-read rate. Writes can cost extra; a hit is not guaranteed. Applies to the next request, not past costs." />
+    </div>
+
+    <div className="game-status" role="status">
+      <span className={game.autopilot ? 'luna-active' : ''} data-testid="game-status"><i className={game.busy ? 'thinking' : ''} />{status}</span>
+      <span className="request-status" data-testid="request-status" title={game.requestOptions ? 'Changes to the switches apply to the next request.' : undefined}>
+        {game.requestOptions ? `In flight: ${game.requestOptions.compression ? 'Packed' : 'Verbose'} / cache ${game.requestOptions.cache ? 'on' : 'off'}` : latest ? `${latest.compression ? 'Packed' : 'Verbose'} / ${cacheResult}` : ''}
+      </span>
+      <div className="prompt-summary">
+        <div><span data-testid="compression-detail">{latest ? latest.compression ? `Last board: ${number(latest.rawTokens)} -> ${number(latest.packedTokens)} tokens (-${lastReduction}%)` : `Last board: ${number(latest.rawTokens)} tokens, uncompressed` : game.metrics.requests ? 'Prompt available after next reply' : 'No prompt sent yet'}</span><small data-testid="last-request-cost">{latest ? `Last request ${signedMoney(lastCost)} / USD est.` : 'No charge for changing settings'}</small></div>
+        <button className="icon-button" aria-label="Inspect last prompt" title="Compare compression before and after; pauses play" disabled={!latest} onClick={() => inspect()}><Columns2 size={18} /></button>
+      </div>
+    </div>
+
+    <section className="game-stage" aria-label="Tetris game">
+      <div className="scoreboard">
+        <div className="main-score"><span>SCORE</span><strong data-testid="game-score">{number(game.view.score)}</strong></div>
+        <div><span>LINES</span><strong data-testid="game-lines">{number(game.view.lines)}</strong></div>
+        <div><span>LEVEL</span><strong data-testid="game-level">{number(game.view.level)}</strong></div>
+      </div>
+      <div className="play-well">
+        <aside className="piece-rail"><span>HOLD</span><button className="hold-slot" title="Hold (C)" aria-label="Hold current piece" disabled={!game.joined || game.autopilot || !game.view.canHold || game.view.status !== 'playing'} onClick={() => game.act('hold')}><PiecePreview piece={game.view.hold} /></button></aside>
+        <div className="board-column">
+          <GameBoard view={game.view} joined={game.joined} suggestion={latest}>
+            {!game.joined ? <div className="board-overlay"><strong>{game.joining ? 'Connecting...' : 'Ready'}</strong>{!game.joining && <button className="primary-button" onClick={game.join}><Play size={18} />Play</button>}</div>
+              : game.view.status === 'over' ? <div className="board-overlay gameover-overlay"><h2>Game over</h2><strong>{number(game.view.score)}</strong><button className="primary-button" disabled={game.busy} onClick={() => void game.restart()}><RotateCcw size={17} />Play again</button></div>
+              : game.view.status === 'paused' && !game.autopilot ? <div className="board-overlay pause-overlay"><button className="resume-button" aria-label="Resume" title="Resume (P)" onClick={() => game.act('resume')}><Play size={30} /></button><span>PAUSED</span></div> : null}
+          </GameBoard>
+          <GameControls act={game.act} disabled={!game.joined || game.autopilot || !game.connected || game.view.status === 'over'} paused={game.view.status === 'paused'} />
+        </div>
+        <aside className="piece-rail next-rail"><span>NEXT</span>{game.view.next.slice(0, 3).map((piece, index) => <div className="next-piece" key={index}><PiecePreview piece={piece} /></div>)}</aside>
+      </div>
+    </section>
+    <dialog className={`prompt-dialog ${inspectInstructions ? 'activity-dialog' : 'compression-dialog'}`} ref={promptDialog} aria-labelledby="prompt-title" onClose={() => setInspectedPrompt(null)}>
+      <header><h2 id="prompt-title">{inspectInstructions ? 'Cache activity' : 'Compression before / after'}</h2><div className="inspector-actions">{inspectInstructions && game.autopilot && <button className="icon-button" aria-label="Stop Luna in inspector" title="Stop Luna" onClick={() => game.toggleAutopilot(false)}><Pause size={19} /></button>}<button className="icon-button" aria-label="Close prompt" title="Close prompt" onClick={() => promptDialog.current?.close()}><X size={19} /></button></div></header>
+      {inspectedPrompt && (inspectInstructions ? <CacheActivity records={game.requestHistory} selected={inspectedPrompt} rates={rates} pending={game.busy} unknown={game.unmeteredRequests} onSelect={setInspectedPrompt} /> : <CompressionComparison insight={inspectedPrompt} />)}
+    </dialog>
+    {game.notice && <div className="notice" role="alert"><span>{game.notice}</span><button className="icon-button" aria-label="Dismiss message" title="Dismiss" onClick={() => game.setNotice('')}><X size={18} /></button></div>}
+  </main>;
+}

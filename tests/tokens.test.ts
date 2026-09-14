@@ -1,5 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { ghostCells, pieceCells, spawnTetromino } from 'miaoda-game-fallblock-core';
 import { Game, WIDTH, HEIGHT, placementsFor } from '../shared/game.ts';
 import { costForUsage, emptyMetrics, pointsPerCent, tokenCreditsUsed } from '../shared/protocol.ts';
 import { packBoard, unpackBoard, buildPrompts, countTokens, tokenChips, decodeTokens, normalizeUsage, addUsage, gameTokens } from '../server/tokens.ts';
@@ -67,14 +68,75 @@ test('custom token text never enters the model prompt while packed shape informa
   const prompts = buildPrompts(game, placementsFor(game));
   assert.ok(!prompts.verbose.includes(text));
   assert.ok(!prompts.packed.includes(text));
-  assert.deepEqual(Object.keys(JSON.parse(prompts.packed)).sort(), ['active', 'board', 'canHold', 'height', 'hiddenRows', 'hold', 'level', 'next', 'placements', 'width']);
+  assert.deepEqual(Object.keys(JSON.parse(prompts.packed)).sort(), ['active', 'board', 'boardState', 'canHold', 'coordinateOrder', 'height', 'hiddenRows', 'hold', 'level', 'lines', 'next', 'piecesPlaced', 'placements', 'randomizer', 'score', 'width']);
   assert.deepEqual(unpackBoard(JSON.parse(prompts.packed).board), game.well.toArray());
   assert.deepEqual(JSON.parse(prompts.packed).next, game.queue.peek());
 });
 
+test('Luna receives unranked Hold choices, terminal facts and the real current-board profile', () => {
+  const game = new Game('luna-context');
+  game.act('hardDrop');
+  const candidates = placementsFor(game);
+  const prompts = buildPrompts(game, candidates);
+  const packed = JSON.parse(prompts.packed);
+  const verbose = JSON.parse(prompts.verbose);
+  assert.equal(packed.height, 22);
+  assert.equal(packed.hiddenRows, 2);
+  assert.equal(packed.randomizer, 'seven-bag');
+  assert.equal(packed.boardState.columnHeights.length, 10);
+  assert.equal(packed.boardState.aggregateHeight, packed.boardState.columnHeights.reduce((sum: number, height: number) => sum + height, 0));
+  assert.deepEqual(packed.placements.map((placement: { id: string }) => placement.id), candidates.map(candidate => candidate.id));
+  assert.ok(packed.placements.some((placement: { useHold: boolean }) => placement.useHold));
+  assert.ok(packed.placements.every((placement: { gameOver: boolean; columnHeights: number[] }) => typeof placement.gameOver === 'boolean' && placement.columnHeights.length === 10));
+  assert.deepEqual(packed.placements, verbose.placements);
+  assert.deepEqual(packed.boardState, verbose.boardState);
+  assert.equal(packed.next.length, 5);
+});
+
+test('the full board and exact active, ghost and candidate cells reach Luna in both formats', () => {
+  const game = new Game('explicit-positions');
+  game.well.set(9, 0, 'J');
+  game.well.set(0, HEIGHT - 1, 'S');
+  game.well.set(1, HEIGHT - 2, 'T');
+  game.well.set(1, HEIGHT - 1, 'Z');
+  game.act('rotateCW');
+  game.act('left');
+  const before = game.view();
+  const candidates = placementsFor(game);
+  const prompts = buildPrompts(game, candidates);
+  const verbose = JSON.parse(prompts.verbose);
+  const packed = JSON.parse(prompts.packed);
+  assert.equal(verbose.board.length, WIDTH * HEIGHT);
+  assert.equal(packed.board.length, HEIGHT);
+  assert.ok(packed.board.every((row: string) => row.length === WIDTH));
+  assert.deepEqual(unpackBoard(packed.board), game.well.toArray());
+  for (let index = 0; index < WIDTH * HEIGHT; index += 1) {
+    assert.deepEqual(verbose.board[index], { row: Math.floor(index / WIDTH), column: index % WIDTH, value: game.well.toArray()[index] });
+  }
+  const coordinates = (cells: { x: number; y: number }[]) => cells.map(cell => [cell.x, cell.y]);
+  for (const prompt of [verbose, packed]) {
+    assert.equal(prompt.coordinateOrder, '[column,row]');
+    assert.ok(Object.keys(prompt).indexOf('board') < Object.keys(prompt).indexOf('placements'));
+    assert.deepEqual(prompt.active.cells, coordinates(pieceCells(game.active)));
+    assert.deepEqual(prompt.active.hardDropCells, coordinates(ghostCells(game.well, game.active)));
+    assert.equal(prompt.piecesPlaced, game.pieces);
+    assert.equal(prompt.lines, game.lines);
+    assert.equal(prompt.score, game.score);
+    assert.equal(prompt.placements.length, candidates.length);
+    candidates.forEach((candidate, index) => {
+      const piece = spawnTetromino(candidate.piece, candidate.piece, candidate.column, candidate.row);
+      piece.cells = piece.orientations![candidate.rotation];
+      assert.deepEqual(prompt.placements[index].cells, coordinates(pieceCells(piece)));
+      assert.equal(prompt.placements[index].id, candidate.id);
+    });
+  }
+  assert.deepEqual(verbose.placements, packed.placements);
+  assert.deepEqual(game.view(), before);
+});
+
 test('verified cache hits preserve gameplay credits without hiding provider tokens', () => {
   const usage = normalizeUsage({ prompt_tokens: 2000, completion_tokens: 20, total_tokens: 2020, prompt_tokens_details: { cached_tokens: 1500, cache_write_tokens: 0 }, completion_tokens_details: { reasoning_tokens: 0 } });
-  const metrics = addUsage(emptyMetrics(), usage, 3000);
+  const metrics = addUsage(emptyMetrics(), usage, 3000, true);
   assert.equal(metrics.input + metrics.output, 2020);
   assert.equal(metrics.cached, 1500);
   assert.equal(metrics.compressionSaved, 3000);
@@ -83,6 +145,23 @@ test('verified cache hits preserve gameplay credits without hiding provider toke
   const cacheWrite = { ...usage, cached: 0, cacheWrites: 1500 };
   assert.equal(tokenCreditsUsed(cacheWrite), 2020);
   assert.equal(usage.reasoning, 0);
+});
+
+test('cache counters separate hits, write misses, ordinary misses and bypassed requests', () => {
+  const base = { input: 2000, output: 20, total: 2020, cached: 0, cacheWrites: 0, reasoning: 0 };
+  const initial = emptyMetrics();
+  const bypassed = addUsage(initial, base, 0, false);
+  const written = addUsage(bypassed, { ...base, cacheWrites: 1200 }, 3000, true);
+  const hit = addUsage(written, { ...base, cached: 1200 }, 3000, true);
+  const missed = addUsage(hit, base, 3000, true);
+  assert.equal(missed.requests, 4);
+  assert.equal(missed.cacheHits, 1);
+  assert.equal(missed.cacheMisses, 2);
+  assert.equal(missed.cacheBypassed, 1);
+  assert.equal(missed.cached, 1200);
+  assert.equal(missed.cacheWrites, 1200);
+  assert.equal(missed.compressionSaved, 9000);
+  assert.deepEqual(initial, emptyMetrics());
 });
 
 test('retail cost prices ordinary input, cache reads, writes and output exactly once', () => {

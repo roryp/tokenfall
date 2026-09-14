@@ -176,7 +176,46 @@ test('model candidates are legal input paths and do not mutate the game', () => 
     for (const action of placement.path) copy.act(action);
     assert.equal(copy.pieces, 1);
     assert.equal(copy.lines, placement.clearedLines);
+    assert.equal(copy.status === 'over', placement.gameOver);
     assert.ok(refreshPlacement(game, placement));
+  }
+});
+
+test('Luna can choose an empty or occupied Hold slot through an exact legal path', () => {
+  const game = new Game('luna-hold');
+  for (const occupied of [false, true]) {
+    if (occupied) { game.act('hold'); game.act('hardDrop'); }
+    const before = game.view();
+    const candidate = placementsFor(game).find(placement => placement.useHold && !placement.gameOver)!;
+    assert.ok(candidate);
+    assert.equal(candidate.path[0], 'hold');
+    assert.equal(candidate.piece, game.hold ?? game.queue.peek()[0]);
+    assert.deepEqual(game.view(), before);
+    const copy = Game.restore(game.replay());
+    for (const action of candidate.path) copy.act(action);
+    assert.equal(copy.pieces, game.pieces + 1);
+    assert.equal(copy.hold, game.piece);
+    assert.equal(copy.tokensTaken, game.tokensTaken + (occupied ? 1 : 2));
+    assert.equal(refreshPlacement(game, candidate)?.id, candidate.id);
+  }
+  game.act('hold');
+  assert.equal(placementsFor(game).some(placement => placement.useHold), false);
+});
+
+test('candidate game-over flags match real lock and next-spawn outcomes without hiding choices', () => {
+  const game = new Game('luna-danger');
+  game.active = game.newPiece('I');
+  for (let row = 3; row < HEIGHT; row += 1) game.well.set(4, row, 'J');
+  const placements = placementsFor(game);
+  assert.ok(placements.some(placement => placement.gameOver));
+  assert.ok(placements.some(placement => !placement.gameOver));
+  for (const placement of placements) {
+    const copy = new Game(game.seed);
+    copy.active = copy.newPiece('I');
+    game.well.toArray().forEach((cell, index) => copy.well.set(index % WIDTH, Math.floor(index / WIDTH), cell));
+    for (const action of placement.path) copy.act(action);
+    assert.equal(copy.status === 'over', placement.gameOver, placement.id);
+    assert.equal(copy.lines, placement.clearedLines, placement.id);
   }
 });
 
@@ -194,7 +233,7 @@ test('invalid and backward frame numbers cannot be replayed', () => {
   game.advanceTo(20);
   assert.throws(() => game.advanceTo(19));
   assert.throws(() => game.advanceTo(Number.NaN));
-  assert.throws(() => game.advanceTo(216001));
+  assert.throws(() => game.advanceTo(Number.MAX_SAFE_INTEGER + 1));
 });
 
 test('paused token experiments offer legal moves without advancing the board', () => {

@@ -1,6 +1,7 @@
 import { getEncoding } from 'js-tiktoken';
+import { ghostCells, pieceCells, spawnTetromino } from 'miaoda-game-fallblock-core';
 import { z } from 'zod';
-import { HEIGHT, HIDDEN_ROWS, WIDTH } from '../shared/game.ts';
+import { boardMetrics, HEIGHT, HIDDEN_ROWS, WIDTH } from '../shared/game.ts';
 import type { Cell, Game, Placement } from '../shared/game.ts';
 import type { Metrics, TokenChip, Usage } from '../shared/protocol.ts';
 
@@ -32,15 +33,28 @@ export function unpackBoard(rows: string[]): Cell[] {
 }
 
 export function buildPrompts(game: Game, placements: Placement[]) {
+  const positions = (cells: readonly { x: number; y: number }[]) => cells.map(cell => [cell.x, cell.y]);
+  const layout = {
+    width: WIDTH, height: HEIGHT, hiddenRows: HIDDEN_ROWS, coordinateOrder: '[column,row]',
+  };
   const common = {
-    width: WIDTH, height: HEIGHT, hiddenRows: HIDDEN_ROWS,
-    active: { type: game.piece, column: game.active.x, row: game.active.y, rotation: game.active.rot ?? 0 },
+    randomizer: game.tokens.length ? 'repeating' : 'seven-bag',
+    active: {
+      type: game.piece, column: game.active.x, row: game.active.y, rotation: game.active.rot ?? 0,
+      cells: positions(pieceCells(game.active)), hardDropCells: positions(ghostCells(game.well, game.active)),
+    },
     hold: game.hold, canHold: !game.usedHold, next: game.queue.peek(), level: game.level,
-    placements: placements.map(({ path: _path, ...placement }) => placement),
+    piecesPlaced: game.pieces, lines: game.lines, score: game.score,
+    boardState: boardMetrics(game.well),
+    placements: placements.map(({ path: _path, ...placement }) => {
+      const landed = spawnTetromino<Cell>(placement.piece, placement.piece, placement.column, placement.row);
+      landed.cells = landed.orientations![placement.rotation];
+      return { ...placement, cells: positions(pieceCells(landed)) };
+    }),
   };
   const board = game.well.toArray();
-  const verbose = JSON.stringify({ ...common, board: board.map((value, index) => ({ row: Math.floor(index / WIDTH), column: index % WIDTH, value })) }, null, 2);
-  const packed = JSON.stringify({ ...common, board: packBoard(board) });
+  const verbose = JSON.stringify({ ...layout, board: board.map((value, index) => ({ row: Math.floor(index / WIDTH), column: index % WIDTH, value })), ...common });
+  const packed = JSON.stringify({ ...layout, board: packBoard(board), ...common });
   return { verbose, packed, rawTokens: countTokens(verbose), packedTokens: countTokens(packed) };
 }
 
@@ -63,10 +77,13 @@ export function normalizeUsage(value: unknown): Usage {
   };
 }
 
-export function addUsage(metrics: Metrics, usage: Usage, savedTokens: number): Metrics {
+export function addUsage(metrics: Metrics, usage: Usage, savedTokens: number, cacheEnabled: boolean): Metrics {
   return {
     requests: metrics.requests + 1, input: metrics.input + usage.input, output: metrics.output + usage.output,
     cached: metrics.cached + usage.cached, cacheWrites: metrics.cacheWrites + usage.cacheWrites,
     reasoning: metrics.reasoning + (usage.reasoning ?? 0), compressionSaved: metrics.compressionSaved + Math.max(0, savedTokens),
+    cacheHits: (metrics.cacheHits ?? 0) + Number(cacheEnabled && usage.cached > 0),
+    cacheMisses: (metrics.cacheMisses ?? 0) + Number(cacheEnabled && usage.cached === 0),
+    cacheBypassed: (metrics.cacheBypassed ?? 0) + Number(!cacheEnabled),
   };
 }

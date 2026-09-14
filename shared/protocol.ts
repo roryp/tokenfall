@@ -1,6 +1,16 @@
 import type { GameView, InputEvent, Placement, Replay } from './game.ts';
 
 export interface TokenChip { id: number; text: string }
+export interface PromptPreview {
+  runId: string;
+  pieceId: number;
+  rawTokens: number;
+  packedTokens: number;
+  prefixTokens: number;
+  maxOutputTokens: number;
+  rawReservation: number;
+  packedReservation: number;
+}
 export interface Usage {
   input: number;
   output: number;
@@ -55,13 +65,16 @@ export interface Metrics {
   cacheWrites: number;
   reasoning: number;
   compressionSaved: number;
+  cacheHits: number;
+  cacheMisses: number;
+  cacheBypassed: number;
 }
-export const emptyMetrics = (): Metrics => ({ requests: 0, input: 0, output: 0, cached: 0, cacheWrites: 0, reasoning: 0, compressionSaved: 0 });
+export const emptyMetrics = (): Metrics => ({ requests: 0, input: 0, output: 0, cached: 0, cacheWrites: 0, reasoning: 0, compressionSaved: 0, cacheHits: 0, cacheMisses: 0, cacheBypassed: 0 });
 export const tokenCreditsUsed = (usage: Pick<Usage, 'input' | 'output' | 'cached'>) => Math.max(0, usage.input - usage.cached) + usage.output;
 export interface Insight {
   id: string;
   pieceId: number;
-  placement: Pick<Placement, 'column' | 'row' | 'rotation'> | null;
+  placement: (Pick<Placement, 'column' | 'row' | 'rotation'> & Partial<Pick<Placement, 'piece' | 'useHold'>>) | null;
   tip: string;
   status: 'ready' | 'stale' | 'invalid';
   usage: Usage;
@@ -72,6 +85,8 @@ export interface Insight {
   compression: boolean;
   cacheEnabled: boolean;
   prompt: string;
+  systemPrompt?: string;
+  promptComparison?: { verbose: string; packed: string };
   outputText: string;
   inputChips: TokenChip[];
   outputChips: TokenChip[];
@@ -93,6 +108,7 @@ export interface RoomView {
   online: number;
   capacity: number;
   leaderboard: LeaderboardEntry[];
+  pointsLeaderboard: LeaderboardEntry[];
   metrics: Metrics;
   joinUrl: string | null;
   model: string;
@@ -104,13 +120,16 @@ export interface RoomView {
   aiCooldownMs: number;
   autopilotCooldownMs: number;
 }
-export interface JoinResult {
+export interface PlayerUsage {
+  metrics: Metrics;
+  unmeteredRequests: number;
+}
+export interface JoinResult extends PlayerUsage {
   token: string;
   playerId: string;
   runId: string;
   sequence: number;
   replay: Replay;
-  metrics: Metrics;
   name: string;
   tokenText: string;
 }
@@ -120,13 +139,15 @@ export interface AiOptions { cache: boolean; compression: boolean; autopilot?: b
 export type Reply<Value> = { ok: true; data: Value } | { ok: false; error: string; code?: string; retryAfterMs?: number };
 export interface ServerEvents {
   room: (room: RoomView) => void;
+  usage: (usage: PlayerUsage) => void;
   notice: (message: string) => void;
 }
 export interface ClientEvents {
-  join: (data: { name: string; room: string; token?: string; text?: string }, reply: (result: Reply<JoinResult>) => void) => void;
+  join: (data: { name: string; room: string; token?: string; text?: string; classic?: boolean }, reply: (result: Reply<JoinResult>) => void) => void;
   inputs: (data: InputBatch, reply: (result: Reply<InputAck>) => void) => void;
   restart: (reply: (result: Reply<JoinResult>) => void) => void;
   configure: (data: { text: string }, reply: (result: Reply<JoinResult>) => void) => void;
+  inspect: (reply: (result: Reply<PromptPreview>) => void) => void;
   assist: (options: AiOptions, reply: (result: Reply<{ insight: Insight; metrics: Metrics }>) => void) => void;
 }
 export type { GameView };

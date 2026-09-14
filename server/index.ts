@@ -18,8 +18,8 @@ application.server.on('error', error => {
   void application.close();
 });
 application.server.listen(config.port, config.host ?? '127.0.0.1', () => {
-  console.log(`Tokenfall listening on ${config.host ?? '127.0.0.1'}:${config.port}`);
-  console.log(`Projector: ${config.publicUrl ?? `http://127.0.0.1:${config.port}`}/?view=room`);
+  console.log(`Tetris listening on ${config.host ?? '127.0.0.1'}:${config.port}`);
+  console.log(`Play: ${config.publicUrl ?? `http://127.0.0.1:${config.port}`}`);
   console.log(`Room ${application.room.code} | ${config.deployment} | reasoning: none`);
 });
 for (const signal of ['SIGINT', 'SIGTERM'] as const) process.once(signal, () => { clearInterval(pricingTimer); void application.close().then(() => process.exit(0)); });
