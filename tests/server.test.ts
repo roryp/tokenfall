@@ -3,17 +3,22 @@ import assert from 'node:assert/strict';
 import { mkdtempSync, rmSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { Client } from '@modelcontextprotocol/sdk/client/index.js';
+import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
 import { io as connect } from 'socket.io-client';
 import { TETROMINOES } from 'miaoda-game-fallblock-core';
-import { Game, placementsFor } from '../shared/game.ts';
-import { emptyMetrics, tokenCreditsUsed } from '../shared/protocol.ts';
+import { boardMetrics, Game, placementsFor } from '../shared/game.ts';
+import { costForUsage, emptyMetrics, reportedTokenBalance, tokenAllowance, tokenCreditsUsed } from '../shared/protocol.ts';
 import type { Insight, JoinResult, Reply, RoomView, TokenPricing } from '../shared/protocol.ts';
 import { createApplication } from '../server/app.ts';
 import { loadConfig } from '../server/config.ts';
-import { AI_COOLDOWN_MS, AUTOPILOT_COOLDOWN_MS, LunaGateway, MAX_OUTPUT_TOKENS, MAX_REASONING_COMPLETION_TOKENS, ModelGate, PLAYER_REQUEST_LIMIT, PLAYER_TOKEN_BUDGET, POLICY, PREFIX_TOKENS, ROOM_TOKEN_BUDGET } from '../server/model.ts';
+import { AI_COOLDOWN_MS, AUTOPILOT_COOLDOWN_MS, LunaGateway, MAX_OUTPUT_TOKENS, MAX_REASONING_COMPLETION_TOKENS, ModelGate, PLAYER_REQUEST_LIMIT, PLAYER_TOKEN_BUDGET, POLICY, PREFIX_TOKENS, ROOM_REQUEST_LIMIT, ROOM_TOKEN_BUDGET } from '../server/model.ts';
 import type { ModelGateway } from '../server/model.ts';
 import { Room } from '../server/room.ts';
-import { buildPrompts, gameTokens } from '../server/tokens.ts';
+import { buildPrompts, countTokens, gameTokens } from '../server/tokens.ts';
+import { lookaheadSnapshot, lookupBoardFacts, lookupFutureMoves, McpLookupError, MAX_MCP_CONTEXT_TOKENS } from '../server/mcp.ts';
+import { analyzeFutureMoves, boardFactsSchema, lookaheadOutputSchema } from '../server/mcp-server.ts';
 
 function fixture() {
   const dataDirectory = mkdtempSync(path.join(os.tmpdir(), 'tokenfall-test-'));
@@ -40,6 +45,373 @@ function insightFor(game: Game): Insight {
     prompt: 'Test prompt', outputText: '{}', inputChips: [], outputChips: [],
   };
 }
+
+test('AI allowance counts output and MCP input once and distinguishes unavailable reservations from reported spend', () => {
+  const usage = { ...emptyMetrics(), input: 12000, output: 2000, reasoning: 1500, cached: 4000 };
+  assert.deepEqual(tokenAllowance(30000, usage, 10000, 1000), { limit: 30000, used: 14000, reserved: 10000, unconfirmed: 1000, remaining: 5000 });
+  assert.equal(reportedTokenBalance(tokenAllowance(30000, usage, 10000, 1000)), 16000);
+  assert.equal(reportedTokenBalance(tokenAllowance(30000, usage)), 16000);
+  assert.equal(reportedTokenBalance(tokenAllowance(10000, usage)), 0);
+  assert.equal(tokenAllowance(30000, usage).remaining, 16000);
+  assert.equal(tokenAllowance(10000, usage).remaining, 0);
+  const gate = new ModelGate();
+  assert.throws(() => gate.acquire('large', 16001, 0, 0), error => (error as { code: string }).code === 'request-size');
+  assert.throws(() => gate.acquire('personal', 4000, 18000, 18000, 0, false, 20000), /2[,\s]000 left.*4[,\s]000/);
+  assert.throws(() => gate.acquire('shared', 4000, 0, ROOM_TOKEN_BUDGET - 1000), error => (error as { code: string }).code === 'room-budget');
+});
+
+test('personal AI allowances persist and can be increased without resetting scores, usage or sentence games', async context => {
+  context.mock.timers.enable({ apis: ['Date'], now: 20000 });
+  const setup = fixture();
+  let room = new Room(setup.config, setup.gateway);
+  try {
+    const joined = room.join('Budget Setup', room.code, undefined, 'budget', 'A shared token pool.', false, 24000);
+    const player = room.playerFor('budget');
+    assert.equal(joined.allowance.limit, 24000);
+    assert.equal(joined.allowance.remaining, 24000);
+    player.metrics = { ...emptyMetrics(), input: 20000, output: 1000, cached: 7000, reasoning: 500, requests: 2 };
+    player.record.attempts = 2;
+    player.record.best_score = 987;
+    room.save(player);
+    await assert.rejects(room.assist(player, { compression: true, cache: false }), /3[,\s]000 left/);
+    assert.equal(player.record.attempts, 2);
+    const run = player.runId;
+    const adjusted = room.setAllowance(player, 60000);
+    assert.equal(adjusted.allowance.remaining, 39000);
+    assert.equal(player.runId, run);
+    assert.equal(player.record.best_score, 987);
+    const reply = await room.assist(player, { compression: true, cache: false });
+    assert.equal(reply.allowance.used, 23020);
+    assert.equal(reply.allowance.remaining, 36980);
+    assert.equal(reply.allowance.reserved, 0);
+    context.mock.timers.tick(2100);
+    const restarted = room.restart(player, 'A new sentence.');
+    assert.deepEqual(restarted.allowance, reply.allowance);
+    for (const invalid of [0, 15999, 16000.5, 8000001, NaN]) assert.throws(() => room.setAllowance(player, invalid));
+    assert.throws(() => room.setAllowance(player, 16000), /already used or held/);
+    room.disconnect('budget');
+    room.close();
+    room = new Room(setup.config, setup.gateway);
+    const restored = room.join('Budget Setup', room.code, joined.token, 'restored');
+    assert.deepEqual(restored.allowance, reply.allowance);
+    assert.equal(restored.tokenText, 'A new sentence.');
+    assert.equal(room.view().pointsLeaderboard[0].score, 987);
+  } finally { room.close(); rmSync(setup.dataDirectory, { recursive: true, force: true }); }
+});
+
+test('existing databases gain the allowance setting without losing player records', () => {
+  const setup = fixture();
+  let room = new Room(setup.config, setup.gateway);
+  try {
+    const joined = room.join('Legacy Budget', room.code, undefined, 'legacy', 'Existing sentence.');
+    const player = room.playerFor('legacy');
+    player.metrics = { ...emptyMetrics(), requests: 50, input: 800000, output: 1000, reasoning: 500 };
+    player.record.attempts = 50;
+    player.record.best_score = 321;
+    room.disconnect('legacy');
+    room.database.exec('ALTER TABLE players DROP COLUMN token_limit');
+    room.close();
+    room = new Room(setup.config, setup.gateway);
+    const restored = room.join('Legacy Budget', room.code, joined.token, 'resumed', undefined, false, 16000);
+    assert.equal(restored.playerId, joined.playerId);
+    assert.equal(restored.allowance.limit, ROOM_TOKEN_BUDGET);
+    assert.equal(restored.allowance.used, 801000);
+    assert.equal(restored.allowance.remaining, ROOM_TOKEN_BUDGET - 801000);
+    assert.equal(restored.tokenText, 'Existing sentence.');
+    assert.equal(room.view().pointsLeaderboard[0].score, 321);
+  } finally { room.close(); rmSync(setup.dataDirectory, { recursive: true, force: true }); }
+});
+
+test('socket allowance configuration validates the limit and only changes the authenticated player', async () => {
+  const setup = fixture();
+  const application = createApplication(setup.config, setup.gateway);
+  await new Promise<void>(resolve => application.server.listen(0, '127.0.0.1', resolve));
+  const address = application.server.address() as { port: number };
+  const client = connect(`http://127.0.0.1:${address.port}`, { transports: ['websocket'] });
+  try {
+    const notJoined = await client.timeout(5000).emitWithAck('allowance', { tokenLimit: 50000 });
+    assert.equal(notJoined.ok, false);
+    assert.equal(notJoined.code, 'session');
+    for (const tokenLimit of [-1, 15999, 16000.5, 8000001, '50000']) {
+      const rejected = await client.timeout(5000).emitWithAck('join', { name: 'Budget Client', room: application.room.code, tokenLimit });
+      assert.equal(rejected.ok, false);
+    }
+    assert.equal(application.room.players.size, 0);
+    const joined = await client.timeout(5000).emitWithAck('join', { name: 'Budget Client', room: application.room.code, text: 'A chosen allowance.', tokenLimit: 50000 });
+    assert.equal(joined.ok, true);
+    assert.equal(joined.data.allowance.limit, 50000);
+    const invalid = await client.timeout(5000).emitWithAck('allowance', { tokenLimit: 60000, playerId: 'somebody-else' });
+    assert.equal(invalid.ok, false);
+    const changed = await client.timeout(5000).emitWithAck('allowance', { tokenLimit: 60000 });
+    assert.equal(changed.ok, true);
+    assert.equal(changed.data.allowance.remaining, 60000);
+    assert.equal(changed.data.metrics.requests, 0);
+    assert.equal(application.room.players.get(joined.data.playerId)!.runId, joined.data.runId);
+  } finally { client.disconnect(); await application.close(); rmSync(setup.dataDirectory, { recursive: true, force: true }); }
+});
+
+test('AI allowance reserves in-flight requests and keeps unreported usage distinct from spend', async () => {
+  const setup = fixture();
+  let complete!: (value: Insight) => void;
+  let fail = false;
+  const room = new Room(setup.config, { complete: async () => {
+    if (fail) throw new Error('Provider usage unavailable');
+    return new Promise<Insight>(resolve => { complete = resolve; });
+  } });
+  try {
+    room.join('In Flight', room.code, undefined, 'pending', undefined, false, 32000);
+    const player = room.playerFor('pending');
+    const pending = room.assist(player, { compression: true, cache: false });
+    const held = room.usage(player).allowance;
+    assert.ok(held.reserved > 0);
+    assert.equal(held.used, 0);
+    assert.equal(held.unconfirmed, 0);
+    assert.equal(held.remaining, 32000 - held.reserved);
+    assert.equal(room.view().allowance.reserved, held.reserved);
+    complete(insightFor(player.game));
+    const result = await pending;
+    assert.equal(result.allowance.used, 2020);
+    assert.equal(result.allowance.reserved, 0);
+    assert.equal(result.allowance.remaining, 29980);
+    room.join('Unknown Usage', room.code, undefined, 'unknown', undefined, false, 32000);
+    fail = true;
+    await assert.rejects(room.assist(room.playerFor('unknown'), { compression: true, cache: false }), /usage unavailable/);
+    const unknown = room.usage(room.playerFor('unknown')).allowance;
+    assert.equal(unknown.used, 0);
+    assert.equal(unknown.reserved, 0);
+    assert.equal(unknown.unconfirmed, 16000);
+    assert.equal(unknown.remaining, 16000);
+    assert.equal(room.view().allowance.unconfirmed, 16000);
+  } finally { room.close(); rmSync(setup.dataDirectory, { recursive: true, force: true }); }
+});
+
+test('MCP lookahead computes achievable two-piece outcomes without choosing the first move or mutating play', () => {
+  const game = new Game('lookahead-proof', gameTokens('Hello world! Tokens make my blocks.'));
+  game.act('left');
+  game.act('hardDrop');
+  const before = game.view();
+  const board = buildPrompts(game, placementsFor(game)).packed;
+  const input = { board: JSON.parse(board).board as string[], active: { piece: game.piece, column: game.active.x, row: game.active.y, rotation: game.active.rot ?? 0 }, hold: game.hold, canHold: !game.usedHold, next: game.queue.peek() };
+  const analysis = analyzeFutureMoves(input);
+  const candidates = placementsFor(game);
+  assert.deepEqual(analysis.moves.map(move => move[0]), candidates.map(candidate => candidate.id));
+  assert.ok(analysis.continuationsEvaluated > candidates.length);
+  for (const [index, candidate] of candidates.entries()) {
+    const branch = Game.restore(game.replay());
+    for (const action of candidate.path) branch.act(action);
+    const replies = placementsFor(branch);
+    const move = analysis.moves[index];
+    assert.equal(move[1], replies.length);
+    assert.equal(move[2], replies.filter(reply => !reply.gameOver).length);
+    for (const forecast of [move[3], move[4]]) {
+      if (!forecast) continue;
+      const reply = replies.find(option => option.id === forecast[0])!;
+      assert.ok(reply);
+      assert.equal(reply.gameOver, false);
+      assert.deepEqual(forecast.slice(1), [reply.piece, reply.useHold, candidate.clearedLines + reply.clearedLines, reply.holes, reply.maxHeight]);
+    }
+  }
+  assert.deepEqual(game.view(), before);
+});
+
+test('real MCP lookahead exposes a line clear and five fewer holes missed by immediate-only evaluation', async () => {
+  const game = new Game('lookahead-advantage-18');
+  for (let turn = 0; turn < 6; turn += 1) {
+    const legal = placementsFor(game).filter(move => !move.gameOver);
+    const choice = legal[(18 * 17 + turn * 23) % legal.length];
+    for (const action of choice.path) game.act(action);
+  }
+  const candidates = placementsFor(game).filter(move => !move.gameOver);
+  const greedy = [...candidates].sort((first, second) => first.holes - second.holes || second.clearedLines - first.clearedLines || first.aggregateHeight - second.aggregateHeight || first.maxHeight - second.maxHeight)[0];
+  const lookup = await lookupFutureMoves(lookaheadSnapshot(game));
+  const analysis = lookaheadOutputSchema.parse(JSON.parse(lookup.result));
+  const baseline = analysis.moves.find(move => move[0] === greedy.id)!;
+  const improved = analysis.moves.find(move => move[3]?.[4] === 2)!;
+  const current = candidates.find(move => move.id === improved[0])!;
+  assert.deepEqual([current.holes, current.maxHeight, current.clearedLines], [greedy.holes, greedy.maxHeight, greedy.clearedLines]);
+  assert.equal(baseline[3]![4], 7);
+  assert.equal(baseline[3]![3], 0);
+  assert.equal(improved[3]![4], 2);
+  assert.equal(improved[3]![3], 1);
+  const replay = Game.restore(game.replay());
+  for (const action of current.path) replay.act(action);
+  const followup = placementsFor(replay).find(move => move.id === improved[3]![0])!;
+  for (const action of followup.path) replay.act(action);
+  assert.equal(replay.lines - game.lines, 1);
+  assert.equal(boardMetrics(replay.well).holes, 2);
+  assert.equal(replay.status, 'playing');
+  assert.ok(analysis.continuationsEvaluated > 2000);
+});
+
+test('MCP lookahead preserves rotated wall poses and both available and already-used Hold states', async () => {
+  for (const scenario of ['held', 'used-hold', 'rotated-wall', 'paused']) {
+    const game = new Game(`lookahead-${scenario}`);
+    game.act('hold');
+    if (scenario !== 'used-hold') game.act('hardDrop');
+    if (scenario === 'rotated-wall') {
+      game.act('rotateCW');
+      for (let step = 0; step < 5; step += 1) game.act('left');
+    }
+    if (scenario === 'paused') game.act('pause');
+    const before = game.view();
+    const candidates = placementsFor(game);
+    const lookup = await lookupFutureMoves(lookaheadSnapshot(game));
+    const analysis = lookaheadOutputSchema.parse(JSON.parse(lookup.result));
+    assert.deepEqual(analysis.moves.map(move => move[0]), candidates.map(move => move.id));
+    for (const index of [0, Math.floor(candidates.length / 2), candidates.length - 1]) {
+      const branch = Game.restore(game.replay());
+      if (branch.status === 'paused') branch.act('resume');
+      for (const action of candidates[index].path) branch.act(action);
+      const replies = placementsFor(branch);
+      const forecast = analysis.moves[index];
+      assert.equal(forecast[1], replies.length, scenario);
+      assert.equal(forecast[2], replies.filter(reply => !reply.gameOver).length, scenario);
+      for (const path of [forecast[3], forecast[4]]) {
+        if (!path) continue;
+        const reply = replies.find(move => move.id === path[0])!;
+        assert.deepEqual(path.slice(1), [reply.piece, reply.useHold, candidates[index].clearedLines + reply.clearedLines, reply.holes, reply.maxHeight], scenario);
+      }
+    }
+    assert.deepEqual(game.view(), before);
+  }
+});
+
+test('the MCP board tool runs through real stdio discovery and returns snapshot-specific facts', async () => {
+  const board = Array.from({ length: 22 }, () => '..........');
+  board[19] = 'T.........';
+  board[21] = 'JJJJ.JJJJJ';
+  const before = [...board];
+  const lookup = await lookupBoardFacts(board);
+  assert.equal(lookup.server, 'tetris-board-facts');
+  assert.equal(lookup.tool, 'lookup_board_facts');
+  assert.equal(lookup.transport, 'stdio');
+  assert.deepEqual(lookup.arguments.board, before);
+  assert.deepEqual(board, before);
+  const facts = JSON.parse(lookup.result);
+  assert.equal(facts.holes, 1);
+  assert.deepEqual(facts.holeCells, [[0, 20]]);
+  assert.equal(facts.columnHeights[0], 3);
+  assert.deepEqual(facts.rowGaps.find((row: { row: number }) => row.row === 21).columns, [4]);
+  assert.ok(lookup.resultTokens > 0 && lookup.resultTokens < MAX_MCP_CONTEXT_TOKENS);
+  const empty = await lookupBoardFacts(Array.from({ length: 22 }, () => '..........'));
+  assert.notEqual(JSON.parse(empty.result).boardHash, facts.boardHash);
+  assert.deepEqual(JSON.parse(empty.result).holeCells, []);
+  await assert.rejects(lookupBoardFacts(['invalid']), McpLookupError);
+});
+
+test('the standalone MCP tool advertises read-only capabilities and rejects malformed or unknown calls', async () => {
+  const client = new Client({ name: 'mcp-contract-test', version: '1.0.0' });
+  const transport = new StdioClientTransport({ command: process.execPath, args: [fileURLToPath(new URL('../server/mcp-server.ts', import.meta.url))], stderr: 'ignore' });
+  try {
+    await client.connect(transport, { timeout: 5000 });
+    const { tools } = await client.listTools();
+    assert.deepEqual(tools.map(tool => tool.name), ['analyze_future_moves', 'lookup_board_facts']);
+    assert.equal(tools[0].annotations?.readOnlyHint, true);
+    assert.equal(tools[0].annotations?.destructiveHint, false);
+    assert.equal(tools[0].annotations?.openWorldHint, false);
+    const invalid = await client.callTool({ name: 'lookup_board_facts', arguments: { board: ['bad board'] } });
+    assert.equal(invalid.isError, true);
+    const extra = await client.callTool({ name: 'lookup_board_facts', arguments: { board: Array(22).fill('..........'), url: 'https://example.invalid' } });
+    assert.equal(extra.isError, true);
+    const unknown = await client.callTool({ name: 'change_game', arguments: {} });
+    assert.equal(unknown.isError, true);
+    const valid = await client.callTool({ name: 'lookup_board_facts', arguments: { board: Array(22).fill('..........') } });
+    assert.equal(valid.isError, undefined);
+    assert.equal(boardFactsSchema.parse(valid.structuredContent).holes, 0);
+  } finally { await client.close(); }
+});
+
+test('MCP results stay within the reserved context limit for crowded and hole-heavy boards', async () => {
+  for (const board of [
+    ['TTTTTTTTTT', ...Array(21).fill('T.........')],
+    Array.from({ length: 22 }, (_, row) => row % 2 ? '.T.T.T.T.T' : 'T.T.T.T.T.'),
+    Array(22).fill('JJJJJJJJJJ'),
+  ]) {
+    const lookup = await lookupBoardFacts(board);
+    const facts = JSON.parse(lookup.result);
+    assert.ok(lookup.resultTokens + 128 <= MAX_MCP_CONTEXT_TOKENS);
+    assert.equal(facts.holeCells.length, facts.holes);
+    assert.equal(facts.columnHeights.length, 10);
+  }
+});
+
+test('Luna receives actual MCP lookahead with reasoning enabled in one metered request, while off remains unchanged', async context => {
+  const setup = fixture();
+  const gateway = new LunaGateway(setup.config);
+  const game = new Game('mcp-gateway');
+  game.well.set(0, 19, 'T');
+  game.well.set(0, 21, 'J');
+  const original = game.view();
+  let sent: unknown;
+  const connections = context.mock.method(StdioClientTransport.prototype, 'start');
+  const mock = context.mock.method(gateway['client'].chat.completions, 'create', async (request: unknown) => {
+    sent = request;
+    const payload = JSON.parse(JSON.stringify(request));
+    const prompt = JSON.parse(payload.messages[1].content);
+    const input = countTokens(payload.messages[0].content[0].text) + countTokens(payload.messages[1].content);
+    return { choices: [{ finish_reason: 'stop', message: { content: JSON.stringify({ placementId: prompt.placements[0].id, tip: 'Use verified two-piece analysis.' }) } }], usage: { prompt_tokens: input, completion_tokens: 100, total_tokens: input + 100, prompt_tokens_details: { cached_tokens: 0, cache_write_tokens: 0 }, completion_tokens_details: { reasoning_tokens: 70 } } };
+  });
+  try {
+    const enabled = await gateway.complete(game, { compression: true, cache: false, reasoning: true, mcp: true }, 'test');
+    assert.equal(enabled.status, 'ready');
+    assert.ok(enabled.mcpLookup);
+    assert.equal(JSON.parse(enabled.prompt).mcpLookup.tool, 'analyze_future_moves');
+    assert.deepEqual(JSON.parse(enabled.prompt).mcpLookup.analysis, JSON.parse(enabled.mcpLookup.result));
+    assert.equal(JSON.parse(enabled.mcpLookup.result).depth, 2);
+    assert.ok(JSON.parse(enabled.mcpLookup.result).continuationsEvaluated > 100);
+    assert.match(enabled.systemPrompt!, /MCP LOOKAHEAD/);
+    assert.ok(enabled.mcpLookup.addedInputTokens! > enabled.mcpLookup.resultTokens);
+    assert.equal(JSON.parse(JSON.stringify(sent)).reasoning_effort, 'low');
+    assert.equal(JSON.parse(JSON.stringify(sent)).messages[1].content, enabled.prompt);
+    assert.deepEqual(JSON.parse(enabled.promptComparison!.verbose).mcpLookup, JSON.parse(enabled.promptComparison!.packed).mcpLookup);
+    const originalPrompts = buildPrompts(game, placementsFor(game));
+    assert.ok(enabled.packedTokens > originalPrompts.packedTokens);
+    assert.ok(enabled.packedTokens - originalPrompts.packedTokens <= MAX_MCP_CONTEXT_TOKENS);
+    assert.equal(mock.mock.callCount(), 1);
+    assert.equal(connections.mock.callCount(), 1);
+    const disabled = await gateway.complete(game, { compression: true, cache: false, reasoning: true }, 'test');
+    assert.equal(disabled.mcpLookup, undefined);
+    assert.equal(disabled.prompt, originalPrompts.packed);
+    assert.equal(disabled.systemPrompt, POLICY);
+    assert.ok(enabled.usage.input > disabled.usage.input);
+    assert.equal(enabled.usage.input - disabled.usage.input, enabled.mcpLookup.addedInputTokens);
+    const rates = setup.pricing.snapshot!.usdPerMillion;
+    const addedCost = costForUsage(enabled.usage, rates).total - costForUsage(disabled.usage, rates).total;
+    assert.ok(addedCost > 0);
+    assert.ok(Math.abs(addedCost - enabled.mcpLookup.addedInputTokens! * rates.input / 1000000) < 1e-12);
+    assert.equal(mock.mock.callCount(), 2);
+    assert.equal(connections.mock.callCount(), 1);
+    assert.deepEqual(game.view(), original);
+    const pending = gateway.complete(game, { compression: true, cache: false, reasoning: true, mcp: true }, 'test');
+    game.act('hardDrop');
+    const changed = game.view();
+    const snapshot = await pending;
+    assert.equal(snapshot.pieceId, original.pieceId);
+    assert.deepEqual(JSON.parse(snapshot.prompt).board, JSON.parse(originalPrompts.packed).board);
+    assert.deepEqual(snapshot.mcpLookup?.arguments.board, JSON.parse(originalPrompts.packed).board);
+    assert.deepEqual(game.view(), changed);
+  } finally { rmSync(setup.dataDirectory, { recursive: true, force: true }); }
+});
+
+test('MCP admission reserves tool context and a failed pre-inference lookup is not billed', async () => {
+  const setup = fixture();
+  const room: Room = new Room(setup.config, { complete: async (game, options) => {
+    assert.equal(options.mcp, true);
+    const prompts = buildPrompts(game, placementsFor(game));
+    assert.equal(room.gate.reserved, PREFIX_TOKENS + prompts.packedTokens + MAX_OUTPUT_TOKENS + 1024 + MAX_MCP_CONTEXT_TOKENS);
+    throw new McpLookupError();
+  } });
+  try {
+    room.join('MCP Player', room.code, undefined, 'mcp');
+    const player = room.playerFor('mcp');
+    await assert.rejects(room.assist(player, { compression: true, cache: false, mcp: true }), /before contacting Luna/);
+    assert.equal(player.record.attempts, 0);
+    assert.equal(player.metrics.requests, 0);
+    assert.equal(room.usage(player).unmeteredRequests, 0);
+    assert.equal(room.gate.inFlight, 0);
+    assert.equal(room.gate.reserved, 0);
+  } finally { room.close(); rmSync(setup.dataDirectory, { recursive: true, force: true }); }
+});
 
 test('inference gate enforces concurrency, cooldown and token budgets', () => {
   const gate = new ModelGate();
@@ -133,7 +505,7 @@ test('reasoning is opt-in, uses a bounded completion budget, and never bypasses 
     assert.equal(truncated.status, 'invalid');
     assert.equal(truncated.placement, null);
     assert.equal(truncated.usage.reasoning, 128);
-    assert.match(truncated.tip, /token limit/);
+    assert.match(truncated.tip, /completion cap, not your total allowance/);
     finishReason = 'stop';
     reasoning = undefined;
     const unknown = await gateway.complete(game, { compression: true, cache: false, reasoning: true }, 'test');
@@ -175,7 +547,7 @@ test('reasoning reserves its full output allowance and persists the actual repor
     room.join('Budget Player', room.code, undefined, 'budget', 'Bounded reasoning.');
     const limited = room.playerFor('budget');
     const packed = buildPrompts(limited.game, placementsFor(limited.game)).packedTokens;
-    limited.metrics.input = PLAYER_TOKEN_BUDGET - (PREFIX_TOKENS + packed + MAX_REASONING_COMPLETION_TOKENS + 1024) + 1;
+    limited.metrics.input = ROOM_TOKEN_BUDGET - (PREFIX_TOKENS + packed + MAX_REASONING_COMPLETION_TOKENS + 1024) + 1;
     await assert.rejects(room.assist(limited, { compression: true, cache: false, reasoning: true }), /Not enough token credits/);
     assert.equal(limited.record.attempts, 0);
     assert.equal(calls, 1);
@@ -365,22 +737,41 @@ test('fast autopilot remains single-flight, paced, and bound by the same budgets
   assert.throws(() => gate.acquire('pilot', 3000, PLAYER_TOKEN_BUDGET, 0, 2000, true), /credits/);
 });
 
-test('standard Luna play continues beyond prototype player limits while retaining the global spending guard', async () => {
-  const setup = fixture();
-  const room = new Room(setup.config, setup.gateway);
-  try {
-    room.join('Continuous Player', room.code, undefined, 'socket', undefined, true);
-    const player = room.playerFor('socket');
-    player.record.attempts = PLAYER_REQUEST_LIMIT + 10;
-    player.metrics = { ...emptyMetrics(), requests: player.record.attempts, input: PLAYER_TOKEN_BUDGET + 10000, output: 1000 };
-    room.save(player);
-    const result = await room.assist(player, { compression: true, cache: false, autopilot: true });
-    assert.equal(result.metrics.requests, PLAYER_REQUEST_LIMIT + 11);
-    assert.equal(player.record.attempts, PLAYER_REQUEST_LIMIT + 11);
-    const gate = new ModelGate();
-    assert.throws(() => gate.acquire('global', 3000, 0, ROOM_TOKEN_BUDGET, 0, true, ROOM_TOKEN_BUDGET), /room model token limit/);
-    assert.throws(() => gate.acquire('large', 16001, 0, 0, 0, true, ROOM_TOKEN_BUDGET), /credits/);
-  } finally { room.close(); rmSync(setup.dataDirectory, { recursive: true, force: true }); }
+test('both game modes continue beyond prototype player limits while retaining shared room guards', async context => {
+  context.mock.timers.enable({ apis: ['Date'], now: 20000 });
+  for (const text of [undefined, 'Hello world! Tokens make my blocks.']) {
+    const setup = fixture();
+    const room = new Room(setup.config, setup.gateway);
+    try {
+      const joined = room.join('Continuous Player', room.code, undefined, 'socket', text);
+      const player = room.playerFor('socket');
+      player.record.attempts = PLAYER_REQUEST_LIMIT + 10;
+      player.record.best_score = 1234;
+      player.metrics = { ...emptyMetrics(), requests: player.record.attempts, input: PLAYER_TOKEN_BUDGET + 10000, output: 1000 };
+      room.save(player);
+      const result = await room.assist(player, { compression: true, cache: false, autopilot: true });
+      assert.equal(result.metrics.requests, PLAYER_REQUEST_LIMIT + 11);
+      assert.equal(player.record.attempts, PLAYER_REQUEST_LIMIT + 11);
+      assert.equal(player.record.best_score, 1234);
+      assert.equal(result.metrics.input, PLAYER_TOKEN_BUDGET + 12000);
+      assert.deepEqual(player.game.tokens, text ? gameTokens(text) : []);
+      assert.equal(room.view().playerTokenBudget, ROOM_TOKEN_BUDGET);
+      room.disconnect('socket');
+      const restored = room.join('Continuous Player', room.code, joined.token, 'restored');
+      assert.deepEqual(restored.metrics, result.metrics);
+      room.join('Other Player', room.code, undefined, 'other');
+      const other = room.playerFor('other');
+      other.metrics.input = ROOM_TOKEN_BUDGET - player.metrics.input - player.metrics.output;
+      room.save(other);
+      context.mock.timers.tick(AUTOPILOT_COOLDOWN_MS);
+      await assert.rejects(room.assist(player, { compression: true, cache: false, autopilot: true }), /room model token limit/);
+      player.record.attempts = ROOM_REQUEST_LIMIT;
+      room.save(player);
+      await assert.rejects(room.assist(player, { compression: true, cache: false, autopilot: true }), /room AI request allowance/);
+      const gate = new ModelGate();
+      assert.throws(() => gate.acquire('large', 16001, 0, 0, 0, true, ROOM_TOKEN_BUDGET), error => (error as { code: string }).code === 'request-size');
+    } finally { room.close(); rmSync(setup.dataDirectory, { recursive: true, force: true }); }
+  }
 });
 
 test('single-instance rollback journal storage retains scores across process restarts', () => {
@@ -399,7 +790,7 @@ test('single-instance rollback journal storage retains scores across process res
   } finally { room.close(); rmSync(setup.dataDirectory, { recursive: true, force: true }); }
 });
 
-test('legacy token runs retain their original bank without erasing the cost of inefficient requests', async context => {
+test('sentence runs retain spending and optimization savings beyond the old request allowance', async context => {
   context.mock.timers.enable({ apis: ['Date'], now: 20000 });
   const requestCounts: number[] = [];
   const creditsSpent: number[] = [];
@@ -424,10 +815,9 @@ test('legacy token runs retain their original bank without erasing the cost of i
       player.game = new Game('compression', gameTokens(player.record.token_text));
       for (let attempt = 0; attempt <= PLAYER_REQUEST_LIMIT; attempt += 1) {
         context.mock.timers.tick(AI_COOLDOWN_MS);
-        try { await room.assist(player, options); }
-        catch (error) { assert.equal((error as { code: string }).code, 'budget'); break; }
+        await room.assist(player, options);
       }
-      assert.ok(tokenCreditsUsed(player.metrics) <= PLAYER_TOKEN_BUDGET);
+      assert.ok(tokenCreditsUsed(player.metrics) < ROOM_TOKEN_BUDGET);
       assert.equal(room.view().metrics.input + room.view().metrics.output, player.metrics.input + player.metrics.output);
       const spent = tokenCreditsUsed(player.metrics);
       room.restart(player);
@@ -436,9 +826,9 @@ test('legacy token runs retain their original bank without erasing the cost of i
       creditsSpent.push(spent);
     } finally { room.close(); rmSync(setup.dataDirectory, { recursive: true, force: true }); }
   }
-  assert.ok(requestCounts[0] < requestCounts[1]);
-  assert.ok(requestCounts[1] <= requestCounts[2]);
-  assert.ok(requestCounts.every(count => count <= PLAYER_REQUEST_LIMIT));
+  assert.ok(requestCounts.every(count => count === PLAYER_REQUEST_LIMIT + 1));
+  assert.ok(creditsSpent[0] > PLAYER_TOKEN_BUDGET);
+  assert.ok(creditsSpent[1] < creditsSpent[0]);
   assert.ok(creditsSpent[2] / requestCounts[2] < creditsSpent[1] / requestCounts[1]);
 });
 
@@ -470,7 +860,7 @@ test('standard play permits thirty richer compressed requests after prior spend 
     assert.equal(player.metrics.cached, 0);
     assert.ok(tokenCreditsUsed(player.metrics) > 16000);
     assert.ok(tokenCreditsUsed(player.metrics) < ROOM_TOKEN_BUDGET);
-    assert.equal(room.view().playerTokenBudget, 160000);
+    assert.equal(room.view().playerTokenBudget, ROOM_TOKEN_BUDGET);
     assert.equal(room.view().metrics.input, player.metrics.input);
   } finally { room.close(); rmSync(setup.dataDirectory, { recursive: true, force: true }); }
 });

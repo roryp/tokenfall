@@ -71,6 +71,50 @@ export interface Metrics {
 }
 export const emptyMetrics = (): Metrics => ({ requests: 0, input: 0, output: 0, cached: 0, cacheWrites: 0, reasoning: 0, compressionSaved: 0, cacheHits: 0, cacheMisses: 0, cacheBypassed: 0 });
 export const tokenCreditsUsed = (usage: Pick<Usage, 'input' | 'output' | 'cached'>) => Math.max(0, usage.input - usage.cached) + usage.output;
+export const MAX_REQUEST_TOKENS = 16000;
+export const DEFAULT_TOKEN_ALLOWANCE = 1000000;
+export const MAX_TOKEN_ALLOWANCE = 8000000;
+export interface TokenAllowance {
+  limit: number;
+  used: number;
+  reserved: number;
+  unconfirmed: number;
+  remaining: number;
+}
+export const reportedTokenBalance = (allowance: Pick<TokenAllowance, 'limit' | 'used'>) => Math.max(0, allowance.limit - allowance.used);
+export function tokenAllowance(limit: number, usage: Pick<Metrics, 'input' | 'output'>, reserved = 0, unconfirmed = 0): TokenAllowance {
+  const used = usage.input + usage.output;
+  return { limit, used, reserved, unconfirmed, remaining: Math.max(0, limit - used - reserved - unconfirmed) };
+}
+export const MCP_LOOKUP_TIMEOUT_MS = 15000;
+export interface McpLookaheadInput {
+  board: string[];
+  active: { piece: GameView['piece']; column: number; row: number; rotation: number };
+  hold: GameView['hold'];
+  canHold: boolean;
+  next: GameView['next'];
+}
+export type McpContinuation = [moveId: string, piece: GameView['piece'], useHold: boolean, lines: number, holes: number, height: number];
+export interface McpLookaheadResult {
+  depth: 2;
+  source: 'shared/game.ts:placementsFor';
+  snapshotHash: string;
+  candidatesEvaluated: number;
+  continuationsEvaluated: number;
+  moveColumns: string[];
+  replyColumns: string[];
+  moves: (readonly [moveId: string, replies: number, surviving: number, lowestHoles: McpContinuation | null, mostClears: McpContinuation | null])[];
+}
+export interface McpLookup {
+  server: string;
+  tool: string;
+  transport: 'stdio';
+  arguments: { board: string[] } | McpLookaheadInput;
+  result: string;
+  resultTokens: number;
+  addedInputTokens?: number;
+  durationMs: number;
+}
 export interface Insight {
   id: string;
   pieceId: number;
@@ -85,6 +129,7 @@ export interface Insight {
   compression: boolean;
   cacheEnabled: boolean;
   reasoningEnabled?: boolean;
+  mcpLookup?: McpLookup;
   prompt: string;
   systemPrompt?: string;
   promptComparison?: { verbose: string; packed: string };
@@ -116,6 +161,9 @@ export interface RoomView {
   prefixTokens: number;
   tokenBudget: number;
   playerTokenBudget: number;
+  allowance: TokenAllowance;
+  requestsRemaining: number;
+  requestTokenLimit: number;
   pricing: TokenPricing;
   unmeteredRequests: number;
   aiCooldownMs: number;
@@ -124,6 +172,7 @@ export interface RoomView {
 export interface PlayerUsage {
   metrics: Metrics;
   unmeteredRequests: number;
+  allowance: TokenAllowance;
 }
 export interface JoinResult extends PlayerUsage {
   token: string;
@@ -136,7 +185,7 @@ export interface JoinResult extends PlayerUsage {
 }
 export interface InputBatch { runId: string; sequence: number; frame: number; events: InputEvent[] }
 export interface InputAck { sequence: number; score: number; lines: number; pieceId: number; frame: number }
-export interface AiOptions { cache: boolean; compression: boolean; reasoning?: boolean; autopilot?: boolean }
+export interface AiOptions { cache: boolean; compression: boolean; reasoning?: boolean; mcp?: boolean; autopilot?: boolean }
 export type Reply<Value> = { ok: true; data: Value } | { ok: false; error: string; code?: string; retryAfterMs?: number };
 export interface ServerEvents {
   room: (room: RoomView) => void;
@@ -144,11 +193,12 @@ export interface ServerEvents {
   notice: (message: string) => void;
 }
 export interface ClientEvents {
-  join: (data: { name: string; room: string; token?: string; text?: string; classic?: boolean }, reply: (result: Reply<JoinResult>) => void) => void;
+  join: (data: { name: string; room: string; token?: string; text?: string; classic?: boolean; tokenLimit?: number }, reply: (result: Reply<JoinResult>) => void) => void;
   inputs: (data: InputBatch, reply: (result: Reply<InputAck>) => void) => void;
   restart: (reply: (result: Reply<JoinResult>) => void) => void;
-  configure: (data: { text: string }, reply: (result: Reply<JoinResult>) => void) => void;
+  configure: (data: { text: string; tokenLimit?: number }, reply: (result: Reply<JoinResult>) => void) => void;
+  allowance: (data: { tokenLimit: number }, reply: (result: Reply<PlayerUsage>) => void) => void;
   inspect: (reply: (result: Reply<PromptPreview>) => void) => void;
-  assist: (options: AiOptions, reply: (result: Reply<{ insight: Insight; metrics: Metrics }>) => void) => void;
+  assist: (options: AiOptions, reply: (result: Reply<{ insight: Insight } & PlayerUsage>) => void) => void;
 }
 export type { GameView };

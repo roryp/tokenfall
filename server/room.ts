@@ -3,12 +3,13 @@ import { existsSync, mkdirSync, readFileSync } from 'node:fs';
 import path from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { Game, FPS, placementsFor } from '../shared/game.ts';
-import { costForUsage, emptyMetrics, pointsPerCent, tokenCreditsUsed } from '../shared/protocol.ts';
+import { costForUsage, emptyMetrics, MAX_REQUEST_TOKENS, pointsPerCent, tokenAllowance } from '../shared/protocol.ts';
 import type { AiOptions, InputAck, InputBatch, JoinResult, LeaderboardEntry, Metrics, PlayerUsage, PromptPreview, RoomView, TokenPricing } from '../shared/protocol.ts';
 import type { AppConfig } from './config.ts';
-import { AI_COOLDOWN_MS, AUTOPILOT_COOLDOWN_MS, MAX_OUTPUT_TOKENS, maxCompletionTokens, ModelGate, PLAYER_REQUEST_LIMIT, PLAYER_TOKEN_BUDGET, PREFIX_TOKENS, ROOM_REQUEST_LIMIT, ROOM_TOKEN_BUDGET, RequestError } from './model.ts';
+import { AI_COOLDOWN_MS, AUTOPILOT_COOLDOWN_MS, MAX_OUTPUT_TOKENS, maxCompletionTokens, ModelGate, PREFIX_TOKENS, ROOM_REQUEST_LIMIT, ROOM_TOKEN_BUDGET, RequestError } from './model.ts';
 import type { ModelGateway } from './model.ts';
 import { addUsage, buildPrompts, gameTokens } from './tokens.ts';
+import { MAX_MCP_CONTEXT_TOKENS, McpLookupError } from './mcp.ts';
 
 interface PlayerRecord {
   id: string;
@@ -21,6 +22,7 @@ interface PlayerRecord {
   attempts: number;
   updated: number;
   token_text: string;
+  token_limit: number;
 }
 export interface Player {
   record: PlayerRecord;
@@ -42,6 +44,7 @@ export class Room {
   gate = new ModelGate();
   pricing: TokenPricing = { status: 'loading', snapshot: null };
   private previewTimes = new Map<string, number>();
+  private pendingTokens = new Map<string, number>();
   config: AppConfig;
   gateway: ModelGateway;
 
@@ -59,10 +62,11 @@ export class Room {
         id TEXT PRIMARY KEY, token_hash TEXT NOT NULL UNIQUE, name TEXT NOT NULL,
         best_score INTEGER NOT NULL DEFAULT 0, best_lines INTEGER NOT NULL DEFAULT 0,
         best_level INTEGER NOT NULL DEFAULT 1, metrics TEXT NOT NULL, attempts INTEGER NOT NULL DEFAULT 0,
-        updated INTEGER NOT NULL, token_text TEXT NOT NULL DEFAULT ''
+        updated INTEGER NOT NULL, token_text TEXT NOT NULL DEFAULT '', token_limit INTEGER NOT NULL DEFAULT 8000000
       );
     `);
     if (!this.database.prepare('PRAGMA table_info(players)').all().some(column => column.name === 'token_text')) this.database.exec("ALTER TABLE players ADD COLUMN token_text TEXT NOT NULL DEFAULT ''");
+    if (!this.database.prepare('PRAGMA table_info(players)').all().some(column => column.name === 'token_limit')) this.database.exec('ALTER TABLE players ADD COLUMN token_limit INTEGER NOT NULL DEFAULT 8000000');
     const saved = this.database.prepare("SELECT value FROM settings WHERE key = 'room'").get() as { value: string } | undefined;
     this.code = saved?.value ?? randomBytes(3).toString('hex').toUpperCase();
     if (!saved) this.database.prepare("INSERT INTO settings (key, value) VALUES ('room', ?)").run(this.code);
@@ -74,11 +78,11 @@ export class Room {
   save(player: Player) {
     player.record.metrics = JSON.stringify(player.metrics);
     const record = player.record;
-    this.database.prepare(`INSERT INTO players (id, token_hash, name, best_score, best_lines, best_level, metrics, attempts, updated, token_text)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    this.database.prepare(`INSERT INTO players (id, token_hash, name, best_score, best_lines, best_level, metrics, attempts, updated, token_text, token_limit)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       ON CONFLICT(id) DO UPDATE SET name=excluded.name, best_score=excluded.best_score, best_lines=excluded.best_lines,
-      best_level=excluded.best_level, metrics=excluded.metrics, attempts=excluded.attempts, updated=excluded.updated, token_text=excluded.token_text`)
-      .run(record.id, record.token_hash, record.name, record.best_score, record.best_lines, record.best_level, record.metrics, record.attempts, record.updated, record.token_text);
+      best_level=excluded.best_level, metrics=excluded.metrics, attempts=excluded.attempts, updated=excluded.updated, token_text=excluded.token_text, token_limit=excluded.token_limit`)
+      .run(record.id, record.token_hash, record.name, record.best_score, record.best_lines, record.best_level, record.metrics, record.attempts, record.updated, record.token_text, record.token_limit);
   }
 
   totals() {
@@ -97,7 +101,7 @@ export class Room {
     catch { throw new RequestError('Use 1 to 500 characters and at most 256 tokens.', 'token-setup'); }
   }
 
-  join(name: string, code: string, token: string | undefined, socketId: string, text?: string, classic = false): JoinResult {
+  join(name: string, code: string, token: string | undefined, socketId: string, text?: string, classic = false, tokenLimit?: number): JoinResult {
     if (code !== this.code) throw new RequestError('That room code is not active.', 'room');
     if (classic && text !== undefined) throw new RequestError('Classic games do not use token text.', 'validation');
     const now = Date.now();
@@ -112,9 +116,10 @@ export class Room {
     if (player?.socketId && player.socketId !== socketId) throw new RequestError('This player is already open in another tab.', 'session-active');
     if (!player?.socketId && this.online >= 50) throw new RequestError('The room has 50 players. A spot opens when someone leaves.', 'full');
     if (!record) {
+      if (tokenLimit !== undefined) this.validateAllowance(tokenLimit);
       if (this.records().length >= 500) throw new RequestError('This workshop has reached its registration limit.', 'full');
       if (text !== undefined && text.length === 0) throw new RequestError('Enter some text to make your token blocks.', 'token-setup');
-      record = { id: randomUUID(), token_hash: tokenHash, name, best_score: 0, best_lines: 0, best_level: 1, metrics: JSON.stringify(emptyMetrics()), attempts: 0, updated: now, token_text: text ?? '' };
+      record = { id: randomUUID(), token_hash: tokenHash, name, best_score: 0, best_lines: 0, best_level: 1, metrics: JSON.stringify(emptyMetrics()), attempts: 0, updated: now, token_text: text ?? '', token_limit: tokenLimit ?? ROOM_TOKEN_BUDGET };
     }
     if (!player) {
       player = { record, metrics: { ...emptyMetrics(), ...JSON.parse(record.metrics) }, game: this.gameFor(record.token_text), runId: randomUUID(), started: now, sequence: 0, socketId: null, lastSeen: now, inputWindow: now, inputCount: 0 };
@@ -140,7 +145,28 @@ export class Room {
   }
 
   usage(player: Player): PlayerUsage {
-    return { metrics: { ...player.metrics }, unmeteredRequests: Math.max(0, player.record.attempts - player.metrics.requests) };
+    const unmeteredRequests = Math.max(0, player.record.attempts - player.metrics.requests);
+    const reserved = this.pendingTokens.get(player.record.id) ?? 0;
+    const unconfirmed = Math.max(0, unmeteredRequests - Number(reserved > 0)) * MAX_REQUEST_TOKENS;
+    return { metrics: { ...player.metrics }, unmeteredRequests, allowance: tokenAllowance(player.record.token_limit, player.metrics, reserved, unconfirmed) };
+  }
+
+  validateAllowance(tokenLimit: number, committed = 0) {
+    if (!Number.isSafeInteger(tokenLimit) || tokenLimit < MAX_REQUEST_TOKENS || tokenLimit > ROOM_TOKEN_BUDGET) throw new RequestError(`Choose an AI allowance from ${MAX_REQUEST_TOKENS.toLocaleString()} to ${ROOM_TOKEN_BUDGET.toLocaleString()} tokens.`, 'validation');
+    if (tokenLimit < committed) throw new RequestError(`The allowance cannot be below ${committed.toLocaleString()} tokens already used or held.`, 'budget');
+  }
+
+  setAllowance(player: Player, tokenLimit: number): PlayerUsage {
+    const current = this.usage(player).allowance;
+    this.validateAllowance(tokenLimit, current.used + current.reserved + current.unconfirmed);
+    player.record.token_limit = tokenLimit;
+    this.save(player);
+    return this.usage(player);
+  }
+
+  roomAllowance(totals = this.totals()) {
+    const unconfirmed = Math.max(0, totals.attempts - totals.metrics.requests - this.pendingTokens.size) * MAX_REQUEST_TOKENS;
+    return tokenAllowance(ROOM_TOKEN_BUDGET, totals.metrics, this.gate.reserved, unconfirmed);
   }
 
   playerFor(socketId: string) {
@@ -190,13 +216,18 @@ export class Room {
     return { sequence: player.sequence, score: player.game.score, lines: player.game.lines, pieceId: player.game.pieceId, frame: player.game.frame };
   }
 
-  restart(player: Player, text?: string) {
+  restart(player: Player, text?: string, tokenLimit?: number) {
     const now = Date.now();
     if (now - player.started < 2000) throw new RequestError('Wait a moment before restarting.', 'cooldown', 2000);
     if (text !== undefined && text.length === 0) throw new RequestError('Enter some text to make your token blocks.', 'token-setup');
+    if (tokenLimit !== undefined) {
+      const current = this.usage(player).allowance;
+      this.validateAllowance(tokenLimit, current.used + current.reserved + current.unconfirmed);
+    }
     const tokenText = text ?? player.record.token_text;
     player.game = this.gameFor(tokenText);
     player.record.token_text = tokenText;
+    if (tokenLimit !== undefined) player.record.token_limit = tokenLimit;
     player.runId = randomUUID();
     player.started = now;
     player.sequence = 0;
@@ -221,23 +252,34 @@ export class Room {
   async assist(player: Player, options: AiOptions) {
     if (player.game.status === 'over') throw new RequestError('Start a new game before asking Luna.', 'game-over');
     const totals = this.totals();
-    const classic = player.game.tokens.length === 0;
-    if ((!classic && player.record.attempts >= PLAYER_REQUEST_LIMIT) || totals.attempts >= ROOM_REQUEST_LIMIT) throw new RequestError('The AI request allowance is used. Manual play is still available.', 'budget');
+    if (totals.attempts >= ROOM_REQUEST_LIMIT) throw new RequestError(`The room AI request allowance is used: 0 of ${ROOM_REQUEST_LIMIT.toLocaleString()} requests left. Manual play is still available.`, 'room-requests');
     const prompts = buildPrompts(player.game, placementsFor(player.game));
-    const reservation = PREFIX_TOKENS + (options.compression ? prompts.packedTokens : prompts.rawTokens) + maxCompletionTokens(options) + 1024;
-    const release = this.gate.acquire(player.record.id, reservation, tokenCreditsUsed(player.metrics), totals.metrics.input + totals.metrics.output, Date.now(), options.autopilot, classic ? ROOM_TOKEN_BUDGET : PLAYER_TOKEN_BUDGET);
+    const reservation = PREFIX_TOKENS + (options.compression ? prompts.packedTokens : prompts.rawTokens) + maxCompletionTokens(options) + 1024 + (options.mcp ? MAX_MCP_CONTEXT_TOKENS : 0);
+    const allowance = this.usage(player).allowance;
+    const roomAllowance = this.roomAllowance(totals);
+    const release = this.gate.acquire(player.record.id, reservation, allowance.used + allowance.unconfirmed, roomAllowance.used + roomAllowance.unconfirmed, Date.now(), options.autopilot, allowance.limit);
     const runId = player.runId;
+    this.pendingTokens.set(player.record.id, reservation);
     player.record.attempts += 1;
-    this.save(player);
     try {
+      this.save(player);
       const bucket = parseInt(player.record.id.slice(0, 2), 16) % 8;
       const insight = await this.gateway.complete(player.game, options, `${this.code}:${bucket}`);
       player.metrics = addUsage(player.metrics, insight.usage, insight.savedTokens, options.cache);
       const current = player.game.view();
       if (insight.status === 'ready' && (runId !== player.runId || insight.pieceId !== current.pieceId || current.status === 'over')) insight.status = 'stale';
       this.save(player);
-      return { insight, metrics: { ...player.metrics } };
-    } finally { release(); }
+      this.pendingTokens.delete(player.record.id);
+      release();
+      return { insight, ...this.usage(player) };
+    } catch (error) {
+      if (error instanceof McpLookupError) {
+        player.record.attempts -= 1;
+        this.save(player);
+        throw new RequestError(error.message, 'mcp');
+      }
+      throw error;
+    } finally { this.pendingTokens.delete(player.record.id); release(); }
   }
 
   publicUrl() {
@@ -276,7 +318,8 @@ export class Room {
     return {
       code: this.code, online: this.online, capacity: 50, leaderboard, pointsLeaderboard, metrics: totals.metrics,
       joinUrl: this.publicUrl(), model: this.config.deployment, prefixTokens: PREFIX_TOKENS,
-      tokenBudget: ROOM_TOKEN_BUDGET, playerTokenBudget: PLAYER_TOKEN_BUDGET,
+      tokenBudget: ROOM_TOKEN_BUDGET, playerTokenBudget: ROOM_TOKEN_BUDGET,
+      allowance: this.roomAllowance(totals), requestsRemaining: Math.max(0, ROOM_REQUEST_LIMIT - totals.attempts), requestTokenLimit: MAX_REQUEST_TOKENS,
       pricing: this.pricing, unmeteredRequests: Math.max(0, totals.attempts - totals.metrics.requests),
       aiCooldownMs: AI_COOLDOWN_MS, autopilotCooldownMs: AUTOPILOT_COOLDOWN_MS,
     };

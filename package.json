@@ -9,6 +9,7 @@
   "scripts": {
     "dev": "node --watch server/index.ts",
     "start": "node server/index.ts",
+    "mcp:server": "node server/mcp-server.ts",
     "typecheck": "tsc --noEmit",
     "build": "npm run typecheck && npm --prefix web run build",
     "test": "node --test tests/*.test.ts",
@@ -16,6 +17,7 @@
   },
   "dependencies": {
     "@azure/identity": "4.13.2",
+    "@modelcontextprotocol/sdk": "1.30.0",
     "dotenv": "17.4.2",
     "express": "5.2.1",
     "js-tiktoken": "1.0.21",

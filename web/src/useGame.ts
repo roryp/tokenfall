@@ -3,8 +3,8 @@ import { io } from 'socket.io-client';
 import type { Socket } from 'socket.io-client';
 import { Game, FPS, refreshPlacement } from '../../shared/game.ts';
 import type { Action, GameView } from '../../shared/game.ts';
-import { costForUsage, emptyMetrics } from '../../shared/protocol.ts';
-import type { AiOptions, ClientEvents, Insight, InputAck, InputBatch, JoinResult, Metrics, Reply, RoomView, ServerEvents } from '../../shared/protocol.ts';
+import { costForUsage, emptyMetrics, MCP_LOOKUP_TIMEOUT_MS } from '../../shared/protocol.ts';
+import type { AiOptions, ClientEvents, Insight, InputAck, InputBatch, JoinResult, Metrics, PlayerUsage, Reply, RoomView, ServerEvents, TokenAllowance } from '../../shared/protocol.ts';
 
 type GameSocket = Socket<ServerEvents, ClientEvents>;
 interface Session { token: string; name: string; room: string }
@@ -20,9 +20,9 @@ function savedSession(): Session | null {
 function savedOptions(): AiOptions {
   try {
     const saved = JSON.parse(sessionStorage.getItem('tetris-luna-options') ?? 'null');
-    if (typeof saved?.cache === 'boolean' && typeof saved?.compression === 'boolean') return { cache: saved.cache, compression: saved.compression, reasoning: saved.reasoning === true };
-  } catch { return { cache: false, compression: false, reasoning: false }; }
-  return { cache: false, compression: false, reasoning: false };
+    if (typeof saved?.cache === 'boolean' && typeof saved?.compression === 'boolean') return { cache: saved.cache, compression: saved.compression, reasoning: saved.reasoning === true, mcp: saved.mcp === true };
+  } catch { return { cache: false, compression: false, reasoning: false, mcp: false }; }
+  return { cache: false, compression: false, reasoning: false, mcp: false };
 }
 
 export function useGame() {
@@ -35,6 +35,7 @@ export function useGame() {
   const [unmeteredRequests, setUnmeteredRequests] = useState(0);
   const [view, setView] = useState<GameView>(() => new Game('preview').view());
   const [metrics, setMetrics] = useState<Metrics>(emptyMetrics);
+  const [allowance, setAllowance] = useState<TokenAllowance | null>(null);
   const [insight, setInsight] = useState<Insight | null>(null);
   const [requestHistory, setRequestHistory] = useState<RequestRecord[]>([]);
   const historyPlayer = useRef('');
@@ -92,6 +93,7 @@ export function useGame() {
     setSessionName(data.name);
     setUnmeteredRequests(data.unmeteredRequests);
     setMetrics(data.metrics);
+    setAllowance(data.allowance ?? null);
     if (historyPlayer.current !== data.playerId) setRequestHistory([]);
     historyPlayer.current = data.playerId;
     setJoined(true);
@@ -100,7 +102,7 @@ export function useGame() {
     refresh();
   }
 
-  function join(setup?: { name: string; text?: string }) {
+  function join(setup?: { name: string; text?: string; tokenLimit?: number }) {
     if (!roomRef.current || !socket.current?.connected || active.current || joiningRef.current) return;
     const code = roomRef.current.code;
     const previous = session.current?.room === code ? session.current : null;
@@ -110,7 +112,7 @@ export function useGame() {
     setJoining(true);
     setNotice('');
     const name = previous?.name ?? setup!.name.trim();
-    socket.current.timeout(8000).emit('join', { name, room: code, ...(previous ? { token: previous.token } : setup?.text !== undefined ? { text: setup.text } : {}) }, (error: Error | null, reply: Reply<JoinResult>) => {
+    socket.current.timeout(8000).emit('join', { name, room: code, ...(previous ? { token: previous.token } : { tokenLimit: setup?.tokenLimit, ...(setup?.text !== undefined ? { text: setup.text } : {}) }) }, (error: Error | null, reply: Reply<JoinResult>) => {
       joiningRef.current = false;
       setJoining(false);
       if (error || !reply.ok) {
@@ -219,7 +221,7 @@ export function useGame() {
     const serial = ++requestSerial.current;
     const epoch = pilotEpoch.current;
     const originalRun = runId.current;
-    const selected = { cache: options.cache, compression: options.compression, reasoning: Boolean(options.reasoning), autopilot: true };
+    const selected = { cache: options.cache, compression: options.compression, reasoning: Boolean(options.reasoning), mcp: Boolean(options.mcp), autopilot: true };
     setRequestOptions(selected);
     setBusy(true);
     if (!await flushAll() || serial !== requestSerial.current || originalRun !== runId.current || !pilotActive.current || epoch !== pilotEpoch.current) {
@@ -227,7 +229,7 @@ export function useGame() {
       return;
     }
     nextRequestAt.current = Date.now() + (roomRef.current?.autopilotCooldownMs ?? 1000);
-    socket.current!.timeout(selected.reasoning ? 65000 : 25000).emit('assist', selected, (error: Error | null, reply: Reply<{ insight: Insight; metrics: Metrics }>) => {
+    socket.current!.timeout((selected.reasoning ? 65000 : 25000) + (selected.mcp ? MCP_LOOKUP_TIMEOUT_MS : 0)).emit('assist', selected, (error: Error | null, reply: Reply<{ insight: Insight } & PlayerUsage>) => {
       if (serial !== requestSerial.current) return;
       requestPending.current = false;
       setRequestOptions(null);
@@ -239,19 +241,21 @@ export function useGame() {
         return;
       }
       setMetrics(reply.data.metrics);
+      setAllowance(reply.data.allowance ?? null);
+      setUnmeteredRequests(reply.data.unmeteredRequests);
       const result = reply.data.insight;
       const record = { number: reply.data.metrics.requests, receivedAt: new Date().toISOString(), insight: result };
       setRequestHistory(history => [record, ...history.filter(entry => entry.insight.id !== result.id)].slice(0, 20));
       const current = originalRun === runId.current && result.pieceId === game.current?.pieceId;
       setInsight(current ? result : { ...result, status: 'stale' });
       if (pilotActive.current && epoch === pilotEpoch.current && !document.hidden) {
-        if (!current || !applyMove(result)) { stopAutopilot(); setNotice('Luna returned an unusable move. Manual play is still available.'); return; }
+        if (!current || !applyMove(result)) { stopAutopilot(); setNotice(result.status === 'invalid' ? result.tip : 'Luna returned an unusable move. Manual play is still available.'); return; }
         if (game.current?.status === 'over') stopAutopilot();
       }
     });
   }
 
-  async function restart(text?: string): Promise<boolean> {
+  async function restart(text?: string, tokenLimit?: number): Promise<boolean> {
     if (!socket.current?.connected || !active.current || requestPending.current || joiningRef.current) return false;
     stopAutopilot();
     if (!await flushAll()) return false;
@@ -267,7 +271,26 @@ export function useGame() {
         resolve(true);
       };
       if (text === undefined) socket.current!.timeout(8000).emit('restart', receive);
-      else socket.current!.timeout(8000).emit('configure', { text }, receive);
+      else socket.current!.timeout(8000).emit('configure', { text, tokenLimit }, receive);
+    });
+  }
+
+  async function adjustAllowance(tokenLimit: number): Promise<boolean> {
+    if (!socket.current?.connected || !active.current || joiningRef.current) return false;
+    act('pause');
+    joiningRef.current = true;
+    setJoining(true);
+    return new Promise(resolve => {
+      socket.current!.timeout(8000).emit('allowance', { tokenLimit }, (error: Error | null, reply: Reply<PlayerUsage>) => {
+        joiningRef.current = false;
+        setJoining(false);
+        if (error || !reply.ok) { setNotice(!error && !reply.ok ? reply.error : 'Could not update the allowance. Try again.'); resolve(false); return; }
+        setAllowance(reply.data.allowance);
+        setMetrics(reply.data.metrics);
+        setUnmeteredRequests(reply.data.unmeteredRequests);
+        setNotice('');
+        resolve(true);
+      });
     });
   }
 
@@ -310,6 +333,7 @@ export function useGame() {
     connection.on('usage', usage => {
       setMetrics(current => usage.metrics.requests >= current.requests ? usage.metrics : current);
       setUnmeteredRequests(usage.unmeteredRequests);
+      setAllowance(current => !current || (usage.allowance && usage.allowance.used >= current.used) ? usage.allowance ?? null : current);
     });
     connection.on('notice', setNotice);
     return () => { active.current = false; pilotActive.current = false; pilotEpoch.current += 1; connection.disconnect(); socket.current = null; };
@@ -343,5 +367,5 @@ export function useGame() {
 
   const rates = room?.pricing.snapshot?.usdPerMillion;
   const cost = rates ? costForUsage(metrics, rates) : null;
-  return { room, connected, joined, joining, player, sessionName, view, metrics, insight, requestHistory, cost, busy, notice, setNotice, options, setOptions, autopilot, toggleAutopilot, requestOptions, unmeteredRequests, join, act, restart };
+  return { room, connected, joined, joining, player, sessionName, view, metrics, allowance, adjustAllowance, insight, requestHistory, cost, busy, notice, setNotice, options, setOptions, autopilot, toggleAutopilot, requestOptions, unmeteredRequests, join, act, restart };
 }

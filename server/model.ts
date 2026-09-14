@@ -5,17 +5,20 @@ import { AzureCliCredential, getBearerTokenProvider, ManagedIdentityCredential }
 import { z } from 'zod';
 import { placementsFor } from '../shared/game.ts';
 import type { Game } from '../shared/game.ts';
+import { MAX_REQUEST_TOKENS, MAX_TOKEN_ALLOWANCE } from '../shared/protocol.ts';
 import type { AiOptions, Insight } from '../shared/protocol.ts';
 import type { AppConfig } from './config.ts';
 import { buildPrompts, countTokens, normalizeUsage, tokenChips } from './tokens.ts';
+import { lookaheadSnapshot, lookupFutureMoves, MAX_MCP_CONTEXT_TOKENS, McpLookupError } from './mcp.ts';
 
 export const POLICY = readFileSync(new URL('./policy.md', import.meta.url), 'utf8');
 export const PREFIX_TOKENS = countTokens(POLICY);
+export const MCP_GUIDANCE = '\n\nMCP LOOKAHEAD\nWith MCP enabled, the optional tool supplements the immediate engine facts with two-placement simulations. Read mcpLookup.analysis before selecting your current placementId. Every original current move is included, in original order. Use survivingReplies to detect next-turn traps. lowestHolesReply and mostClearsAlternative each describe ONE achievable future path, not independent minima to combine. A zero survivingReplies means no enumerated next placement avoids game over. Prefer a current move with safe continuations; compare achievable future holes, clears and height against its immediate outcome. nextMoveId belongs to a hypothetical next board and MUST NOT be returned as the current placementId. This is only two-placement lookahead, not a guarantee of survival. You still select and return one current move.';
 export const MAX_OUTPUT_TOKENS = 128;
 export const MAX_REASONING_COMPLETION_TOKENS = 2048;
 export const maxCompletionTokens = (options: AiOptions) => options.reasoning ? MAX_REASONING_COMPLETION_TOKENS : MAX_OUTPUT_TOKENS;
 export const PLAYER_TOKEN_BUDGET = 160000;
-export const ROOM_TOKEN_BUDGET = 8000000;
+export const ROOM_TOKEN_BUDGET = MAX_TOKEN_ALLOWANCE;
 export const PLAYER_REQUEST_LIMIT = 40;
 export const ROOM_REQUEST_LIMIT = 2000;
 export const AI_COOLDOWN_MS = 8000;
@@ -49,8 +52,9 @@ export class ModelGate {
     this.requestTimes = this.requestTimes.filter(entry => now - entry.time < 60000);
     const scheduledTokens = this.requestTimes.reduce((sum, entry) => sum + entry.tokens, 0);
     if (this.inFlight >= 4 || this.requestTimes.length >= 90 || scheduledTokens + reservation > 400000) throw new RequestError('The room is busy. Keep playing and try again shortly.', 'busy', 3000);
-    if (reservation > 16000 || playerSpent + reservation > playerBudget) throw new RequestError('Not enough token credits for this request. Compression lowers the cost; manual play is still available.', 'budget');
-    if (roomSpent + this.reserved + reservation > ROOM_TOKEN_BUDGET) throw new RequestError('The room model token limit is reached. Manual play is still available.', 'budget');
+    if (reservation > MAX_REQUEST_TOKENS) throw new RequestError(`This request needs ${reservation.toLocaleString()} reserved tokens, above the ${MAX_REQUEST_TOKENS.toLocaleString()} per-request cap. Turn on Compression or turn off MCP or Reasoning. A larger personal allowance will not change this cap.`, 'request-size');
+    if (playerSpent + reservation > playerBudget) throw new RequestError(`Not enough token credits in your AI allowance: ${Math.max(0, playerBudget - playerSpent).toLocaleString()} left; this request needs ${reservation.toLocaleString()}. Adjust your allowance or lower the request size.`, 'budget');
+    if (roomSpent + this.reserved + reservation > ROOM_TOKEN_BUDGET) throw new RequestError(`The shared room model token limit is reached: ${Math.max(0, ROOM_TOKEN_BUDGET - roomSpent - this.reserved).toLocaleString()} tokens available; ${reservation.toLocaleString()} needed. Manual play is still available.`, 'room-budget');
     this.inFlight += 1;
     this.reserved += reservation;
     this.activePlayers.add(playerId);
@@ -88,14 +92,28 @@ export class LunaGateway implements ModelGateway {
   }
 
   async complete(game: Game, options: AiOptions, cacheBucket: string): Promise<Insight> {
+    const started = performance.now();
     const pieceId = game.pieceId;
     const placements = placementsFor(game);
     if (!placements.length) throw new RequestError('Start a new game before requesting a move.');
-    const prompts = buildPrompts(game, placements);
+    let prompts = buildPrompts(game, placements);
+    const mcpLookup = options.mcp ? await lookupFutureMoves(lookaheadSnapshot(game)) : undefined;
+    const originalTokens = options.compression ? prompts.packedTokens : prompts.rawTokens;
+    if (mcpLookup) {
+      const context = { server: mcpLookup.server, tool: mcpLookup.tool, analysis: JSON.parse(mcpLookup.result) };
+      const verbose = JSON.stringify({ ...JSON.parse(prompts.verbose), mcpLookup: context });
+      const packed = JSON.stringify({ ...JSON.parse(prompts.packed), mcpLookup: context });
+      prompts = { verbose, packed, rawTokens: countTokens(verbose), packedTokens: countTokens(packed) };
+    }
     const prompt = options.compression ? prompts.packed : prompts.verbose;
+    const systemPrompt = POLICY + (mcpLookup ? MCP_GUIDANCE : '');
+    if (mcpLookup) {
+      mcpLookup.addedInputTokens = countTokens(prompt) - originalTokens + countTokens(systemPrompt) - PREFIX_TOKENS;
+      if (mcpLookup.addedInputTokens > MAX_MCP_CONTEXT_TOKENS) throw new McpLookupError();
+    }
     const content = {
       type: 'text' as const,
-      text: POLICY,
+      text: systemPrompt,
       ...(options.cache ? { prompt_cache_breakpoint: { mode: 'explicit' as const } } : {}),
     };
     const request: OpenAI.Chat.ChatCompletionCreateParamsNonStreaming = {
@@ -103,7 +121,7 @@ export class LunaGateway implements ModelGateway {
       reasoning_effort: options.reasoning ? 'low' : 'none',
       max_completion_tokens: maxCompletionTokens(options),
       store: false,
-      prompt_cache_key: `tokenfall-policy-v4:${cacheBucket}`,
+      prompt_cache_key: `tokenfall-policy-v4:${cacheBucket}${mcpLookup ? ':lookahead-v1' : ''}`,
       prompt_cache_options: { mode: 'explicit', ttl: '30m' },
       messages: [
         { role: 'system' as const, content: [content] },
@@ -117,7 +135,6 @@ export class LunaGateway implements ModelGateway {
         },
       },
     };
-    const started = performance.now();
     const result = await this.client.chat.completions.create(request, { timeout: options.reasoning ? 60000 : 20000 });
     const latencyMs = Math.round(performance.now() - started);
     const usage = normalizeUsage(result.usage);
@@ -130,12 +147,13 @@ export class LunaGateway implements ModelGateway {
     return {
       id: randomUUID(), pieceId,
       placement: valid ? { column: selected.column, row: selected.row, rotation: selected.rotation, piece: selected.piece, useHold: selected.useHold } : null,
-      tip: valid && selection ? selection.tip : !allowedReasoning ? 'The service did not confirm zero reasoning. This move was rejected.' : result.choices[0]?.finish_reason === 'length' ? 'The completion token limit was reached. Usage was recorded, but no move was applied.' : 'The model did not return a valid legal move.',
+      tip: valid && selection ? selection.tip : !allowedReasoning ? 'The service did not confirm zero reasoning. This move was rejected.' : result.choices[0]?.finish_reason === 'length' ? `The reply hit its ${maxCompletionTokens(options).toLocaleString()}-token completion cap, not your total allowance. Usage was recorded; no move was applied.` : 'The model did not return a valid legal move.',
       status: valid ? 'ready' : 'invalid', usage, latencyMs,
       rawTokens: prompts.rawTokens, packedTokens: prompts.packedTokens,
       savedTokens: options.compression ? Math.max(0, prompts.rawTokens - prompts.packedTokens) : 0,
       compression: options.compression, cacheEnabled: options.cache, reasoningEnabled: Boolean(options.reasoning),
-      prompt, systemPrompt: POLICY, outputText, inputChips: tokenChips(prompt), outputChips: tokenChips(outputText),
+      ...(mcpLookup ? { mcpLookup } : {}),
+      prompt, systemPrompt, outputText, inputChips: tokenChips(prompt), outputChips: tokenChips(outputText),
       promptComparison: { verbose: prompts.verbose, packed: prompts.packed },
     };
   }
