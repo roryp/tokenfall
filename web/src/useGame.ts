@@ -20,9 +20,9 @@ function savedSession(): Session | null {
 function savedOptions(): AiOptions {
   try {
     const saved = JSON.parse(sessionStorage.getItem('tetris-luna-options') ?? 'null');
-    if (typeof saved?.cache === 'boolean' && typeof saved?.compression === 'boolean') return { cache: saved.cache, compression: saved.compression };
-  } catch { return { cache: false, compression: false }; }
-  return { cache: false, compression: false };
+    if (typeof saved?.cache === 'boolean' && typeof saved?.compression === 'boolean') return { cache: saved.cache, compression: saved.compression, reasoning: saved.reasoning === true };
+  } catch { return { cache: false, compression: false, reasoning: false }; }
+  return { cache: false, compression: false, reasoning: false };
 }
 
 export function useGame() {
@@ -30,6 +30,8 @@ export function useGame() {
   const [connected, setConnected] = useState(false);
   const [joined, setJoined] = useState(false);
   const [joining, setJoining] = useState(false);
+  const [player, setPlayer] = useState<{ id: string; name: string; tokenText: string } | null>(null);
+  const [sessionName, setSessionName] = useState<string>();
   const [unmeteredRequests, setUnmeteredRequests] = useState(0);
   const [view, setView] = useState<GameView>(() => new Game('preview').view());
   const [metrics, setMetrics] = useState<Metrics>(emptyMetrics);
@@ -86,6 +88,8 @@ export function useGame() {
     sending.current = null;
     active.current = true;
     joiningRef.current = false;
+    setPlayer({ id: data.playerId, name: data.name, tokenText: data.tokenText });
+    setSessionName(data.name);
     setUnmeteredRequests(data.unmeteredRequests);
     setMetrics(data.metrics);
     if (historyPlayer.current !== data.playerId) setRequestHistory([]);
@@ -96,23 +100,25 @@ export function useGame() {
     refresh();
   }
 
-  function join() {
+  function join(setup?: { name: string; text?: string }) {
     if (!roomRef.current || !socket.current?.connected || active.current || joiningRef.current) return;
+    const code = roomRef.current.code;
+    const previous = session.current?.room === code ? session.current : null;
+    if (!previous && !setup) return;
     joiningRef.current = true;
     joinFailed.current = false;
     setJoining(true);
     setNotice('');
-    const code = roomRef.current.code;
-    const previous = session.current?.room === code ? session.current : null;
-    const name = previous?.name ?? `Player ${crypto.randomUUID().slice(0, 6)}`;
-    socket.current.timeout(8000).emit('join', { name, room: code, classic: true, ...(previous ? { token: previous.token } : {}) }, (error: Error | null, reply: Reply<JoinResult>) => {
+    const name = previous?.name ?? setup!.name.trim();
+    socket.current.timeout(8000).emit('join', { name, room: code, ...(previous ? { token: previous.token } : setup?.text !== undefined ? { text: setup.text } : {}) }, (error: Error | null, reply: Reply<JoinResult>) => {
       joiningRef.current = false;
       setJoining(false);
       if (error || !reply.ok) {
         joinFailed.current = true;
-        setNotice(!error && !reply.ok ? reply.error : 'Could not connect. Press Play to retry.');
+        setNotice(!error && !reply.ok ? reply.error : 'Could not connect. Join again to retry.');
         if (!error && !reply.ok && reply.code === 'session') {
           session.current = null;
+          setSessionName(undefined);
           joinFailed.current = false;
           try { sessionStorage.removeItem('tokenfall-session'); } catch { return; }
         }
@@ -213,7 +219,7 @@ export function useGame() {
     const serial = ++requestSerial.current;
     const epoch = pilotEpoch.current;
     const originalRun = runId.current;
-    const selected = { cache: options.cache, compression: options.compression, autopilot: true };
+    const selected = { cache: options.cache, compression: options.compression, reasoning: Boolean(options.reasoning), autopilot: true };
     setRequestOptions(selected);
     setBusy(true);
     if (!await flushAll() || serial !== requestSerial.current || originalRun !== runId.current || !pilotActive.current || epoch !== pilotEpoch.current) {
@@ -221,7 +227,7 @@ export function useGame() {
       return;
     }
     nextRequestAt.current = Date.now() + (roomRef.current?.autopilotCooldownMs ?? 1000);
-    socket.current!.timeout(25000).emit('assist', selected, (error: Error | null, reply: Reply<{ insight: Insight; metrics: Metrics }>) => {
+    socket.current!.timeout(selected.reasoning ? 65000 : 25000).emit('assist', selected, (error: Error | null, reply: Reply<{ insight: Insight; metrics: Metrics }>) => {
       if (serial !== requestSerial.current) return;
       requestPending.current = false;
       setRequestOptions(null);
@@ -245,18 +251,23 @@ export function useGame() {
     });
   }
 
-  async function restart() {
-    if (!socket.current?.connected || !active.current || requestPending.current || joiningRef.current) return;
+  async function restart(text?: string): Promise<boolean> {
+    if (!socket.current?.connected || !active.current || requestPending.current || joiningRef.current) return false;
     stopAutopilot();
-    if (!await flushAll()) return;
+    if (!await flushAll()) return false;
     joiningRef.current = true;
     setJoining(true);
-    socket.current.timeout(8000).emit('restart', (error: Error | null, reply: Reply<JoinResult>) => {
-      joiningRef.current = false;
-      setJoining(false);
-      if (error || !reply.ok) { setNotice(!error && !reply.ok ? reply.error : 'Could not start a new game. Try again.'); return; }
-      installSession(reply.data);
-      setNotice('');
+    return new Promise(resolve => {
+      const receive = (error: Error | null, reply: Reply<JoinResult>) => {
+        joiningRef.current = false;
+        setJoining(false);
+        if (error || !reply.ok) { setNotice(!error && !reply.ok ? reply.error : 'Could not start a new game. Try again.'); resolve(false); return; }
+        installSession(reply.data);
+        setNotice('');
+        resolve(true);
+      };
+      if (text === undefined) socket.current!.timeout(8000).emit('restart', receive);
+      else socket.current!.timeout(8000).emit('configure', { text }, receive);
     });
   }
 
@@ -292,8 +303,9 @@ export function useGame() {
     });
     connection.on('room', nextRoom => {
       roomRef.current = nextRoom;
+      setSessionName(session.current?.room === nextRoom.code ? session.current.name : undefined);
       startTransition(() => setRoom(nextRoom));
-      if (!active.current && !joiningRef.current && !joinFailed.current) onJoin();
+      if (session.current?.room === nextRoom.code && !active.current && !joiningRef.current && !joinFailed.current) onJoin();
     });
     connection.on('usage', usage => {
       setMetrics(current => usage.metrics.requests >= current.requests ? usage.metrics : current);
@@ -331,5 +343,5 @@ export function useGame() {
 
   const rates = room?.pricing.snapshot?.usdPerMillion;
   const cost = rates ? costForUsage(metrics, rates) : null;
-  return { room, connected, joined, joining, view, metrics, insight, requestHistory, cost, busy, notice, setNotice, options, setOptions, autopilot, toggleAutopilot, requestOptions, unmeteredRequests, join, act, restart };
+  return { room, connected, joined, joining, player, sessionName, view, metrics, insight, requestHistory, cost, busy, notice, setNotice, options, setOptions, autopilot, toggleAutopilot, requestOptions, unmeteredRequests, join, act, restart };
 }

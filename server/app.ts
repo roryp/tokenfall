@@ -19,7 +19,7 @@ const inputSchema = z.object({
   runId: z.string().uuid(), sequence: z.number().int().positive(), frame: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
   events: z.array(z.object({ frame: z.number().int().nonnegative(), action: z.enum(ACTIONS) }).strict()).max(64),
 }).strict();
-const aiSchema = z.object({ cache: z.boolean(), compression: z.boolean(), autopilot: z.boolean().optional() }).strict();
+const aiSchema = z.object({ cache: z.boolean(), compression: z.boolean(), reasoning: z.boolean().optional(), autopilot: z.boolean().optional() }).strict();
 
 export function errorReply(error: unknown): Reply<never> {
   if (error instanceof RequestError) return { ok: false, error: error.message, code: error.code, retryAfterMs: error.retryAfterMs };
@@ -42,7 +42,7 @@ export function createApplication(config: AppConfig, gateway: ModelGateway = new
     next();
   });
   app.use(express.json({ limit: '16kb' }));
-  app.get('/api/health', (_request, response) => response.json({ status: 'ok', model: config.deployment, reasoning: 'none' }));
+  app.get('/api/health', (_request, response) => response.json({ status: 'ok', model: config.deployment, reasoning: 'none', reasoningOptions: ['none', 'low'] }));
   app.get('/api/room', (_request, response) => response.setHeader('Cache-Control', 'no-store').json(room.view()));
   const tokenWindows = new Map<string, { start: number; count: number }>();
   app.post('/api/tokenize', (request, response) => {

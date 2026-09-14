@@ -2,14 +2,15 @@ import { useEffect, useEffectEvent, useRef } from 'react';
 import { ArrowDown, ArrowDownToLine, ArrowLeft, ArrowRight, ArrowRightLeft, RotateCcw, RotateCw } from 'lucide-react';
 import type { ReactNode } from 'react';
 import { pieceCells, spawnTetromino } from 'miaoda-game-fallblock-core';
-import { HEIGHT, HIDDEN_ROWS, WIDTH } from '../../shared/game.ts';
-import type { Action, Cell, GameView } from '../../shared/game.ts';
+import { HEIGHT, HIDDEN_ROWS, tokenLabel, WIDTH } from '../../shared/game.ts';
+import type { Action, Cell, GameView, PieceToken } from '../../shared/game.ts';
 import type { Insight } from '../../shared/protocol.ts';
 
-export function PiecePreview({ piece }: { piece: Cell }) {
+export function PiecePreview({ piece, token }: { piece: Cell; token?: PieceToken | null }) {
   const cells = piece ? pieceCells(spawnTetromino(piece, piece, 0, 0)) : [];
-  return <div role="img" aria-label={piece ? `${piece} piece` : 'Empty hold'}>
+  return <div role="img" aria-label={piece ? `${piece} piece${token ? `: ${tokenLabel(token.text)}` : ''}` : 'Empty hold'}>
     <div className="piece-preview">{Array.from({ length: 8 }, (_, index) => <i key={index} className={cells.some(cell => cell.x === index % 4 && cell.y === Math.floor(index / 4)) ? `mino mino-${piece}` : ''} />)}</div>
+    {token && <span className="piece-token" title={`Token ${token.id}: ${token.text}`}>{tokenLabel(token.text)}</span>}
   </div>;
 }
 
@@ -26,18 +27,20 @@ export function GameBoard({ view, joined, suggestion, children }: { view: GameVi
     const token = (name: string) => colors.getPropertyValue(`--cp-${name}`).trim();
     const blockColors: Record<string, string> = { I: token('link'), O: token('warning'), T: token('accent'), S: token('success'), Z: token('danger'), J: token('game-j'), L: token('game-l') };
     const prior = previous.current;
-    if (joined && prior && view.pieces === prior.pieces + 1 && !window.matchMedia('(prefers-reduced-motion: reduce)').matches) {
+    if (joined && prior && prior.tokens === view.tokens && view.pieces === prior.pieces + 1 && !window.matchMedia('(prefers-reduced-motion: reduce)').matches) {
       let target = prior.ghost;
+      let activeToken = prior.activeToken;
       if (suggestion?.pieceId === prior.pieceId && suggestion.status === 'stale' && suggestion.placement) {
         const pose = suggestion.placement;
         const type = pose.piece ?? prior.piece;
         const landed = spawnTetromino<Cell>(type, type, pose.column, pose.row);
         landed.cells = landed.orientations![pose.rotation];
         target = pieceCells(landed);
+        if (pose.useHold) activeToken = prior.holdToken ?? prior.nextTokens[0];
       }
-      drop.current = { board: prior, target, started: performance.now() };
+      drop.current = { board: { ...prior, activeToken }, target, started: performance.now() };
     }
-    if (prior && (view.pieces < prior.pieces || view.frame < prior.frame)) drop.current = null;
+    if (prior && (prior.tokens !== view.tokens || view.pieces < prior.pieces || view.frame < prior.frame)) drop.current = null;
     previous.current = view;
     let board = view;
     const animation = drop.current;
@@ -90,7 +93,48 @@ export function GameBoard({ view, joined, suggestion, children }: { view: GameVi
       }
       context.restore();
     };
+    const drawLabel = (text: string, cells: { x: number; y: number }[]) => {
+      const visible = cells.filter(cell => cell.y >= HIDDEN_ROWS && cell.y < HEIGHT && cell.x >= 0 && cell.x < WIDTH);
+      if (!visible.length) return;
+      const occupied = new Set(visible.map(cell => `${cell.x},${cell.y}`));
+      let best = { cell: visible[0], length: 1, vertical: false };
+      for (const cell of visible) for (const vertical of [false, true]) {
+        let length = 1;
+        while (occupied.has(`${cell.x + (vertical ? 0 : length)},${cell.y + (vertical ? length : 0)}`)) length += 1;
+        if (length > best.length) best = { cell, length, vertical };
+      }
+      const width = best.length * size - 10;
+      context.save();
+      context.translate((best.cell.x + 0.5) * size, (best.cell.y - HIDDEN_ROWS + 0.5) * size);
+      if (best.vertical) context.rotate(Math.PI / 2);
+      context.translate((best.length - 1) * size / 2, 0);
+      context.font = `700 12px ${token('mono')}`;
+      const characters = Array.from(tokenLabel(text));
+      let label = characters.join('');
+      while (characters.length > 0 && context.measureText(label).width > width - 4) { characters.pop(); label = `${characters.join('')}...`; }
+      context.fillStyle = token('board');
+      context.globalAlpha = 0.9;
+      context.beginPath();
+      context.roundRect(-width / 2, -9, width, 18, 2);
+      context.fill();
+      context.fillStyle = token('tile-light');
+      context.globalAlpha = 1;
+      context.textAlign = 'center';
+      context.textBaseline = 'middle';
+      context.fillText(label, 0, 0, width - 4);
+      context.restore();
+    };
     board.board.forEach((value, index) => { if (value) drawCell(index % WIDTH, Math.floor(index / WIDTH), value, 'solid'); });
+    if (board.tokens.length) {
+      const occurrences = new Map<number, { x: number; y: number }[]>();
+      board.tokenBoard.forEach((occurrence, index) => {
+        if (occurrence === null || !board.board[index]) return;
+        const cells = occurrences.get(occurrence) ?? [];
+        cells.push({ x: index % WIDTH, y: Math.floor(index / WIDTH) });
+        occurrences.set(occurrence, cells);
+      });
+      for (const [occurrence, cells] of occurrences) drawLabel(board.tokens[occurrence % board.tokens.length].text, cells);
+    }
     board.ghost.forEach(cell => { if (cell.value) drawCell(cell.x, cell.y, cell.value, 'ghost'); });
     if (joined && suggestion?.placement && suggestion.pieceId === view.pieceId && suggestion.status === 'ready') {
       const target = suggestion.placement;
@@ -101,6 +145,7 @@ export function GameBoard({ view, joined, suggestion, children }: { view: GameVi
     }
     if (board.status !== 'over') {
       board.active.forEach(cell => { if (cell.value) drawCell(cell.x, cell.y, cell.value, 'solid'); });
+      if (board.activeToken) drawLabel(board.activeToken.text, board.active);
     }
     if (joined && view.lastClear && view.frame - view.lastClear.frame < 12) {
       context.fillStyle = token('tile-light');
@@ -112,7 +157,7 @@ export function GameBoard({ view, joined, suggestion, children }: { view: GameVi
   return <div className="board-shell">
     <div className="board-edge"><span>01</span><span>10</span></div>
     <div className="board-interior">
-      <canvas ref={canvas} className="game-canvas" aria-label="Tetris playfield, 10 columns and 20 rows" data-pieces={view.pieces} data-status={view.status} data-frame={view.frame} role="img" />
+      <canvas ref={canvas} className="game-canvas" aria-label={`Tetris playfield, 10 columns and 20 rows${view.activeToken ? `, current token: ${tokenLabel(view.activeToken.text)}` : ''}`} data-token-count={view.tokens.length} data-active-token={view.activeToken ? tokenLabel(view.activeToken.text) : undefined} data-pieces={view.pieces} data-status={view.status} data-frame={view.frame} role="img" />
       {children}
       {joined && view.lastClear && view.frame - view.lastClear.frame < 90 && view.status === 'playing' && <div className="clear-callout" key={view.lastClear.frame}><strong>{view.lastClear.label}</strong><span>+{view.lastClear.points.toLocaleString()}</span></div>}
     </div>
@@ -129,7 +174,8 @@ export function GameControls({ act, paused, disabled }: { act: (action: Action) 
   }
   const onKeyDown = useEffectEvent((event: KeyboardEvent) => {
     const keys: Record<string, Action> = { ArrowLeft: 'left', ArrowRight: 'right', ArrowDown: 'softDrop', ArrowUp: 'rotateCW', KeyX: 'rotateCW', KeyZ: 'rotateCCW', Space: 'hardDrop', KeyC: 'hold', ShiftLeft: 'hold', ShiftRight: 'hold' };
-    if (event.target instanceof HTMLElement && (['INPUT', 'TEXTAREA', 'SELECT'].includes(event.target.tagName) || event.target.isContentEditable || event.target.closest('dialog'))) return;
+    if (event.target instanceof HTMLElement && (['INPUT', 'TEXTAREA', 'SELECT'].includes(event.target.tagName) || event.target.isContentEditable || event.target.closest('dialog, .room-panel'))) return;
+    if (event.code === 'Space' && event.target instanceof HTMLButtonElement) return;
     if (disabled) return;
     if (['KeyP', 'Escape'].includes(event.code)) {
       event.preventDefault();

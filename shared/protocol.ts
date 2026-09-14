@@ -84,6 +84,7 @@ export interface Insight {
   savedTokens: number;
   compression: boolean;
   cacheEnabled: boolean;
+  reasoningEnabled?: boolean;
   prompt: string;
   systemPrompt?: string;
   promptComparison?: { verbose: string; packed: string };
@@ -135,7 +136,7 @@ export interface JoinResult extends PlayerUsage {
 }
 export interface InputBatch { runId: string; sequence: number; frame: number; events: InputEvent[] }
 export interface InputAck { sequence: number; score: number; lines: number; pieceId: number; frame: number }
-export interface AiOptions { cache: boolean; compression: boolean; autopilot?: boolean }
+export interface AiOptions { cache: boolean; compression: boolean; reasoning?: boolean; autopilot?: boolean }
 export type Reply<Value> = { ok: true; data: Value } | { ok: false; error: string; code?: string; retryAfterMs?: number };
 export interface ServerEvents {
   room: (room: RoomView) => void;

@@ -74,7 +74,7 @@ html[data-theme="dark"] {
   font-size: 14px;
 }
 * { box-sizing: border-box; }
-body { margin: 0; min-width: 320px; }
+body { margin: 0; min-width: 0; }
 button, input, textarea, select { font: inherit; }
 button, a { -webkit-tap-highlight-color: var(--cp-transparent); }
 button { cursor: pointer; color: inherit; }

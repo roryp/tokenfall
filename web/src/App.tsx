@@ -1,9 +1,10 @@
 import { useEffect, useRef, useState } from 'react';
-import { Bot, Columns2, FileJson2, History, Layers3, Pause, Play, RotateCcw, Wifi, WifiOff, X } from 'lucide-react';
+import { Bot, Brain, Columns2, FileJson2, History, Layers3, Pause, Play, RotateCcw, Trophy, Wifi, WifiOff, X } from 'lucide-react';
 import type { LucideIcon } from 'lucide-react';
 import { costForUsage } from '../../shared/protocol.ts';
 import type { Insight, TokenRates } from '../../shared/protocol.ts';
 import { GameBoard, GameControls, PiecePreview } from './GameBoard.tsx';
+import { GameSetup, RoomPanel } from './RoomPanel.tsx';
 import { formatMoney } from './format.ts';
 import { useGame } from './useGame.ts';
 import type { RequestRecord } from './useGame.ts';
@@ -35,7 +36,7 @@ function CacheActivity({ records, selected, rates, pending, unknown, onSelect }:
     })}</tbody></table></div>
     <h3 className="activity-selection" data-testid="cache-selected-reply">{record ? `Reply #${record.number}` : 'Selected reply'} / {cacheLabel(selected)}</h3>
     <p data-testid="inspected-cache-result">{selected.usage.cached > 0 ? `Cache hit: ${number(selected.usage.cached)} input tokens reused${selected.usage.cacheWrites > 0 ? `; ${number(selected.usage.cacheWrites)} tokens also written` : ''}` : selected.usage.cacheWrites > 0 ? `Cache miss: ${number(selected.usage.cacheWrites)} tokens written, none reused` : selected.cacheEnabled ? 'Cache miss: no input tokens reused' : 'Cache was off for this request'}</p>
-    <dl className="cache-content-breakdown"><div><dt>Fixed instructions</dt><dd>{selected.usage.cached > 0 ? 'Reused from the cached prefix' : selected.usage.cacheWrites > 0 ? 'Stored for later reuse; this was a miss' : selected.cacheEnabled ? 'Sent without a cache match' : 'Sent with caching disabled'}</dd></div><div><dt>Board and legal moves</dt><dd>Fresh input for this request, not a cache hit</dd></div><div><dt>New answer</dt><dd>{number(selected.usage.output)} output tokens generated, not cached</dd></div></dl>
+    <dl className="cache-content-breakdown"><div><dt>Fixed instructions</dt><dd>{selected.usage.cached > 0 ? 'Reused from the cached prefix' : selected.usage.cacheWrites > 0 ? 'Stored for later reuse; this was a miss' : selected.cacheEnabled ? 'Sent without a cache match' : 'Sent with caching disabled'}</dd></div><div><dt>Board and legal moves</dt><dd>Fresh input for this request, not a cache hit</dd></div><div><dt>Model output</dt><dd>{number(selected.usage.output)} output tokens generated{selected.usage.reasoning === null ? '; reasoning count not reported' : `, including ${number(selected.usage.reasoning)} reasoning tokens`}, not cached</dd></div></dl>
     <h3>Instruction text for this reply</h3>
     {selected.systemPrompt ? <pre tabIndex={0} data-testid="cached-instructions">{selected.systemPrompt}</pre> : <p>Instruction text is unavailable for this earlier reply.</p>}
     <small>Provider-confirmed token counts, not word-level cache offsets. Replies missing from this tab's history are not reconstructed.</small>
@@ -90,6 +91,8 @@ export default function App() {
   const [inspectedPrompt, setInspectedPrompt] = useState<Insight | null>(null);
   const [inspectInstructions, setInspectInstructions] = useState(false);
   const promptDialog = useRef<HTMLDialogElement | null>(null);
+  const [editingSentence, setEditingSentence] = useState(false);
+  const sentenceDialog = useRef<HTMLDialogElement | null>(null);
   const latest = game.insight;
   const rates = game.room?.pricing.snapshot?.usdPerMillion;
   const compressionSaving = rates ? game.metrics.compressionSaved * rates.input / 1000000 : null;
@@ -108,6 +111,7 @@ export default function App() {
   const status = !game.connected ? 'Connecting' : !game.joined ? 'Ready' : game.busy ? 'Luna is thinking' : game.autopilot ? 'Luna playing' : game.view.status === 'over' ? 'Game over' : game.view.status === 'paused' ? 'Paused' : 'Manual play';
   const cacheResult = latest ? latest.usage.cached > 0 ? `${number(latest.usage.cached)} cached` : latest.usage.cacheWrites > 0 ? `${number(latest.usage.cacheWrites)} cache write` : latest.cacheEnabled ? 'Cache miss' : 'Cache off' : '';
   useEffect(() => { if (inspectedPrompt) promptDialog.current?.showModal(); }, [inspectedPrompt]);
+  useEffect(() => { if (editingSentence) sentenceDialog.current?.showModal(); }, [editingSentence]);
 
   function inspect(instructions = false) {
     const selected = latest ?? (instructions ? game.requestHistory[0]?.insight : null);
@@ -117,16 +121,25 @@ export default function App() {
     setInspectedPrompt(selected);
   }
 
-  return <main className="tetris-app" data-playing={game.joined} data-autopilot={game.autopilot}>
+  function showRankings() {
+    game.act('pause');
+    document.querySelector<HTMLElement>('.leaderboard h2')?.focus({ preventScroll: true });
+    document.querySelector('.room-panel')?.scrollIntoView({ block: 'start' });
+  }
+
+  return <main className="room-layout" data-playing={game.joined}>
+    <div className="tetris-app" data-playing={game.joined} data-autopilot={game.autopilot}>
     <header className="game-header">
       <h1><span className="tetris-mark" aria-hidden="true"><i /><i /><i /><i /></span>TETRIS</h1>
       <div className="header-actions">
         <span className={`connection ${game.connected ? 'connected' : ''}`} title={game.connected ? 'Connected' : 'Reconnecting'} aria-label={game.connected ? 'Connected' : 'Reconnecting'}>{game.connected ? <Wifi size={16} /> : <WifiOff size={16} />}</span>
+        <button className="icon-button" aria-label="Show leaderboard" title="Leaderboard" onClick={showRankings}><Trophy size={19} /></button>
         <button className="icon-button" aria-label={game.autopilot ? 'Stop Luna' : game.view.status === 'paused' ? 'Resume game' : 'Pause game'} title={game.autopilot ? 'Stop Luna' : game.view.status === 'paused' ? 'Resume (P)' : 'Pause (P)'} disabled={!game.joined || game.view.status === 'over'} onClick={() => game.autopilot ? game.toggleAutopilot(false) : game.act(game.view.status === 'paused' ? 'resume' : 'pause')}>
           {game.view.status === 'paused' && !game.autopilot ? <Play size={20} /> : <Pause size={20} />}
         </button>
         <button className="icon-button" aria-label="New game" title="New game" disabled={!game.joined || game.busy || game.joining} onClick={() => void game.restart()}><RotateCcw size={19} /></button>
       </div>
+      {game.notice && <div className="notice" role="alert"><span>{game.notice}</span><button className="icon-button" aria-label="Dismiss message" title="Dismiss" onClick={() => game.setNotice('')}><X size={18} /></button></div>}
     </header>
 
     <section className="cost-ticker" aria-label="AI cost ticker" aria-live="polite" aria-atomic="true">
@@ -151,6 +164,13 @@ export default function App() {
 
     <div className="luna-controls" aria-label="Luna controls">
       <Switch label="Ask Luna" icon={Bot} checked={game.autopilot} disabled={!game.joined || !game.connected || game.view.status === 'over'} onChange={game.toggleAutopilot} title="Let Luna play the game automatically. Uses paid AI requests. Switch off to stop." />
+      <div className="luna-reasoning">
+        <Switch label="Reasoning" icon={Brain} checked={Boolean(game.options.reasoning)} onChange={reasoning => game.setOptions(current => ({ ...current, reasoning }))} detail={game.options.reasoning ? 'Low effort next' : 'Off next'} title="Enable low reasoning effort for the next Luna request. Can take longer and use more billed output tokens. Changing this does not start Luna." />
+        <dl className="reasoning-usage" aria-label="Reasoning token usage" aria-live="polite" aria-atomic="true" title="Provider-reported reasoning tokens. Already included in output tokens and AI cost; missing counts are not estimated.">
+          <div><dt>Reported total</dt><dd data-testid="reasoning-tokens">{number(game.metrics.reasoning)}</dd></div>
+          <div><dt>{latest ? `Last reply / ${latest.reasoningEnabled ? 'low' : 'off'}` : 'Last reply'}</dt><dd data-testid="last-reasoning-tokens">{game.busy ? 'Pending' : latest ? latest.usage.reasoning === null ? 'Not reported' : number(latest.usage.reasoning) : '--'}</dd></div>
+        </dl>
+      </div>
       <Switch label="Compression" icon={FileJson2} checked={game.options.compression} onChange={compression => game.setOptions(current => ({ ...current, compression }))} detail={game.options.compression ? 'Packed rows next' : 'Cell JSON next'} title="Send the same board in fewer tokens. Applies to the next request, not past costs." />
       <Switch label="Cache" icon={Layers3} checked={game.options.cache} onChange={cache => game.setOptions(current => ({ ...current, cache }))} detail={game.options.cache ? 'Reuse rules next' : 'Full input next'} title="Reuse fixed instructions at the cache-read rate. Writes can cost extra; a hit is not guaranteed. Applies to the next request, not past costs." />
     </div>
@@ -158,7 +178,7 @@ export default function App() {
     <div className="game-status" role="status">
       <span className={game.autopilot ? 'luna-active' : ''} data-testid="game-status"><i className={game.busy ? 'thinking' : ''} />{status}</span>
       <span className="request-status" data-testid="request-status" title={game.requestOptions ? 'Changes to the switches apply to the next request.' : undefined}>
-        {game.requestOptions ? `In flight: ${game.requestOptions.compression ? 'Packed' : 'Verbose'} / cache ${game.requestOptions.cache ? 'on' : 'off'}` : latest ? `${latest.compression ? 'Packed' : 'Verbose'} / ${cacheResult}` : ''}
+        {game.requestOptions ? `In flight: ${game.requestOptions.compression ? 'Packed' : 'Verbose'} / cache ${game.requestOptions.cache ? 'on' : 'off'} / reasoning ${game.requestOptions.reasoning ? 'low' : 'off'}` : latest ? `${latest.compression ? 'Packed' : 'Verbose'} / ${cacheResult}` : ''}
       </span>
       <div className="prompt-summary">
         <div><span data-testid="compression-detail">{latest ? latest.compression ? `Last board: ${number(latest.rawTokens)} -> ${number(latest.packedTokens)} tokens (-${lastReduction}%)` : `Last board: ${number(latest.rawTokens)} tokens, uncompressed` : game.metrics.requests ? 'Prompt available after next reply' : 'No prompt sent yet'}</span><small data-testid="last-request-cost">{latest ? `Last request ${signedMoney(lastCost)} / USD est.` : 'No charge for changing settings'}</small></div>
@@ -173,22 +193,28 @@ export default function App() {
         <div><span>LEVEL</span><strong data-testid="game-level">{number(game.view.level)}</strong></div>
       </div>
       <div className="play-well">
-        <aside className="piece-rail"><span>HOLD</span><button className="hold-slot" title="Hold (C)" aria-label="Hold current piece" disabled={!game.joined || game.autopilot || !game.view.canHold || game.view.status !== 'playing'} onClick={() => game.act('hold')}><PiecePreview piece={game.view.hold} /></button></aside>
+        <aside className="piece-rail"><span>HOLD</span><button className="hold-slot" title="Hold (C)" aria-label="Hold current piece" disabled={!game.joined || game.autopilot || !game.view.canHold || game.view.status !== 'playing'} onClick={() => game.act('hold')}><PiecePreview piece={game.view.hold} token={game.view.holdToken} /></button></aside>
         <div className="board-column">
           <GameBoard view={game.view} joined={game.joined} suggestion={latest}>
-            {!game.joined ? <div className="board-overlay"><strong>{game.joining ? 'Connecting...' : 'Ready'}</strong>{!game.joining && <button className="primary-button" onClick={game.join}><Play size={18} />Play</button>}</div>
+            {!game.joined ? <div className="board-overlay"><strong>{game.joining ? 'Connecting...' : 'Ready'}</strong></div>
               : game.view.status === 'over' ? <div className="board-overlay gameover-overlay"><h2>Game over</h2><strong>{number(game.view.score)}</strong><button className="primary-button" disabled={game.busy} onClick={() => void game.restart()}><RotateCcw size={17} />Play again</button></div>
               : game.view.status === 'paused' && !game.autopilot ? <div className="board-overlay pause-overlay"><button className="resume-button" aria-label="Resume" title="Resume (P)" onClick={() => game.act('resume')}><Play size={30} /></button><span>PAUSED</span></div> : null}
           </GameBoard>
           <GameControls act={game.act} disabled={!game.joined || game.autopilot || !game.connected || game.view.status === 'over'} paused={game.view.status === 'paused'} />
         </div>
-        <aside className="piece-rail next-rail"><span>NEXT</span>{game.view.next.slice(0, 3).map((piece, index) => <div className="next-piece" key={index}><PiecePreview piece={piece} /></div>)}</aside>
+        <aside className="piece-rail next-rail"><span>NEXT</span>{game.view.next.slice(0, 3).map((piece, index) => <div className="next-piece" key={index}><PiecePreview piece={piece} token={game.view.nextTokens[index]} /></div>)}</aside>
       </div>
     </section>
+    </div>
+    <RoomPanel game={game} onEdit={() => { game.act('pause'); game.setNotice(''); setEditingSentence(true); }} onReturn={() => { window.scrollTo({ top: 0 }); document.querySelector<HTMLButtonElement>('.game-header button[aria-label="Resume game"]')?.focus({ preventScroll: true }); }} />
+    <dialog className="prompt-dialog sentence-dialog" ref={sentenceDialog} aria-labelledby="sentence-title" onClose={() => setEditingSentence(false)}>
+      <header><h2 id="sentence-title">New sentence</h2><button className="icon-button" aria-label="Close sentence editor" title="Close sentence editor" onClick={() => sentenceDialog.current?.close()}><X size={19} /></button></header>
+      {editingSentence && game.notice && <p className="field-error" role="alert">{game.notice}</p>}
+      {editingSentence && <GameSetup editing initialText={game.player?.tokenText || undefined} disabled={!game.connected} pending={game.joining} onSubmit={async setup => { if (await game.restart(setup.text)) sentenceDialog.current?.close(); }} />}
+    </dialog>
     <dialog className={`prompt-dialog ${inspectInstructions ? 'activity-dialog' : 'compression-dialog'}`} ref={promptDialog} aria-labelledby="prompt-title" onClose={() => setInspectedPrompt(null)}>
       <header><h2 id="prompt-title">{inspectInstructions ? 'Cache activity' : 'Compression before / after'}</h2><div className="inspector-actions">{inspectInstructions && game.autopilot && <button className="icon-button" aria-label="Stop Luna in inspector" title="Stop Luna" onClick={() => game.toggleAutopilot(false)}><Pause size={19} /></button>}<button className="icon-button" aria-label="Close prompt" title="Close prompt" onClick={() => promptDialog.current?.close()}><X size={19} /></button></div></header>
       {inspectedPrompt && (inspectInstructions ? <CacheActivity records={game.requestHistory} selected={inspectedPrompt} rates={rates} pending={game.busy} unknown={game.unmeteredRequests} onSelect={setInspectedPrompt} /> : <CompressionComparison insight={inspectedPrompt} />)}
     </dialog>
-    {game.notice && <div className="notice" role="alert"><span>{game.notice}</span><button className="icon-button" aria-label="Dismiss message" title="Dismiss" onClick={() => game.setNotice('')}><X size={18} /></button></div>}
   </main>;
 }

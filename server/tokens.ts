@@ -70,10 +70,12 @@ export function normalizeUsage(value: unknown): Usage {
   const parsed = usageSchema.parse(value);
   if (parsed.total_tokens !== parsed.prompt_tokens + parsed.completion_tokens) throw new Error('Provider usage totals do not match.');
   if (parsed.prompt_tokens_details.cached_tokens + parsed.prompt_tokens_details.cache_write_tokens > parsed.prompt_tokens) throw new Error('Provider cache counts exceed input.');
+  const reasoning = parsed.completion_tokens_details?.reasoning_tokens ?? null;
+  if (reasoning !== null && reasoning > parsed.completion_tokens) throw new Error('Provider reasoning counts exceed output.');
   return {
     input: parsed.prompt_tokens, output: parsed.completion_tokens, total: parsed.total_tokens,
     cached: parsed.prompt_tokens_details.cached_tokens, cacheWrites: parsed.prompt_tokens_details.cache_write_tokens,
-    reasoning: parsed.completion_tokens_details?.reasoning_tokens ?? null,
+    reasoning,
   };
 }
 

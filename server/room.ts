@@ -6,7 +6,7 @@ import { Game, FPS, placementsFor } from '../shared/game.ts';
 import { costForUsage, emptyMetrics, pointsPerCent, tokenCreditsUsed } from '../shared/protocol.ts';
 import type { AiOptions, InputAck, InputBatch, JoinResult, LeaderboardEntry, Metrics, PlayerUsage, PromptPreview, RoomView, TokenPricing } from '../shared/protocol.ts';
 import type { AppConfig } from './config.ts';
-import { AI_COOLDOWN_MS, AUTOPILOT_COOLDOWN_MS, MAX_OUTPUT_TOKENS, ModelGate, PLAYER_REQUEST_LIMIT, PLAYER_TOKEN_BUDGET, PREFIX_TOKENS, ROOM_REQUEST_LIMIT, ROOM_TOKEN_BUDGET, RequestError } from './model.ts';
+import { AI_COOLDOWN_MS, AUTOPILOT_COOLDOWN_MS, MAX_OUTPUT_TOKENS, maxCompletionTokens, ModelGate, PLAYER_REQUEST_LIMIT, PLAYER_TOKEN_BUDGET, PREFIX_TOKENS, ROOM_REQUEST_LIMIT, ROOM_TOKEN_BUDGET, RequestError } from './model.ts';
 import type { ModelGateway } from './model.ts';
 import { addUsage, buildPrompts, gameTokens } from './tokens.ts';
 
@@ -224,7 +224,7 @@ export class Room {
     const classic = player.game.tokens.length === 0;
     if ((!classic && player.record.attempts >= PLAYER_REQUEST_LIMIT) || totals.attempts >= ROOM_REQUEST_LIMIT) throw new RequestError('The AI request allowance is used. Manual play is still available.', 'budget');
     const prompts = buildPrompts(player.game, placementsFor(player.game));
-    const reservation = PREFIX_TOKENS + (options.compression ? prompts.packedTokens : prompts.rawTokens) + MAX_OUTPUT_TOKENS + 1024;
+    const reservation = PREFIX_TOKENS + (options.compression ? prompts.packedTokens : prompts.rawTokens) + maxCompletionTokens(options) + 1024;
     const release = this.gate.acquire(player.record.id, reservation, tokenCreditsUsed(player.metrics), totals.metrics.input + totals.metrics.output, Date.now(), options.autopilot, classic ? ROOM_TOKEN_BUDGET : PLAYER_TOKEN_BUDGET);
     const runId = player.runId;
     player.record.attempts += 1;

@@ -20,6 +20,6 @@ application.server.on('error', error => {
 application.server.listen(config.port, config.host ?? '127.0.0.1', () => {
   console.log(`Tetris listening on ${config.host ?? '127.0.0.1'}:${config.port}`);
   console.log(`Play: ${config.publicUrl ?? `http://127.0.0.1:${config.port}`}`);
-  console.log(`Room ${application.room.code} | ${config.deployment} | reasoning: none`);
+  console.log(`Room ${application.room.code} | ${config.deployment} | reasoning: off by default, optional low effort`);
 });
 for (const signal of ['SIGINT', 'SIGTERM'] as const) process.once(signal, () => { clearInterval(pricingTimer); void application.close().then(() => process.exit(0)); });

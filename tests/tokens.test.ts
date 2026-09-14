@@ -147,6 +147,19 @@ test('verified cache hits preserve gameplay credits without hiding provider toke
   assert.equal(usage.reasoning, 0);
 });
 
+test('reasoning is a reported subset of output and is never billed or counted twice', () => {
+  const provider = { prompt_tokens: 4000, completion_tokens: 160, total_tokens: 4160, prompt_tokens_details: { cached_tokens: 0, cache_write_tokens: 0 }, completion_tokens_details: { reasoning_tokens: 128 } };
+  const usage = normalizeUsage(provider);
+  const metrics = addUsage(emptyMetrics(), usage, 0, false);
+  assert.equal(metrics.reasoning, 128);
+  assert.equal(metrics.output, 160);
+  assert.equal(metrics.input + metrics.output, 4160);
+  assert.equal(tokenCreditsUsed(metrics), 4160);
+  const rates = { input: 0.20, cachedInput: 0.02, cacheWrite: 0.25, output: 1.20 };
+  assert.equal(costForUsage(metrics, rates).output, 160 * rates.output / 1000000);
+  assert.throws(() => normalizeUsage({ ...provider, completion_tokens_details: { reasoning_tokens: 161 } }), /reasoning counts exceed output/);
+});
+
 test('cache counters separate hits, write misses, ordinary misses and bypassed requests', () => {
   const base = { input: 2000, output: 20, total: 2020, cached: 0, cacheWrites: 0, reasoning: 0 };
   const initial = emptyMetrics();

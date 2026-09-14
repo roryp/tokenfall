@@ -12,6 +12,8 @@ import { buildPrompts, countTokens, normalizeUsage, tokenChips } from './tokens.
 export const POLICY = readFileSync(new URL('./policy.md', import.meta.url), 'utf8');
 export const PREFIX_TOKENS = countTokens(POLICY);
 export const MAX_OUTPUT_TOKENS = 128;
+export const MAX_REASONING_COMPLETION_TOKENS = 2048;
+export const maxCompletionTokens = (options: AiOptions) => options.reasoning ? MAX_REASONING_COMPLETION_TOKENS : MAX_OUTPUT_TOKENS;
 export const PLAYER_TOKEN_BUDGET = 160000;
 export const ROOM_TOKEN_BUDGET = 8000000;
 export const PLAYER_REQUEST_LIMIT = 40;
@@ -98,8 +100,8 @@ export class LunaGateway implements ModelGateway {
     };
     const request: OpenAI.Chat.ChatCompletionCreateParamsNonStreaming = {
       model: this.deployment,
-      reasoning_effort: 'none' as const,
-      max_completion_tokens: MAX_OUTPUT_TOKENS,
+      reasoning_effort: options.reasoning ? 'low' : 'none',
+      max_completion_tokens: maxCompletionTokens(options),
       store: false,
       prompt_cache_key: `tokenfall-policy-v4:${cacheBucket}`,
       prompt_cache_options: { mode: 'explicit', ttl: '30m' },
@@ -116,22 +118,23 @@ export class LunaGateway implements ModelGateway {
       },
     };
     const started = performance.now();
-    const result = await this.client.chat.completions.create(request);
+    const result = await this.client.chat.completions.create(request, { timeout: options.reasoning ? 60000 : 20000 });
     const latencyMs = Math.round(performance.now() - started);
     const usage = normalizeUsage(result.usage);
     const outputText = result.choices[0]?.message.content ?? '';
     let selection: z.infer<typeof moveSchema> | null = null;
     try { selection = moveSchema.parse(JSON.parse(outputText)); } catch { selection = null; }
     const selected = placements.find(placement => placement.id === selection?.placementId);
-    const valid = selected && selection && usage.reasoning === 0 && result.choices[0]?.finish_reason === 'stop';
+    const allowedReasoning = options.reasoning || usage.reasoning === 0;
+    const valid = selected && selection && allowedReasoning && result.choices[0]?.finish_reason === 'stop';
     return {
       id: randomUUID(), pieceId,
       placement: valid ? { column: selected.column, row: selected.row, rotation: selected.rotation, piece: selected.piece, useHold: selected.useHold } : null,
-      tip: valid && selection ? selection.tip : usage.reasoning !== 0 ? 'The service did not confirm zero reasoning. This move was rejected.' : 'The model did not return a valid legal move.',
+      tip: valid && selection ? selection.tip : !allowedReasoning ? 'The service did not confirm zero reasoning. This move was rejected.' : result.choices[0]?.finish_reason === 'length' ? 'The completion token limit was reached. Usage was recorded, but no move was applied.' : 'The model did not return a valid legal move.',
       status: valid ? 'ready' : 'invalid', usage, latencyMs,
       rawTokens: prompts.rawTokens, packedTokens: prompts.packedTokens,
       savedTokens: options.compression ? Math.max(0, prompts.rawTokens - prompts.packedTokens) : 0,
-      compression: options.compression, cacheEnabled: options.cache,
+      compression: options.compression, cacheEnabled: options.cache, reasoningEnabled: Boolean(options.reasoning),
       prompt, systemPrompt: POLICY, outputText, inputChips: tokenChips(prompt), outputChips: tokenChips(outputText),
       promptComparison: { verbose: prompts.verbose, packed: prompts.packed },
     };

@@ -10,7 +10,7 @@ import { emptyMetrics, tokenCreditsUsed } from '../shared/protocol.ts';
 import type { Insight, JoinResult, Reply, RoomView, TokenPricing } from '../shared/protocol.ts';
 import { createApplication } from '../server/app.ts';
 import { loadConfig } from '../server/config.ts';
-import { AI_COOLDOWN_MS, AUTOPILOT_COOLDOWN_MS, LunaGateway, MAX_OUTPUT_TOKENS, ModelGate, PLAYER_REQUEST_LIMIT, PLAYER_TOKEN_BUDGET, POLICY, PREFIX_TOKENS, ROOM_TOKEN_BUDGET } from '../server/model.ts';
+import { AI_COOLDOWN_MS, AUTOPILOT_COOLDOWN_MS, LunaGateway, MAX_OUTPUT_TOKENS, MAX_REASONING_COMPLETION_TOKENS, ModelGate, PLAYER_REQUEST_LIMIT, PLAYER_TOKEN_BUDGET, POLICY, PREFIX_TOKENS, ROOM_TOKEN_BUDGET } from '../server/model.ts';
 import type { ModelGateway } from '../server/model.ts';
 import { Room } from '../server/room.ts';
 import { buildPrompts, gameTokens } from '../server/tokens.ts';
@@ -98,6 +98,90 @@ test('the gateway passes Luna\'s Hold choice unchanged and never substitutes an 
   } finally { rmSync(setup.dataDirectory, { recursive: true, force: true }); }
 });
 
+test('reasoning is opt-in, uses a bounded completion budget, and never bypasses legal-move validation', async context => {
+  const setup = fixture();
+  const gateway = new LunaGateway(setup.config);
+  const game = new Game('reasoning-options');
+  let placementId = placementsFor(game)[0].id;
+  let reasoning: number | undefined = 128;
+  let finishReason = 'stop';
+  let sent: unknown;
+  let timeout: number | undefined;
+  context.mock.method(gateway['client'].chat.completions, 'create', async (request: unknown, options: { timeout: number }) => {
+    sent = request;
+    timeout = options.timeout;
+    return { choices: [{ finish_reason: finishReason, message: { content: JSON.stringify({ placementId, tip: 'A legal move.' }) } }], usage: { prompt_tokens: 4000, completion_tokens: 160, total_tokens: 4160, prompt_tokens_details: { cached_tokens: 0, cache_write_tokens: 0 }, completion_tokens_details: { reasoning_tokens: reasoning } } };
+  });
+  try {
+    const disabled = await gateway.complete(game, { compression: true, cache: false }, 'test');
+    assert.equal(JSON.parse(JSON.stringify(sent)).reasoning_effort, 'none');
+    assert.equal(JSON.parse(JSON.stringify(sent)).max_completion_tokens, MAX_OUTPUT_TOKENS);
+    assert.equal(disabled.status, 'invalid');
+    assert.equal(disabled.reasoningEnabled, false);
+    assert.equal(timeout, 20000);
+    const enabled = await gateway.complete(game, { compression: true, cache: false, reasoning: true }, 'test');
+    assert.equal(JSON.parse(JSON.stringify(sent)).reasoning_effort, 'low');
+    assert.equal(JSON.parse(JSON.stringify(sent)).max_completion_tokens, MAX_REASONING_COMPLETION_TOKENS);
+    assert.equal(enabled.status, 'ready');
+    assert.equal(enabled.reasoningEnabled, true);
+    assert.equal(enabled.usage.reasoning, 128);
+    assert.equal(enabled.usage.output, 160);
+    assert.equal(enabled.usage.total, 4160);
+    assert.equal(timeout, 60000);
+    finishReason = 'length';
+    const truncated = await gateway.complete(game, { compression: true, cache: false, reasoning: true }, 'test');
+    assert.equal(truncated.status, 'invalid');
+    assert.equal(truncated.placement, null);
+    assert.equal(truncated.usage.reasoning, 128);
+    assert.match(truncated.tip, /token limit/);
+    finishReason = 'stop';
+    reasoning = undefined;
+    const unknown = await gateway.complete(game, { compression: true, cache: false, reasoning: true }, 'test');
+    assert.equal(unknown.usage.reasoning, null);
+    assert.equal(unknown.status, 'ready');
+    placementId = 'not-legal';
+    const invalid = await gateway.complete(game, { compression: true, cache: false, reasoning: true }, 'test');
+    assert.equal(invalid.status, 'invalid');
+    assert.equal(invalid.placement, null);
+    assert.equal(game.pieces, 0);
+  } finally { rmSync(setup.dataDirectory, { recursive: true, force: true }); }
+});
+
+test('reasoning reserves its full output allowance and persists the actual reported count', async () => {
+  const setup = fixture();
+  let calls = 0;
+  let reservation = 0;
+  const room: Room = new Room(setup.config, { complete: async (game, options) => {
+    calls += 1;
+    assert.equal(options.reasoning, true);
+    assert.equal(room.gate.reserved, reservation);
+    return { ...insightFor(game), reasoningEnabled: true, usage: { input: 4000, output: 160, cached: 0, cacheWrites: 0, total: 4160, reasoning: 128 } };
+  } });
+  try {
+    const joined = room.join('Reasoning Player', room.code, undefined, 'reasoning');
+    const player = room.playerFor('reasoning');
+    const prompts = buildPrompts(player.game, placementsFor(player.game));
+    reservation = PREFIX_TOKENS + prompts.packedTokens + MAX_REASONING_COMPLETION_TOKENS + 1024;
+    const reply = await room.assist(player, { compression: true, cache: false, reasoning: true });
+    assert.equal(reply.metrics.reasoning, 128);
+    assert.equal(reply.metrics.output, 160);
+    assert.equal(room.gate.reserved, 0);
+    room.disconnect('reasoning');
+    const restored = room.join('Reasoning Player', room.code, joined.token, 'restored');
+    assert.equal(restored.metrics.reasoning, 128);
+    assert.equal(restored.metrics.output, 160);
+    const stored = room.database.prepare('SELECT metrics FROM players WHERE id = ?').get(joined.playerId)!;
+    assert.equal(JSON.parse(stored.metrics as string).reasoning, 128);
+    room.join('Budget Player', room.code, undefined, 'budget', 'Bounded reasoning.');
+    const limited = room.playerFor('budget');
+    const packed = buildPrompts(limited.game, placementsFor(limited.game)).packedTokens;
+    limited.metrics.input = PLAYER_TOKEN_BUDGET - (PREFIX_TOKENS + packed + MAX_REASONING_COMPLETION_TOKENS + 1024) + 1;
+    await assert.rejects(room.assist(limited, { compression: true, cache: false, reasoning: true }), /Not enough token credits/);
+    assert.equal(limited.record.attempts, 0);
+    assert.equal(calls, 1);
+  } finally { room.close(); rmSync(setup.dataDirectory, { recursive: true, force: true }); }
+});
+
 test('all normal active and Hold combinations fit the request guard in both encodings', () => {
   assert.ok(PREFIX_TOKENS >= 1024);
   for (const active of TETROMINOES) for (const held of [null, ...TETROMINOES]) {
@@ -105,9 +189,9 @@ test('all normal active and Hold combinations fit the request guard in both enco
     game.active = game.newPiece(active);
     game.held = held ? game.newPiece(held) : null;
     const prompts = buildPrompts(game, placementsFor(game));
-    for (const count of [prompts.rawTokens, prompts.packedTokens]) {
-      const reservation = PREFIX_TOKENS + count + MAX_OUTPUT_TOKENS + 1024;
-      assert.ok(reservation <= 16000, `${active}/${held ?? 'empty'} needs ${reservation} reserved tokens`);
+    for (const count of [prompts.rawTokens, prompts.packedTokens]) for (const output of [MAX_OUTPUT_TOKENS, MAX_REASONING_COMPLETION_TOKENS]) {
+      const reservation = PREFIX_TOKENS + count + output + 1024;
+      assert.ok(reservation <= 16000, `${active}/${held ?? 'empty'} with ${output} output needs ${reservation} reserved tokens`);
     }
   }
 });
