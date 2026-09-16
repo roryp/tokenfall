@@ -1,22 +1,15 @@
 # Tetris With Luna
 
-A normal, untimed Tetris game with a shared room and live leaderboard. Join by name with sentence-based blocks or randomized classic seven-bag pieces. Both modes keep SRS rotation, hold, next pieces, a ghost, line clears, levels, and standard scoring. There are no timed rounds, lessons, or projector screens.
+Untimed Tetris with a shared room, live leaderboards, and optional GPT-5.6 Luna autoplay. Manual play and token previews make no model calls.
+
+[Play online](https://azappctfcqc35fwl26.calmsea-c2502d80.eastus2.azurecontainerapps.io/)
 
 ## Play
 
-- Enter a name and sentence in **Join game**. The free preview uses actual `o200k_base` tokens; each token ID maps to one of the seven shapes, and the sequence repeats. Token fragments stay attached to falling, held, queued, and settled pieces. Choose **Classic** for ordinary seven-bag pieces. Text is limited to 500 characters and 256 tokens.
-- Set **AI token allowance** alongside the sentence before joining. New players default to 1,000,000 tokens, adjustable from 16,000 to 8,000,000. **AI TOKENS LEFT** counts down during play; select that counter to inspect the balances or change your allowance without restarting. Luna, MCP input, and reasoning share this one pool.
-- **Leaderboard** defaults to best Tetris points, including manual players. **Points / cent** uses best points divided by estimated total session spend in US cents. Zero spend, missing prices, and incomplete usage are unranked in that view. Both lists are selected independently by the server, with up to 50 entries, ten per page, and a shortcut to your own position.
-- **Share game**, the QR icon beside the room code, shows a scannable audience QR and the copyable room link without a session credential. Enlarge the QR for presentation; opening or closing it does not stop Luna. QR images are generated locally with a white quiet zone in both themes. Anyone scanning it can join under their own name while a seat is available. Localhost-only links have no audience QR; use the deployed or network-accessible game URL. Rankings remain visible beside the game on wide screens and below it on phones; the trophy button pauses manual play and opens the rankings without stopping an enabled Luna session.
-- **Change sentence** starts a new run without resetting best score, reported AI spend, or cache/compression preferences. Reloading or reconnecting retains the current sentence and game. Reloading and starting a new run leave Luna off; reconnecting to the same player and run preserves an already-enabled Luna session. The sentence itself is private and is not included in public rankings or model prompts.
-- Play manually with the keyboard or touch controls. Manual play makes no model calls.
-- Turn on **Ask Luna** to let GPT-5.6 Luna play continuously until game over or Stop. Temporary errors retain the switch selection and allow up to three automatic retries with 2/4/8-second backoff, or the server's longer delay. Repeated errors and spending safeguards pause Luna with a Retry control; changing request settings or raising the allowance can resume the selected session. Limits are never bypassed. It does not buy a single hint or require a separate Play move action.
-- **Reasoning**, directly below Ask Luna, opts into low reasoning effort. It defaults off and applies to the next request; changing it never starts Luna or changes an in-flight request. The counters show the provider-reported session total and last reply's reasoning tokens, with Pending or Not reported instead of guessed counts. Totals and the preference survive reloads and new games; last-reply details are available only since page load. Reasoning can increase latency and output cost, and its tokens are already included in the main cost and token totals.
-- **MCP** enables real two-piece lookahead before the next Luna request. It simulates each current move and the legal next placements, including Hold, so Luna can compare next-turn traps, achievable line clears, remaining holes, and stack height. It defaults off and survives reloads. The labeled **Results** button opens the forecasts, actual tool arguments, and estimated extra input cost. Opening the popup temporarily pauses Luna without clearing its switch; closing it resumes an already-enabled session. Later replies do not replace the selected result.
-- Toggle **Compression** and **Cache** while Luna plays. Each switch immediately shows the next request's encoding/reuse mode; the in-flight line keeps the current request's original settings. Changing settings does not reprice past spend or make a model call.
-- The cost ticker shows session AI cost, tokens, requests, and separate signed adjustments: compression savings are negative, cache reads reduce cost, and cache-write premiums can add cost. The before-optimizations estimate plus both adjustments reconciles to the reported-usage cost. Restarting preserves accumulated spend and cache counters.
-- **Inspect last prompt** opens **Compression before / after**: both exact encodings of the same board, their token counts, and the reduction. The popup marks which version was sent; an uncompressed request's packed alternative is not treated as billed savings. It temporarily pauses play while preserving Luna's switch; both snapshots stay fixed if an already-started reply arrives. Inspection is free. Closing it resumes Luna only when Luna was already enabled. Allowance and sentence dialogs behave the same way unless a new run is started.
-- The history icon opens **Cache activity**, a running list of the latest 20 replies received since this page loaded. It keeps updating while Luna plays, with a Stop control inside the popup. Each reply can be selected to see exactly which instruction text was reused, written, or not reused. Earlier selected details do not jump to the newest reply.
+- Join with a 2-16 character name. **Sentence** maps real `o200k_base` token IDs to shapes and repeats the labeled sequence; text is limited to 500 characters and 256 tokens. **Classic** uses seven-bag pieces. Both support SRS rotation, hold, ghost, next pieces, levels, and standard scoring.
+- **Leaderboard** ranks best points, including manual players. **Points / cent** divides best points by estimated cumulative player spend in US cents; zero spend, missing prices, and incomplete usage are unranked. Each list has up to 50 entries, ten per page. The room permits 50 online players and 500 saved registrations.
+- **Share game** provides a credential-free link and locally generated, enlargeable QR code. Audience QR requires a public or network-accessible URL, not localhost. Sharing and viewing rankings do not stop an enabled Luna session.
+- **New game** and **Change sentence** preserve best scores, AI usage, allowances, and preferences. They start a new board with Luna off.
 
 | Action | Keyboard |
 | --- | --- |
@@ -28,49 +21,32 @@ A normal, untimed Tetris game with a shared room and live leaderboard. Join by n
 | Hold | C / Shift |
 | Pause / Resume | P / Escape |
 
-Luna waits for each response with the board paused, then applies the verified move. Turning it off, hiding the page, opening a paused inspector, or disconnecting prevents late responses from moving pieces. Hidden pages make no new requests; returning to the page resumes an already-enabled session. Already-started requests can still be charged, including failed attempts. Reloading never silently restarts AI. Model choices and latency are not guaranteed.
+Touch controls are also available.
 
-### Move Selection
+### Luna Controls
 
-Luna is the sole strategy selector. The full 10-by-22 board is sent first, with hidden rows 0-1 and visible rows 2-21. Every request includes all 220 settled cells, including empty spaces and buried holes. With compression on, these same cells are encoded as 22 strings of exactly 10 characters; no rows are cropped or summarized. With compression off, every cell has an explicit row, column, and value.
+**Ask Luna** plays continuously, pausing the board while each paid request is pending and executing the validated move. All four options default off and are **disabled until Ask Luna is on**. Changes affect the next request; stopping Luna disables the controls without clearing preferences.
 
-Positions use `[column,row]` order. `active.cells` contains the four actual falling-cell positions, `active.hardDropCells` its ghost landing, and each candidate's `cells` its four final positions before line clearing. Origin and rotation remain available, but Luna no longer needs to infer occupied squares from them. The request also includes the next five pieces, held piece, Hold availability, pieces placed, cleared lines, score, and all generated legal placements. Hold-and-place choices are included whenever available. The browser executes the exact path for Luna's returned placement ID; there is no substitute move, pruning of current candidates, automatic rescue, or reset. Optional MCP lookahead provides simulated future evidence, but never selects or executes the current move for Luna.
+| Option | Effect |
+| --- | --- |
+| Reasoning | Low effort instead of `none`; reported reasoning tokens are already part of output usage. |
+| MCP | Real two-placement lookahead, including Hold; adds input tokens and latency. **Results** shows the tool call and forecasts. |
+| Compression | Losslessly packs the same board into fewer input tokens. **Inspect last prompt** compares both exact encodings. |
+| Cache | Reuses fixed instructions when the provider confirms a hit. Writes can cost extra; hits are not guaranteed. |
 
-With MCP off, the engine supplies only factual single-placement outcomes: cleared lines, holes, ten column heights, total/max height, bumpiness, and whether that placement would immediately end the game. It also supplies the current board profile so Luna can compare changes. With MCP on, the separate tool additionally searches two placements ahead. Invalid model choices are never applied; they retain their reported cost and use the same bounded retry policy.
+Hidden pages, disconnects, and the MCP, compression, sentence, and allowance dialogs suspend Luna and invalidate late moves without clearing its selection. Closing dialogs, returning to the page, or reconnecting to the same run can resume it. **Stop**, game over, new games, and page reloads leave Luna off. Already-started requests can still be charged.
 
-The full-board policy in [server/policy.md](server/policy.md) uses cache version 4. Its instructions emphasize reading the lowest occupied rows and accessible gaps, comparing exact candidate cells, taking safe row clears, and avoiding tall stacks beside unused columns. The response schema stays identical between requests so variable legal-ID lists do not unnecessarily alter the cached prefix. IDs are checked against the actual candidate list after the response. Both board encodings contain the same candidates and position data; verbose cell JSON is compactly serialized to keep the complete choice list within the existing request guard. Reasoning defaults to `none`; the opt-in switch sends `low` without changing the policy, candidates, or move validation.
+Temporary failures allow three retries with 2/4/8-second backoff or a longer server delay. Repeated failures and hard limits pause with **Retry Luna**; changing options or allowance can retry without bypassing limits. Busy/cooldown responses wait for admission without contacting the model.
 
-## MCP Lookahead
+**Cache activity** deliberately keeps Luna running and has its own Stop control. It retains the latest 20 received replies in the loaded page, with fixed older selections. Inspection is free; receipts clear on reload, but usage and cache totals persist. Provider counts do not identify individual cached words.
 
-[server/mcp-server.ts](server/mcp-server.ts) is a standalone MCP server built with the official `@modelcontextprotocol/sdk`. The game's toggle invokes `analyze_future_moves` over stdio. The application performs real MCP initialization, `tools/list` discovery, and `tools/call`; this is application-triggered, not a simulated or model-selected function call. The earlier `lookup_board_facts` tool remains available for existing MCP clients but is no longer used by the game toggle.
+## Costs And Limits
 
-The analysis accepts the exact 22 packed board rows, current piece pose, Hold state, and next five known pieces. It reuses the game's SRS, legal-placement enumeration, and actual input replay. For every original candidate, it applies that path to an isolated game and enumerates the following legal placements, including Hold. It reports the number of surviving replies and two achievable continuations: lowest holes, and a different best line-clearing path when available. Each tuple represents one real path; its metrics cannot be mixed with another path's metrics. The current candidate order and legal choices are unchanged. No future piece beyond the known preview is used.
+New players joining through the UI receive a **1,000,000-token allowance**, adjustable from **16,000 to 8,000,000** before joining or through **AI TOKENS LEFT**. This is cumulative across games, not replenished on restart. Older saved players retain their existing allowance.
 
-This is extra tactical information that the default prompt does not contain. A deterministic regression demonstrates the difference: two current choices both leave seven holes and a six-row stack, but lookahead exposes a next-piece line clear that reduces one branch to two holes; the immediate-only heuristic misses it. That establishes useful analysis, not a guarantee that Luna always follows it or survives indefinitely. The horizon is two placements and only engine-enumerated paths are considered.
+The counter shows the smaller personal/room balance after **reported input + output**, including cached input. **Available now** additionally subtracts pending reservations and conservative holds for missing usage, up to 16,000 tokens per unreported request. Holds are not reported spend. MCP input and reasoning output are counted once, not added again.
 
-The tool cannot modify gameplay, search the web, access the database, or receive names, private sentence text, session tokens, or Azure credentials. Unknown tools and extra arguments are rejected. No public HTTP MCP endpoint is required: both locally and in Azure, the Node application starts the same MCP child process inside its container.
-
-To connect another MCP client, launch the actual server with `node server/mcp-server.ts` from this workspace. The equivalent npm command is `npm run --silent mcp:server`; stdout is reserved for MCP JSON-RPC. The app starts a separate tool process for each enabled lookup and closes it afterward.
-
-The forecasts are added to both encodings of the same immutable snapshot, with a concise MCP-only policy addendum explaining how to use them. When the analysis is large, repeated continuation tuples are losslessly deduplicated into an indexed `replies` table; every current candidate and forecast remains present. The inspector retains the original tool result, while the prompt inspector shows the exact encoding sent to Luna. A 91-move regression covers the previously failing 2,309-token tool result. MCP off keeps the original prompt and policy unchanged. Luna still chooses the move using one model request, with reasoning independently selectable. The additional analysis and instructions consume billed input tokens; there is no artificial fee or padded context. The Results popup shows the added input-token estimate and its cost at the displayed full input rate, already included in the main ticker. Cache hits can lower that incremental cost, and total response costs can vary with output length. MCP uses a separate stable `lookahead-v2` cache suffix. The server reserves an additional 2,304 context tokens within the unchanged 16,000-token guard; large uncompressed requests may need Compression enabled.
-
-MCP initialization, discovery, and lookup share a 15-second deadline with bounded response size. The browser includes that same allowance in its request timeout. Four concurrent lookahead calls were tested at Azure's 0.5 CPU and 1 GiB allocation; the earlier five-second board-lookup deadline was insufficient for the deeper searches. A failed lookup stops the request before contacting Luna and does not count as missing model usage or paid spend. Errors distinguish connection, timeout, tool, invalid response, snapshot mismatch, and context-size failures; server logs contain only the tool, stage, reason, and duration, not player data. Temporary failures use bounded retries while Luna remains enabled. An analysis that still cannot fit the context allowance pauses without retrying or dropping forecasts. There is no silent fallback. Switching MCP off allows ordinary Luna requests again. Stop still prevents a late response from moving a piece, but an already-started request can finish and be charged. The last received lookup is available only in the current page's bounded request history; the app does not invent earlier traces after reload.
-
-## Cost And Savings
-
-### Remaining Tokens
-
-The personal allowance is a server-enforced cumulative limit for that player, not a fresh grant each game. The HUD shows the smaller of the personal and shared room balances after reported usage, excluding temporary holds. It stays unchanged while a request is pending and falls when reported usage arrives; explicitly raising the allowance can increase it. Both balances and the room's remaining request slots are listed in the room panel. **Available now** separately subtracts in-flight reservations and unconfirmed usage holds. The allowance dialog shows each amount and the separate 16,000-token per-request cap.
-
-Tokens used are provider-reported input plus output, including cached input. MCP analysis is already part of input and reasoning is already part of output; neither is subtracted twice. Cache reuse reduces the dollar price, not the number of provider tokens counted. A pending request temporarily reserves its full input/output estimate and headroom, so **Available now** can rise when unused reservation is released. These holds never change the main **AI TOKENS LEFT** counter or get labeled as spending. Only reported usage is labeled as spent, and all server-side reservation checks remain in force.
-
-Requests with missing provider usage retain a conservative hold of up to 16,000 tokens each. That hold is not claimed as actual usage or a charge. Saved players from earlier versions retain the 8,000,000-token allowance rather than acquiring a smaller default, and an additive database migration preserves their metrics and scores. Changing allowances, sentences, restarting, or reconnecting never clears recorded spend. Raising a personal allowance does not reserve tokens from other players or replenish the shared room.
-
-Limit messages distinguish insufficient personal allowance, a shared-room token or request limit, an oversized request, and a reply exhausting its completion cap. The last two can occur while many spending tokens remain: a larger personal allowance cannot change the per-request safety limits. Compression or disabling optional analysis can reduce request size. A truncated reply remains billable and is never applied as a move.
-
-### Pricing
-
-The server obtains actual usage from Azure and refreshes matching USD Global Standard short-context rates from the [Azure Retail Prices API](https://prices.azure.com/api/retail/prices) hourly. No fallback prices or cache hits are invented. The ticker labels stale rates and incomplete usage; it is a retail estimate, not an invoice.
+The ticker uses provider usage and matching USD Global Standard short-context rates from the [Azure Retail Prices API](https://prices.azure.com/api/retail/prices), refreshed hourly. Totals are valued at the displayed rates, **not historical invoices**; stale/missing prices and incomplete usage are labeled. Pricing currently recognizes the deployment name `gpt-5.6-luna` only.
 
 ```text
 ordinary input = input - cached reads - cache writes
@@ -80,103 +56,96 @@ cost = (ordinary input * input rate
       + output * output rate) / 1,000,000
 ```
 
-Compression losslessly packs the same board and legal moves into fewer tokens. Its savings use the actual prompt builder's local tokenizer estimates. Cache savings use provider-confirmed reads at the discounted rate, minus the premium for writes. A write alone can cost extra and is labeled accordingly. Enabling a switch is not itself a saving. Output, including reasoning, is new on every request and is billed once at the output rate. When reasoning is off, accepted moves still require a provider-confirmed zero reasoning count. With reasoning on, nonzero or unreported reasoning is allowed, but truncated replies and invalid moves are still rejected and their usage retained. Missing reasoning counts do not make otherwise reported output free.
+Compression savings are tokenizer estimates; cache adjustments use confirmed reads/writes. The before-optimizations estimate plus signed adjustments reconciles to reported-usage cost. Cache reduces price, not allowance tokens; enabling a switch alone saves nothing.
 
-Cache totals count completed cache-enabled requests: any confirmed reused input is a hit; no reused input is a miss, including cache writes. Cache-off requests and failures without usage are not misses. Counters survive reconnects, new games, and server restarts. Requests recorded before hit/miss tracking are labeled unclassified, without guessing their outcomes from aggregate token counts. The latest board summary and prompt snapshot describe the request actually sent, not whichever switches are selected afterward.
-
-The inline **Latest cache result** names the reusable content: **Fixed Tetris instructions**. It shows the last reply's hit, miss, write, or cache-off outcome, the actual input tokens reused/written, and its signed cache-cost adjustment. **Board + next move** is labeled as fresh work. The previous receipt stays labeled **Last reply** while another request is in flight; toggling Cache does not turn it into a hit.
-
-**Inspect cached instructions** opens **Cache activity**. Rows show each received reply's hit, miss/write, miss, or cache-off result, read/write token counts, and signed cost effect. Selecting a row shows its exact fixed instruction text and distinguishes that prefix from fresh board input and generated output. The provider reports token counts, not per-word offsets; the display does not invent word-level cache highlights or claim to enumerate the provider's cache storage.
-
-The running log remains available across new games and reconnects in the same loaded page, but is bounded to 20 replies and clears on page reload. Persistent cost and hit/miss totals do not clear. Replies absent from the current page are not reconstructed, and failed calls without provider usage are shown as unknown rather than cache misses. Opening Cache activity pauses manual play, but deliberately leaves an already-running Luna session running; the popup has its own Stop button. Closing it does not start or resume AI.
-
-The compression popup compares the exact verbose and packed strings that the gateway already computed for one board. Only the selected encoding was sent to the model, so returning the alternative as response metadata adds no inference request or input-token charge. Both contain the same 220 cells, active/ghost positions, and legal choices. On phones, the before/after panes stack and scroll within the popup rather than adding another game screen.
-
-**Safeguards:** one request per player at a time; four concurrent room requests; a one-second minimum between automatic requests; 90 requests and 400,000 reserved tokens per minute; 2,000 attempts and 8,000,000 provider tokens per persisted room. Requests reserve full cache-miss usage plus headroom and the selected completion cap: 128 tokens with reasoning off or 2,048 tokens including reasoning and the visible answer with reasoning on. The 16,000-token reservation limit remains unchanged. Reasoning requests have a 60-second provider timeout versus 20 seconds without reasoning; the browser waits five seconds longer. A completion that exhausts its cap can be billable without yielding a move. The provider SDK itself does not retry; an enabled Luna session can make up to three fresh attempts after temporary failures, each separately admitted and accounted for. Sentence and classic games use the same adjustable personal token allowance within the shared room limit, with no separate per-player request cutoff. Existing usage remains counted; changing sentences or restarting a game does not replenish the room budget. These are service/spending guards, not gameplay timers or Azure billing caps. Failed requests can be billable even when usage is missing.
+**Server safeguards:** one in-flight request per player, four concurrent per room, at least one second between automatic requests, 90 requests / 400,000 reserved tokens per minute, and 2,000 attempts / 8,000,000 tokens per persisted room. Each request reserves at most 16,000 tokens including headroom and completion allowance: 128 with reasoning off, 2,048 with it on. Provider timeouts are 20/60 seconds respectively; MCP adds a separate 15-second deadline. Raising a personal allowance does not raise these limits. Invalid/truncated replies are not played, but reported usage remains charged. These are application guards, not Azure billing caps.
 
 ## Run Locally
 
-Requires Node.js 24+, npm, and the existing Azure Luna deployment with Entra access. The checked-in native frontend build dependencies target Windows x64.
+Requires **Node.js 24+**, npm, Azure CLI, and Entra access to an existing Luna deployment (`Cognitive Services OpenAI User`). The checked-in native frontend packages target **Windows x64**; the production container runs Linux.
+
+Use the selected `azd` environment, or set these variables for your existing resource:
 
 ```powershell
+$env:AZURE_OPENAI_ENDPOINT = 'https://YOUR_RESOURCE.openai.azure.com'
+$env:AZURE_OPENAI_DEPLOYMENT = 'gpt-5.6-luna'
+$env:AZURE_TENANT_ID = 'YOUR_TENANT_ID'
+$env:AZURE_LOCATION = 'eastus2'
+az login --tenant $env:AZURE_TENANT_ID
 npm ci
 npm --prefix web ci
 npm run build
 npm start
 ```
 
-Open http://127.0.0.1:3100. The server reads the selected azd environment and uses the signed-in Azure CLI credential locally. No API keys are required. If that port is occupied, choose another port with `PORT`; use a separate `DATA_DIRECTORY` when running a second server.
+Use your resource's region for `AZURE_LOCATION`; pricing needs it. Open http://127.0.0.1:3100. Local inference uses Azure CLI credentials, not API keys; leave `AZURE_CLIENT_ID` unset locally because it selects managed identity. The health endpoint `/api/health` checks the server, not successful model access.
 
-After frontend edits, run `npm --prefix web run build`. Server edits need a restart, or `npm run dev` for server watching. Compression/cache preferences and session recovery are scoped to the same browser tab. New visitors see the join form and leaderboard without occupying a player seat until they join. Returning visitors reconnect to their saved player without clearing sentence blocks.
+Configuration precedence is selected `azd` environment, root dotenv file, then process variables. See [server/config.ts](server/config.ts). `npm run dev` watches the backend; rebuild frontend edits with `npm --prefix web run build`. A second server needs a different `PORT` and `DATA_DIRECTORY`. For deliberate network sharing, set `HOST=0.0.0.0` and an audience-reachable `PUBLIC_BASE_URL`.
+
+### Persistence
+
+SQLite stores the room code, hashed session credentials, sentences, best scores, allowances, and usage. Browser session credentials and options use per-tab session storage. Reload/reconnect can recover the board while its server-side game remains cached; boards are lost on process restart and can be evicted after 15 minutes disconnected. Durable scores and usage remain. Sentence text is not sent to Luna or public rankings.
+
+## How It Works
+
+React/Vite renders the game; Express and Socket.IO synchronize inputs against the same [game engine](shared/game.ts) on the server. Scores come from verified replay, not client-supplied totals.
+
+Luna alone selects a current move. [Prompt construction](server/tokens.ts) sends all **220 cells** (10 columns, 22 rows, including two hidden rows), exact active/ghost/candidate cells in `[column,row]` order, Hold, five next pieces, and every engine-generated legal placement with factual outcomes. Compression uses 22 ten-character rows; it never crops the board. The [policy](server/policy.md) and [gateway](server/model.ts) validate the returned placement ID; no substitute move or automatic rescue is used. Reasoning-off replies require a provider-confirmed zero reasoning count. Survival is not guaranteed.
+
+[MCP lookahead](server/mcp-server.ts) uses the official SDK over stdio: initialization, `tools/list`, then `analyze_future_moves`. It replays each current candidate and enumerates next placements, including Hold, using only the known preview. The app triggers it, not the model. Forecasts are losslessly deduplicated when needed, never pruned; the extra input shares the 16,000-token guard with a 2,304-token MCP allowance. A lookup failure stops before paid inference, with no silent fallback. Large requests may require Compression or disabling MCP. The tool receives game state, not names, sentence text, session tokens, or Azure credentials.
+
+The app starts and closes one MCP child process per lookup; no public MCP endpoint is needed. Other MCP clients can launch `npm run --silent mcp:server` from the repository. The older `lookup_board_facts` tool remains available for compatibility.
 
 ## Deploy
 
-The existing [azure.yaml](azure.yaml), [Dockerfile](Dockerfile), and [infra/hosting.bicep](infra/hosting.bicep) deploy the web service to Azure Container Apps. For an app-only update to an existing environment:
+The existing [azure.yaml](azure.yaml), [Dockerfile](Dockerfile), and [hosting template](infra/hosting.bicep) target Azure Container Apps. Packaging requires Docker, PowerShell 7, authenticated `azd`, and the Windows frontend toolchain. For an app-only update to the existing environment:
 
 ```powershell
 azd deploy web --environment tokenfall-dev --no-prompt
 ```
 
-Only provision when infrastructure changes are intended, and preview them first with `azd provision --preview`. Deploy between active games. Do not run `azd init` over the configured environment.
+Do not run `azd init` over the configured environment. Provision only for intentional infrastructure changes, after `azd provision --preview`. Packaging builds the frontend on the host; the image runs non-root Node 24 on port 3100 with managed identity for registry pull and inference. Local data and credentials are excluded.
 
-The image runs as non-root Node 24 and listens on port 3100. Managed identity provides registry pull and model inference access. Local databases, credentials, and environment files are excluded from the image. Hosting/storage charges are separate from the model-cost ticker.
+**Single writer only:** keep one replica, one active revision, and no traffic splitting. Deploy between games and verify the previous writer has stopped. Cloud SQLite uses `DELETE` journaling / full synchronization on Azure Files. The existing SMB mount requires `nobrl` and shared-key authentication; secure transfer stays enabled. Hosting/storage charges are separate from the model ticker.
 
-Cloud state uses SQLite with `DELETE` journaling and full synchronization on the existing Azure Files mount. Keep one replica, one active revision, and no traffic splitting: this is a single-writer service. The mount's `nobrl` option and shared-key authentication are required by the existing Container Apps SMB setup; secure transfer remains enabled. Active boards do not survive a process restart, but recorded usage, best scores, sentences, and player credentials do. The restored browser no longer forces sentence-based sessions into classic games.
+## Reset Room Data
 
-## Reset Leaderboard And History
-
-### Local Reset Panel (Authentication Pending)
-
-The in-app reset panel is available for local testing only. Enable it explicitly on a loopback development server:
-
-```powershell
-$env:LOCAL_ROOM_MAINTENANCE = 'true'
-$env:HOST = '127.0.0.1'
-$env:DATA_DIRECTORY = 'data/maintenance-preview'
-npm run build
-npm start
-```
-
-Open **Room maintenance** beside the room code. Opening stops Luna and pauses/syncs your game. Select **Leaderboard + history** or **Scores only**, review the counts, and enter the room code. Other games must be paused and pending AI requests must finish first. Refresh the preview after any new results or room changes. Cancelling leaves data unchanged and Luna off.
-
-Every reset verifies a recovery backup before writing. Full reset clears saved players, both leaderboards, browser receipts and old sessions; scores-only preserves identities and AI accounting and offers **Rejoin game**. The room code stays the same. Database and cached-game state reset together without restarting the server. Confirmations expire after two minutes and cannot be reused.
-
-There is **no authentication yet**. The feature is off by default, startup rejects enabling it with a public bind address, production mode or managed identity, and the endpoints reject forwarded and non-local/cross-origin requests. This is not a substitute for admin authentication. Do not expose the local test server through a tunnel; leave this flag unset on Azure until authentication is implemented.
+**Default `all` reset deletes saved players, both leaderboards, sentences, sessions, and in-app AI history. Everyone must rejoin.** It replenishes the application allowance, not Azure billing or provider caches. Room code/link, configuration, backups, and evaluation files remain. Every applied reset verifies a recovery backup before a transactional write; keep backups private.
 
 ### Maintenance Scripts
 
-The default `all` reset **deletes saved players**, both leaderboard lists, scores, sentences, sessions, and in-app AI usage/cost history. Everyone must join again. It replenishes the application's room allowance; it does **not** erase Azure billing or provider-side caches. The room code/link, deployment configuration, and recovery backups stay intact.
-
-Preview the deployed room without changing data:
-
-```powershell
-npm run reset:azure
-```
-
-Apply using the room code printed by the preview:
-
-```powershell
-npm run reset:azure -- -Apply -ConfirmRoom CBB8C7
-```
-
-The Azure wrapper uses the existing `tokenfall-dev` azd environment; select another with `-Environment`. It requires PowerShell 7, `az`, `azd`, and access to execute commands and restart the existing Container App. It refuses active players or pending AI requests, creates and verifies a SQLite backup, clears data transactionally, restarts the same revision to discard cached games, and verifies the public lists are empty. It does not provision or redeploy anything. The backup path is printed; keep it private because it contains the original player data.
-
-The wrapper sends the checksum-verified script over one authenticated exec connection; credentials are never printed. If Azure returns HTTP 429, respect its cooldown before rerunning. Reset writes are not automatically retried.
-
-For a **stopped local server**, use the database in its actual data directory:
+For a **stopped local server**, use its actual database path, preview first, then replace `YOUR01` with the displayed room code:
 
 ```powershell
 npm run reset -- --database data/tokenfall.sqlite
 npm run reset -- --database data/tokenfall.sqlite --apply --confirm-room YOUR01 --server-stopped
 ```
 
-Replace `YOUR01` with the preview's room code, then start the server again. Do not use `--server-stopped` while that database's server is running. `--mode scores` locally or `-Mode scores` on Azure only zeroes scores and retains player entries and usage; it does **not** empty the leaderboard. The reset does not delete local evaluation reports, screenshots, or previous backups.
+Restart afterward. Never pass `--server-stopped` against a running server.
 
-Focused tests:
+For Azure, preview first and use the returned room code:
 
 ```powershell
-node --test --test-name-pattern="room reset script" tests/server.test.ts
+npm run reset:azure
+npm run reset:azure -- -Apply -ConfirmRoom YOUR01
 ```
+
+The [Azure wrapper](scripts/reset-room.ps1) requires PowerShell 7, `az`, `azd`, and Container App exec/restart permissions. It defaults to `tokenfall-dev` (`-Environment` selects another), refuses connected players or pending AI, restarts the same revision, and verifies the result without deploying. Respect HTTP 429 cooldowns; writes are not automatically retried.
+
+Use `--mode scores` locally or `-Mode scores` on Azure to zero scores **without removing players or AI usage**; that mode does not empty the leaderboard. See [reset implementation](scripts/reset-room.ts).
+
+### Local Reset Panel
+
+**Authentication is not implemented.** The panel is off by default and must never be exposed through a tunnel or enabled on Azure. On a loopback development server only:
+
+```powershell
+$env:LOCAL_ROOM_MAINTENANCE = 'true'
+$env:HOST = '127.0.0.1'
+$env:DATA_DIRECTORY = 'data/maintenance-preview'
+npm start
+```
+
+After building/configuring as above, open **Room maintenance** beside the room code. Opening stops Luna and pauses/syncs your game. Pause all other games, wait for pending requests, choose **Leaderboard + history** or **Scores only**, review the preview, and type the room code. Confirmations expire after two minutes and cannot be reused; changed data requires a fresh preview. Reset clears cached games without a server restart. Cancel changes nothing and leaves Luna off. Startup rejects public binding, production mode, or managed identity; endpoints reject non-local, forwarded, and cross-origin requests.
 
 ## Verify
 
@@ -187,24 +156,12 @@ npm --prefix web run lint
 npm run test:ui
 ```
 
-The backend suite covers normal rules, exact replay, no absolute game-clock cutoff, continuous AI admission, usage pricing, lossless compression, private usage delivery, persistence, and 50 socket clients. It also retains legacy-data compatibility checks.
+Tests cover replay/rules, tokenization, pricing/allowances, genuine MCP calls with synthetic inference, persistence, resets, and 50 simultaneous sockets. Browser tests require installed **Microsoft Edge** via `playwright-core`; they cover full games, Luna option gating/recovery, inspectors, QR joins, and responsive light/dark layouts. Fixtures use isolated databases and incur **no Azure inference charges**. Screenshots go to ignored `data/tetris-qa`.
 
-Browser tests use `playwright-core` with installed Microsoft Edge and isolated rooms with explicitly synthetic model responses. They cover named joins, real sentence tokenization and labels, preview failures and retry, independent two-browser joins, live score/presence updates, ranking order and pagination, full-room and expired-session recovery, sentence privacy, and configuration errors. Existing checks cover a whole AI-controlled game, instant toggle feedback without phantom savings, signed cost reconciliation, write/read/miss counters, absent rates, exact before/after prompt equality, live cache-history updates and older selections, bounded history across new games, late-response cancellation, sessions/restarts, and more than 30 seconds of uninterrupted manual play. Responsive checks span 305-1920px usable widths, both themes, keyboard focus, canvas pixels, and the sentence editor. Nonzero-cost feedback and both inspection popups are also checked at 320px and 390px. Screenshots are stored in ignored `data/tetris-qa`. These tests incur no Azure inference charges. The optional [scripts/smoke-model.ps1](scripts/smoke-model.ps1) performs bounded **paid** provider checks.
-
-For an opt-in **paid** sustained-play evaluation through the production gateway and verified input replay:
+Optional **paid** evaluation through the real gateway:
 
 ```powershell
 node scripts/evaluate-luna.ts --live --moves 100 --min-lines 20 --max-usd 0.20 --seed pure-luna-survival-20260914
 ```
 
-[scripts/evaluate-luna.ts](scripts/evaluate-luna.ts) saves exact prompts, model replies, executed choices, usage, and the final board under ignored `data/luna-evaluations`. It stops on a real loss, invalid response, eight-minute deadline, or estimated spending cap. It never rescues the board or starts a second game. The `--live` flag is required to authorize paid requests; normal tests do not invoke it.
-
-Use `--no-compression` to evaluate the explicit 220-cell JSON form. The evaluator checks each selected placement's predicted holes, column heights, terminal state, and board metrics against actual execution, and checks the server/client states match. It records peak stack height as well as survival. A passing finite run is not proof of indefinite survival.
-
-Version-4 validation on 2026-09-14 used three predetermined fresh seeds. `full-board-20260914-a` reached 90 pieces and 32 lines before Azure returned HTTP 500; it is recorded as interrupted, with one request missing usage, not as a pass. `full-board-20260914-b` used uncompressed cell JSON and completed 100 pieces with 38 lines, zero final holes, and a peak height of seven. `full-board-20260914-c` used lossless compression and completed 100 pieces with 33 lines, nine final holes, and a peak height of eleven. All 290 executed placements matched their predicted outcomes and verified server replay. No resets or substitute selections were used. The last run still accumulated holes: these results validate the complete prompt and execution, not an unbeatable player.
-
-The full-position update passed all 63 backend tests, build/typecheck, three focused browser regressions, and the non-root Linux image check. After deployment, a single capped live request in Playwright MCP confirmed all 220 unique cell positions and four-cell coordinates for the active piece, ghost, and every candidate. The inspector's text exactly matched the sent JSON. Existing recorded usage was preserved; the smoke request cost $0.0021012 at the displayed retail rates.
-
-Earlier verification on 2026-09-14 with the version-3 policy: pure Luna placed 100 pieces, cleared 39 lines, scored 15,784 points, and selected Hold 42 times without losing. The final board had zero holes and a maximum height of two cells. All 100 requests reported zero reasoning, with 96 cache hits and $0.0847088 estimated retail cost. There were no solver-selected moves or automatic resets. This was one seed, not adequate evidence of general reliability; a later user game still accumulated a dangerous stack.
-
-The update passed 62 backend tests, 14 browser checks, build, lint, and a non-root Linux image smoke test. After deployment, a five-request Playwright MCP run verified the real browser executed Luna's selected placements exactly, including a Hold that cleared a row. It reached 290 points with zero reasoning, two cache hits, and $0.0056416 estimated spend. Board state and usage survived reload, and AI remained off. The deployed application retained its existing scores and usage.
+The [evaluator](scripts/evaluate-luna.ts) requires `--live`, keeps cache on and reasoning/MCP off, and supports `--no-compression`. It verifies exact replay and stops at its target, loss, invalid response, eight-minute deadline, or estimated spending cap. Prompts, replies, usage, and results are saved under ignored `data/luna-evaluations`; no rescue or reset occurs. [Provider smoke checks](scripts/smoke-model.ps1) also make paid requests and are not part of normal tests. Finite passing runs do not establish indefinite survival.
