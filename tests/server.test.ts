@@ -393,13 +393,49 @@ test('Luna receives actual MCP lookahead with reasoning enabled in one metered r
   } finally { rmSync(setup.dataDirectory, { recursive: true, force: true }); }
 });
 
+test('MCP lookahead compacts crowded forecasts losslessly within the existing request budget', async context => {
+  const setup = fixture();
+  const gateway = new LunaGateway(setup.config);
+  const game = new Game('mcp-irregular-0');
+  for (let turn = 0; turn < 8; turn += 1) {
+    const legal = placementsFor(game).filter(move => !move.gameOver);
+    for (const action of legal[turn * 23 % legal.length].path) game.act(action);
+  }
+  const original = game.view();
+  const mock = context.mock.method(gateway['client'].chat.completions, 'create', async (request: unknown) => {
+    const payload = JSON.parse(JSON.stringify(request));
+    const prompt = JSON.parse(payload.messages[1].content);
+    const input = countTokens(payload.messages[0].content[0].text) + countTokens(payload.messages[1].content);
+    return { choices: [{ finish_reason: 'stop', message: { content: JSON.stringify({ placementId: prompt.placements[0].id, tip: 'Use the compact forecasts.' }) } }], usage: { prompt_tokens: input, completion_tokens: 20, total_tokens: input + 20, prompt_tokens_details: { cached_tokens: 0, cache_write_tokens: 0 }, completion_tokens_details: { reasoning_tokens: 0 } } };
+  });
+  try {
+    const result = await gateway.complete(game, { compression: true, cache: false, mcp: true }, 'test');
+    assert.equal(result.status, 'ready');
+    const lookup = result.mcpLookup!;
+    const analysis = lookaheadOutputSchema.parse(JSON.parse(lookup.result));
+    assert.equal(analysis.candidatesEvaluated, 91);
+    assert.ok(lookup.resultTokens > MAX_MCP_CONTEXT_TOKENS);
+    const { replies, ...packed } = JSON.parse(result.prompt).mcpLookup.analysis;
+    assert.ok(replies.length < analysis.moves.length);
+    const expanded = { ...packed, moves: packed.moves.map(([id, legal, surviving, holes, clears]: [string, number, number, number | null, number | null]) => [id, legal, surviving, holes === null ? null : replies[holes], clears === null ? null : replies[clears]]) };
+    assert.deepEqual(expanded, analysis);
+    assert.deepEqual(JSON.parse(result.promptComparison!.verbose).mcpLookup, JSON.parse(result.promptComparison!.packed).mcpLookup);
+    assert.ok(lookup.addedInputTokens! <= MAX_MCP_CONTEXT_TOKENS);
+    assert.ok(countTokens(result.systemPrompt!) - PREFIX_TOKENS <= 256);
+    assert.ok(PREFIX_TOKENS + buildPrompts(game, placementsFor(game)).packedTokens + MAX_OUTPUT_TOKENS + 1024 + MAX_MCP_CONTEXT_TOKENS <= 16000);
+    assert.equal(mock.mock.callCount(), 1);
+    assert.deepEqual(game.view(), original);
+  } finally { rmSync(setup.dataDirectory, { recursive: true, force: true }); }
+});
+
 test('MCP admission reserves tool context and a failed pre-inference lookup is not billed', async () => {
   const setup = fixture();
+  let oversized = false;
   const room: Room = new Room(setup.config, { complete: async (game, options) => {
     assert.equal(options.mcp, true);
     const prompts = buildPrompts(game, placementsFor(game));
     assert.equal(room.gate.reserved, PREFIX_TOKENS + prompts.packedTokens + MAX_OUTPUT_TOKENS + 1024 + MAX_MCP_CONTEXT_TOKENS);
-    throw new McpLookupError();
+    throw new McpLookupError(oversized ? 'context' : 'tool');
   } });
   try {
     room.join('MCP Player', room.code, undefined, 'mcp');
@@ -409,6 +445,13 @@ test('MCP admission reserves tool context and a failed pre-inference lookup is n
     assert.equal(player.metrics.requests, 0);
     assert.equal(room.usage(player).unmeteredRequests, 0);
     assert.equal(room.gate.inFlight, 0);
+    assert.equal(room.gate.reserved, 0);
+    oversized = true;
+    room.join('MCP Context', room.code, undefined, 'mcp-context');
+    const contextPlayer = room.playerFor('mcp-context');
+    await assert.rejects(room.assist(contextPlayer, { compression: true, cache: false, mcp: true }), { code: 'mcp-context', message: /cannot fit/ });
+    assert.equal(contextPlayer.record.attempts, 0);
+    assert.equal(room.usage(contextPlayer).unmeteredRequests, 0);
     assert.equal(room.gate.reserved, 0);
   } finally { room.close(); rmSync(setup.dataDirectory, { recursive: true, force: true }); }
 });

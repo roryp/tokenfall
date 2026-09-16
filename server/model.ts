@@ -9,11 +9,11 @@ import { MAX_REQUEST_TOKENS, MAX_TOKEN_ALLOWANCE } from '../shared/protocol.ts';
 import type { AiOptions, Insight } from '../shared/protocol.ts';
 import type { AppConfig } from './config.ts';
 import { buildPrompts, countTokens, normalizeUsage, tokenChips } from './tokens.ts';
-import { lookaheadSnapshot, lookupFutureMoves, MAX_MCP_CONTEXT_TOKENS, McpLookupError } from './mcp.ts';
+import { lookaheadSnapshot, lookupFutureMoves, MAX_MCP_CONTEXT_TOKENS, McpLookupError, mcpPromptContext } from './mcp.ts';
 
 export const POLICY = readFileSync(new URL('./policy.md', import.meta.url), 'utf8');
 export const PREFIX_TOKENS = countTokens(POLICY);
-export const MCP_GUIDANCE = '\n\nMCP LOOKAHEAD\nWith MCP enabled, the optional tool supplements the immediate engine facts with two-placement simulations. Read mcpLookup.analysis before selecting your current placementId. Every original current move is included, in original order. Use survivingReplies to detect next-turn traps. lowestHolesReply and mostClearsAlternative each describe ONE achievable future path, not independent minima to combine. A zero survivingReplies means no enumerated next placement avoids game over. Prefer a current move with safe continuations; compare achievable future holes, clears and height against its immediate outcome. nextMoveId belongs to a hypothetical next board and MUST NOT be returned as the current placementId. This is only two-placement lookahead, not a guarantee of survival. You still select and return one current move.';
+export const MCP_GUIDANCE = '\n\nMCP LOOKAHEAD\nWith MCP enabled, the optional tool supplements the immediate engine facts with two-placement simulations. Read mcpLookup.analysis before selecting your current placementId. Every original current move is included, in original order. Use survivingReplies to detect next-turn traps. lowestHolesReply and mostClearsAlternative each describe ONE achievable future path, not independent minima to combine. When analysis.replies is present, non-null forecast entries in moves are zero-based indexes into that replies table; resolve them to the same replyColumns tuples. A zero survivingReplies means no enumerated next placement avoids game over. Prefer a current move with safe continuations; compare achievable future holes, clears and height against its immediate outcome. nextMoveId belongs to a hypothetical next board and MUST NOT be returned as the current placementId. This is only two-placement lookahead, not a guarantee of survival. You still select and return one current move.';
 export const MAX_OUTPUT_TOKENS = 128;
 export const MAX_REASONING_COMPLETION_TOKENS = 2048;
 export const maxCompletionTokens = (options: AiOptions) => options.reasoning ? MAX_REASONING_COMPLETION_TOKENS : MAX_OUTPUT_TOKENS;
@@ -100,7 +100,7 @@ export class LunaGateway implements ModelGateway {
     const mcpLookup = options.mcp ? await lookupFutureMoves(lookaheadSnapshot(game)) : undefined;
     const originalTokens = options.compression ? prompts.packedTokens : prompts.rawTokens;
     if (mcpLookup) {
-      const context = { server: mcpLookup.server, tool: mcpLookup.tool, analysis: JSON.parse(mcpLookup.result) };
+      const context = mcpPromptContext(mcpLookup);
       const verbose = JSON.stringify({ ...JSON.parse(prompts.verbose), mcpLookup: context });
       const packed = JSON.stringify({ ...JSON.parse(prompts.packed), mcpLookup: context });
       prompts = { verbose, packed, rawTokens: countTokens(verbose), packedTokens: countTokens(packed) };
@@ -109,7 +109,7 @@ export class LunaGateway implements ModelGateway {
     const systemPrompt = POLICY + (mcpLookup ? MCP_GUIDANCE : '');
     if (mcpLookup) {
       mcpLookup.addedInputTokens = countTokens(prompt) - originalTokens + countTokens(systemPrompt) - PREFIX_TOKENS;
-      if (mcpLookup.addedInputTokens > MAX_MCP_CONTEXT_TOKENS) throw new McpLookupError();
+      if (mcpLookup.addedInputTokens > MAX_MCP_CONTEXT_TOKENS) throw new McpLookupError('context');
     }
     const content = {
       type: 'text' as const,
@@ -121,7 +121,7 @@ export class LunaGateway implements ModelGateway {
       reasoning_effort: options.reasoning ? 'low' : 'none',
       max_completion_tokens: maxCompletionTokens(options),
       store: false,
-      prompt_cache_key: `tokenfall-policy-v4:${cacheBucket}${mcpLookup ? ':lookahead-v1' : ''}`,
+      prompt_cache_key: `tokenfall-policy-v4:${cacheBucket}${mcpLookup ? ':lookahead-v2' : ''}`,
       prompt_cache_options: { mode: 'explicit', ttl: '30m' },
       messages: [
         { role: 'system' as const, content: [content] },

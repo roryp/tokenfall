@@ -1,4 +1,5 @@
 import { startTransition, useEffect, useEffectEvent, useRef, useState } from 'react';
+import type { SetStateAction } from 'react';
 import { io } from 'socket.io-client';
 import type { Socket } from 'socket.io-client';
 import { Game, FPS, refreshPlacement } from '../../shared/game.ts';
@@ -41,8 +42,10 @@ export function useGame() {
   const historyPlayer = useRef('');
   const [busy, setBusy] = useState(false);
   const [notice, setNotice] = useState('');
-  const [options, setOptions] = useState<AiOptions>(savedOptions);
+  const [options, updateOptions] = useState<AiOptions>(savedOptions);
   const [autopilot, setAutopilot] = useState(false);
+  const [autopilotStatus, setAutopilotStatus] = useState<'retrying' | 'blocked' | null>(null);
+  const [inspectionPaused, setInspectionPaused] = useState(false);
   const [requestOptions, setRequestOptions] = useState<AiOptions | null>(null);
   const socket = useRef<GameSocket | null>(null);
   const game = useRef<Game | null>(null);
@@ -62,6 +65,9 @@ export function useGame() {
   const requestPending = useRef(false);
   const requestSerial = useRef(0);
   const nextRequestAt = useRef(0);
+  const retryCount = useRef(0);
+  const pilotBlocked = useRef(false);
+  const inspection = useRef(false);
 
   useEffect(() => {
     try { sessionStorage.setItem('tetris-luna-options', JSON.stringify(options)); } catch { return; }
@@ -69,19 +75,68 @@ export function useGame() {
 
   function refresh() { if (game.current) setView(game.current.view()); }
 
+  function clearRetry() {
+    retryCount.current = 0;
+    pilotBlocked.current = false;
+    setAutopilotStatus(null);
+  }
+
   function stopAutopilot() {
     pilotActive.current = false;
     pilotEpoch.current += 1;
     setAutopilot(false);
+    clearRetry();
+  }
+
+  function retryAutopilot() {
+    if (!pilotActive.current) return;
+    clearRetry();
+    nextRequestAt.current = 0;
+    setNotice('');
+  }
+
+  function setOptions(next: SetStateAction<AiOptions>) {
+    updateOptions(next);
+    retryAutopilot();
+  }
+
+  function pauseForInspection() {
+    inspection.current = true;
+    setInspectionPaused(true);
+    pilotEpoch.current += 1;
+    if (game.current?.status === 'playing') { game.current.act('pause'); refresh(); void flush(); }
+  }
+
+  function resumeAfterInspection() {
+    inspection.current = false;
+    setInspectionPaused(false);
+  }
+
+  function deferAutopilot(message: string, retryable = true, retryAfterMs = 0) {
+    if (!pilotActive.current) return;
+    retryCount.current += 1;
+    if (!retryable || retryCount.current > 3) {
+      pilotBlocked.current = true;
+      setAutopilotStatus('blocked');
+      setNotice(`${message} Luna is paused${retryable ? ' after repeated errors' : ''}.`);
+      return;
+    }
+    const delay = Math.max(retryAfterMs, 2000 * 2 ** (retryCount.current - 1));
+    nextRequestAt.current = Date.now() + delay;
+    setAutopilotStatus('retrying');
+    setNotice(`${message} Retrying in ${Math.ceil(delay / 1000)}s.`);
   }
 
   function installSession(data: JoinResult) {
-    stopAutopilot();
+    if (historyPlayer.current !== data.playerId || runId.current !== data.runId) stopAutopilot();
+    else pilotEpoch.current += 1;
     requestSerial.current += 1;
     requestPending.current = false;
     setBusy(false);
     setRequestOptions(null);
     game.current = Game.restore(data.replay);
+    if (game.current.status === 'over') stopAutopilot();
+    else if (pilotActive.current && game.current.status === 'playing') game.current.act('pause');
     runId.current = data.runId;
     sequence.current = data.sequence;
     sentEvents.current = data.replay.events.length;
@@ -119,6 +174,7 @@ export function useGame() {
         joinFailed.current = true;
         setNotice(!error && !reply.ok ? reply.error : 'Could not connect. Join again to retry.');
         if (!error && !reply.ok && reply.code === 'session') {
+          stopAutopilot();
           session.current = null;
           setSessionName(undefined);
           joinFailed.current = false;
@@ -134,7 +190,7 @@ export function useGame() {
 
   function resync(message: string) {
     if (!active.current) return;
-    stopAutopilot();
+    pilotEpoch.current += 1;
     active.current = false;
     setNotice(message);
     socket.current?.disconnect().connect();
@@ -194,6 +250,7 @@ export function useGame() {
     if (!active.current || !socket.current?.connected || !game.current || game.current.status === 'over') return;
     pilotEpoch.current += 1;
     pilotActive.current = true;
+    clearRetry();
     setAutopilot(true);
     setNotice('');
     if (game.current.status === 'playing') game.current.act('pause');
@@ -215,7 +272,7 @@ export function useGame() {
   }
 
   async function requestMove() {
-    if (requestPending.current || Date.now() < nextRequestAt.current || !pilotActive.current || document.hidden || !game.current || !active.current || !socket.current?.connected) return;
+    if (requestPending.current || pilotBlocked.current || inspection.current || Date.now() < nextRequestAt.current || !pilotActive.current || document.hidden || !game.current || !active.current || !socket.current?.connected) return;
     if (game.current.status === 'over') { stopAutopilot(); return; }
     requestPending.current = true;
     const serial = ++requestSerial.current;
@@ -224,7 +281,7 @@ export function useGame() {
     const selected = { cache: options.cache, compression: options.compression, reasoning: Boolean(options.reasoning), mcp: Boolean(options.mcp), autopilot: true };
     setRequestOptions(selected);
     setBusy(true);
-    if (!await flushAll() || serial !== requestSerial.current || originalRun !== runId.current || !pilotActive.current || epoch !== pilotEpoch.current) {
+    if (!await flushAll() || serial !== requestSerial.current || originalRun !== runId.current || !pilotActive.current || epoch !== pilotEpoch.current || document.hidden || inspection.current) {
       if (serial === requestSerial.current) { requestPending.current = false; setBusy(false); setRequestOptions(null); }
       return;
     }
@@ -234,10 +291,14 @@ export function useGame() {
       requestPending.current = false;
       setRequestOptions(null);
       setBusy(false);
-      if (error) { stopAutopilot(); setNotice('Luna timed out. Any provider charges will still be recorded.'); return; }
+      const currentPilot = pilotActive.current && epoch === pilotEpoch.current && originalRun === runId.current;
+      if (error) { if (currentPilot) deferAutopilot('Luna timed out. Any provider charges will still be recorded.'); return; }
       if (!reply.ok) {
-        if (reply.retryAfterMs) nextRequestAt.current = Date.now() + reply.retryAfterMs;
-        if (reply.code !== 'busy' && reply.code !== 'cooldown') { stopAutopilot(); setNotice(reply.error); }
+        if (!currentPilot) return;
+        if (reply.code === 'busy' || reply.code === 'cooldown') {
+          nextRequestAt.current = Date.now() + Math.max(1000, reply.retryAfterMs ?? 0);
+          setAutopilotStatus('retrying');
+        } else deferAutopilot(reply.error, ['mcp', 'unavailable', 'rate'].includes(reply.code ?? ''), reply.retryAfterMs);
         return;
       }
       setMetrics(reply.data.metrics);
@@ -248,8 +309,10 @@ export function useGame() {
       setRequestHistory(history => [record, ...history.filter(entry => entry.insight.id !== result.id)].slice(0, 20));
       const current = originalRun === runId.current && result.pieceId === game.current?.pieceId;
       setInsight(current ? result : { ...result, status: 'stale' });
-      if (pilotActive.current && epoch === pilotEpoch.current && !document.hidden) {
-        if (!current || !applyMove(result)) { stopAutopilot(); setNotice(result.status === 'invalid' ? result.tip : 'Luna returned an unusable move. Manual play is still available.'); return; }
+      if (currentPilot && !document.hidden && !inspection.current) {
+        if (!current || !applyMove(result)) { deferAutopilot(result.status === 'invalid' ? result.tip : 'Luna returned an unusable move. Manual play is still available.'); return; }
+        clearRetry();
+        setNotice('');
         if (game.current?.status === 'over') stopAutopilot();
       }
     });
@@ -277,7 +340,7 @@ export function useGame() {
 
   async function adjustAllowance(tokenLimit: number): Promise<boolean> {
     if (!socket.current?.connected || !active.current || joiningRef.current) return false;
-    act('pause');
+    pauseForInspection();
     joiningRef.current = true;
     setJoining(true);
     return new Promise(resolve => {
@@ -288,6 +351,7 @@ export function useGame() {
         setAllowance(reply.data.allowance);
         setMetrics(reply.data.metrics);
         setUnmeteredRequests(reply.data.unmeteredRequests);
+        retryAutopilot();
         setNotice('');
         resolve(true);
       });
@@ -296,8 +360,6 @@ export function useGame() {
 
   const onJoin = useEffectEvent(join);
   const onFlush = useEffectEvent(flush);
-  const onAct = useEffectEvent(act);
-  const onStop = useEffectEvent(stopAutopilot);
   const onPilotStep = useEffectEvent(requestMove);
 
   useEffect(() => {
@@ -311,7 +373,7 @@ export function useGame() {
     connection.on('connect', () => { setConnected(true); joiningRef.current = false; joinFailed.current = false; });
     connection.on('connect_error', () => setConnected(false));
     connection.on('disconnect', () => {
-      onStop();
+      pilotEpoch.current += 1;
       requestSerial.current += 1;
       requestPending.current = false;
       joiningRef.current = false;
@@ -359,7 +421,10 @@ export function useGame() {
     const visibility = () => {
       previous = performance.now();
       accumulator = 0;
-      if (document.hidden) { onStop(); if (game.current?.status === 'playing') onAct('pause'); }
+      if (document.hidden) {
+        pilotEpoch.current += 1;
+        if (game.current?.status === 'playing') { game.current.act('pause'); refresh(); void onFlush(); }
+      }
     };
     document.addEventListener('visibilitychange', visibility);
     return () => { cancelAnimationFrame(request); document.removeEventListener('visibilitychange', visibility); };
@@ -367,5 +432,5 @@ export function useGame() {
 
   const rates = room?.pricing.snapshot?.usdPerMillion;
   const cost = rates ? costForUsage(metrics, rates) : null;
-  return { room, connected, joined, joining, player, sessionName, view, metrics, allowance, adjustAllowance, insight, requestHistory, cost, busy, notice, setNotice, options, setOptions, autopilot, toggleAutopilot, requestOptions, unmeteredRequests, join, act, restart };
+  return { room, connected, joined, joining, player, sessionName, view, metrics, allowance, adjustAllowance, insight, requestHistory, cost, busy, notice, setNotice, options, setOptions, autopilot, autopilotStatus, inspectionPaused, pauseForInspection, resumeAfterInspection, retryAutopilot, toggleAutopilot, requestOptions, unmeteredRequests, join, act, restart };
 }

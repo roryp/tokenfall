@@ -276,7 +276,16 @@ body {
 .leaderboard footer > div { gap: 0; }
 .own-rank { border-top: 1px solid var(--cp-border); font-size: 12px; }
 .own-rank b { margin-left: 6px; color: var(--cp-accent); }
+.room-share { min-width: 0; margin-bottom: 16px; border-bottom: 1px solid var(--cp-border); padding-bottom: 16px; }
+.join-qr { width: min(100%, 280px); margin: 0 auto 12px; }
+.join-qr header { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-bottom: 8px; }
+.join-qr h2 { font-size: 15px; }
+.join-qr canvas { display: block; width: min(100%, 256px) !important; height: auto !important; aspect-ratio: 1; margin: 0 auto; }
+.join-qr-dialog { width: min(600px, calc(100% - 32px)); text-align: center; }
+.join-qr-dialog canvas { display: block; width: min(100%, 480px, max(140px, calc(100svh - 240px))) !important; height: auto !important; aspect-ratio: 1; margin: 16px auto; }
+.qr-join-link { display: block; overflow-wrap: anywhere; color: var(--cp-link); font: 12px/1.5 var(--cp-mono); margin: 12px 0; }
 .invite-link { display: flex; gap: 4px; margin: 0 0 16px; min-width: 0; }
+.room-share .invite-link { margin-bottom: 0; }
 .invite-link input { font: 11px var(--cp-mono); }
 .player-summary { margin-bottom: 18px; }
 .player-summary > div { min-width: 0; }
@@ -292,7 +301,7 @@ body {
 @media (min-width: 900px) {
   .room-panel { width: min(100%, 860px); }
   .room-layout[data-playing="false"] .room-panel { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); column-gap: 40px; align-items: start; }
-  .room-layout[data-playing="false"] .room-heading, .room-layout[data-playing="false"] .invite-link { grid-column: 1 / -1; }
+  .room-layout[data-playing="false"] .room-heading, .room-layout[data-playing="false"] .room-share { grid-column: 1 / -1; }
 }
 @media (min-width: 1200px) {
   .room-layout[data-playing="true"] { display: grid; grid-template-columns: minmax(0, 860px) minmax(0, 340px); }
@@ -362,13 +371,14 @@ body {
   .cache-receipt footer { margin-top: 2px; }
   .cache-receipt footer > span, .cache-receipt footer small { font-size: 8px; }
   .cache-receipt footer > b { font-size: 10px; }
-  .luna-controls { gap: 10px; }
-  .luna-reasoning { column-gap: 10px; }
-  .reasoning-usage dt { font-size: 8px; }
+  .luna-controls { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 4px 12px; }
+  .luna-mcp { grid-column: 2; grid-row: 1; border-top: 0; }
+  .luna-reasoning { grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); column-gap: 12px; }
+  .reasoning-usage dt { font-size: 10px; }
   .reasoning-usage dd { font-size: 11px; }
   .reasoning-label-detail { display: none; }
-  .game-switch { gap: 5px; font-size: 11px; }
-  .game-switch small { font-size: 8px; }
+  .game-switch { gap: 5px; font-size: 12px; }
+  .game-switch small { font-size: 10px; }
   .game-switch > svg { display: none; }
   .game-status { font-size: 9px; min-height: 44px; padding-right: 120px; position: relative; align-content: center; gap: 3px 8px; }
   .prompt-summary { position: absolute; right: 0; top: 0; width: 120px; min-height: 44px; border: 0; gap: 0; }
@@ -385,12 +395,15 @@ body {
   .piece-token { width: 36px; font-size: 9px; }
   .hold-slot:has(.piece-token) { min-height: 65px; }
   .next-piece:has(.piece-token) { height: 59px; }
-  .gameover-overlay h2 { font-size: 17px; }
+  .gameover-overlay { gap: 6px; padding: 4px; }
+  .gameover-overlay > h2 { font-size: 14px; line-height: 1.2; }
+  .gameover-overlay > strong { font-size: 18px; line-height: 1.2; }
+  .gameover-overlay .primary-button { width: 100%; min-width: 44px; flex-shrink: 0; gap: 4px; padding: 4px; }
   .primary-button { font-size: 11px; padding: 10px; }
 }
 @media (max-width: 350px) {
-  .luna-controls { gap: 7px; }
-  .game-switch { font-size: 10px; gap: 4px; }
+  .luna-controls { column-gap: 10px; }
+  .game-switch { gap: 4px; }
   .game-switch > i { width: 28px; }
   .game-switch.is-on > i::after { transform: translateX(8px); }
   .cost-ticker strong { font-size: 13px; }
@@ -412,6 +425,7 @@ body {
   .cost-adjustments { padding-top: 3px; }
   .cache-receipt { padding-top: 0; }
   .cache-receipt header { min-height: 14px; margin-bottom: 1px; }
+  .cache-receipt footer { display: none; }
   .cache-parts { gap: 0; }
   .luna-controls { row-gap: 4px; }
   .game-stage { grid-template-rows: 43px minmax(0, 1fr); }

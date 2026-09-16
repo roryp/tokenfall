@@ -1,5 +1,6 @@
-import { useEffect, useId, useState } from 'react';
-import { ArrowUp, Check, ChevronLeft, ChevronRight, Copy, Link2, LocateFixed, Play, Quote, RotateCcw, Trophy, Users } from 'lucide-react';
+import { useEffect, useId, useRef, useState } from 'react';
+import { ArrowUp, Check, ChevronLeft, ChevronRight, Copy, LocateFixed, Maximize2, Play, QrCode, Quote, RotateCcw, Trophy, Users, X } from 'lucide-react';
+import { QRCodeCanvas } from 'qrcode.react';
 import { DEFAULT_TOKEN_TEXT, tokenLabel, tokenShape } from '../../shared/game.ts';
 import { DEFAULT_TOKEN_ALLOWANCE, MAX_REQUEST_TOKENS, MAX_TOKEN_ALLOWANCE, reportedTokenBalance } from '../../shared/protocol.ts';
 import type { RoomView, TokenAllowance, TokenChip } from '../../shared/protocol.ts';
@@ -77,26 +78,42 @@ export function RoomPanel({ game, onEdit, onReturn }: { game: ReturnType<typeof 
   const [ranking, setRanking] = useState('points');
   const [page, setPage] = useState(0);
   const [sharing, setSharing] = useState(false);
+  const qrDialog = useRef<HTMLDialogElement | null>(null);
   const room = game.room;
   const entries = (ranking === 'points' ? room?.pointsLeaderboard : room?.leaderboard?.filter(entry => entry.challengeScore !== null)) ?? [];
   const pageCount = Math.max(1, Math.ceil(entries.length / 10));
   const currentPage = Math.min(page, pageCount - 1);
   const ownIndex = entries.findIndex(entry => entry.id === game.player?.id);
   const invite = new URL(room?.joinUrl ?? window.location.origin);
+  invite.username = '';
+  invite.password = '';
+  invite.pathname = '/';
+  invite.search = '';
+  invite.hash = '';
   if (room) invite.searchParams.set('room', room.code);
+  const audienceLink = Boolean(room) && !['localhost', '[::1]', '0.0.0.0'].includes(invite.hostname) && !invite.hostname.endsWith('.localhost') && !/^127\./.test(invite.hostname);
   async function copyInvite() {
     try { await navigator.clipboard.writeText(invite.href); game.setNotice('Game link copied.'); }
     catch { game.setNotice('Select the game link to copy it.'); }
   }
   return <aside className="room-panel" aria-label="Game room">
-    <header className="room-heading"><div><span>ROOM <b data-testid="room-code">{room?.code ?? '------'}</b></span><small><Users size={14} />{game.connected ? `${room?.online ?? 0}/${room?.capacity ?? 50} online` : 'Reconnecting'}</small></div><div className="room-actions"><button className="icon-button" aria-label="Share game" title="Share game" aria-expanded={sharing} disabled={!room} onClick={() => setSharing(value => !value)}><Link2 size={19} /></button>{game.joined && <button className="icon-button" aria-label="Back to game" title="Back to game" onClick={onReturn}><ArrowUp size={19} /></button>}</div></header>
+    <header className="room-heading"><div><span>ROOM <b data-testid="room-code">{room?.code ?? '------'}</b></span><small><Users size={14} />{game.connected ? `${room?.online ?? 0}/${room?.capacity ?? 50} online` : 'Reconnecting'}</small></div><div className="room-actions"><button className="icon-button" aria-label="Share game" title="Share game / audience QR" aria-expanded={sharing} aria-controls={`${id}-share`} disabled={!room} onClick={() => setSharing(value => !value)}><QrCode size={19} /></button>{game.joined && <button className="icon-button" aria-label="Back to game" title="Back to game" onClick={onReturn}><ArrowUp size={19} /></button>}</div></header>
     <div className="allowance-strip" aria-label="AI allowance balances">
       {game.joined && <span>Personal <b data-testid="personal-tokens-left">{game.allowance ? reportedTokenBalance(game.allowance).toLocaleString() : '--'}</b> / <b data-testid="ai-token-limit">{game.allowance?.limit.toLocaleString() ?? '--'}</b></span>}<span>Room <b data-testid="room-tokens-left">{room?.allowance ? reportedTokenBalance(room.allowance).toLocaleString() : '--'}</b> tokens left</span><span><b data-testid="room-requests-left">{room?.requestsRemaining?.toLocaleString() ?? '--'}</b> room requests left</span>
       {game.joined && <span>Available now <b data-testid="available-tokens-now">{game.allowance && room?.allowance ? Math.min(game.allowance.remaining, room.allowance.remaining).toLocaleString() : '--'}</b></span>}
       {(game.busy || (game.allowance?.reserved ?? 0) > 0) && <span data-testid="allowance-reserved">{game.allowance?.reserved ? `${game.allowance.reserved.toLocaleString()} held for current request` : 'Reservation pending'}</span>}
       {(game.allowance?.unconfirmed ?? 0) > 0 && <span data-testid="allowance-unconfirmed">{game.allowance!.unconfirmed.toLocaleString()} held / usage unconfirmed</span>}
     </div>
-    {sharing && <div className="invite-link"><input aria-label="Game invite link" readOnly value={invite.href} onFocus={event => event.target.select()} /><button className="icon-button" aria-label="Copy game link" title="Copy game link" onClick={() => void copyInvite()}><Copy size={17} /></button></div>}
+    {sharing && <section className="room-share" id={`${id}-share`} aria-label="Share game">
+      {audienceLink ? <div className="join-qr"><header><h2>Join room {room?.code}</h2><button className="icon-button" aria-label="Enlarge join QR code" title="Enlarge QR code" onClick={() => qrDialog.current?.showModal()}><Maximize2 size={18} /></button></header><QRCodeCanvas value={invite.href} size={256} level="M" marginSize={4} role="img" aria-label="Audience join QR code" /></div> : <p className="field-error" role="status">Audience QR unavailable on localhost. A public or network-accessible game URL is required.</p>}
+      <div className="invite-link"><input aria-label="Game invite link" readOnly value={invite.href} onFocus={event => event.target.select()} /><button className="icon-button" aria-label="Copy game link" title="Copy game link" onClick={() => void copyInvite()}><Copy size={17} /></button></div>
+    </section>}
+    <dialog className="prompt-dialog join-qr-dialog" ref={qrDialog} aria-labelledby={`${id}-qr-title`}>
+      <header><h2 id={`${id}-qr-title`}>Join room {room?.code}</h2><button className="icon-button" aria-label="Close join QR code" title="Close QR code" onClick={() => qrDialog.current?.close()}><X size={19} /></button></header>
+      {audienceLink && <QRCodeCanvas value={invite.href} size={1024} level="M" marginSize={4} role="img" aria-label="Audience join QR code" />}
+      <a className="qr-join-link" href={invite.href} target="_blank" rel="noopener noreferrer">{invite.href}</a>
+      <button className="icon-button" aria-label="Copy game link" title="Copy game link" onClick={() => void copyInvite()}><Copy size={18} /></button>
+    </dialog>
     {!game.joined ? game.sessionName ? <div className="returning-player"><h2>{game.sessionName}</h2><button className="primary-button" disabled={!game.connected || game.joining} onClick={() => game.join()}><Play size={18} />{game.joining ? 'Reconnecting...' : 'Rejoin game'}</button></div> : <GameSetup disabled={!game.connected || !room || room.online >= room.capacity} pending={game.joining} onSubmit={game.join} /> : <div className="player-summary"><div><strong data-testid="player-name">{game.player?.name}</strong><p title={game.player?.tokenText}>{game.player?.tokenText || 'Classic pieces'}</p></div><button className="icon-button" aria-label="Change sentence" title="Change sentence" disabled={game.busy || game.joining || !game.connected} onClick={onEdit}><Quote size={19} /></button></div>}
     {!game.joined && room && room.online >= room.capacity && <p className="field-error" role="status">Room full. Waiting for a free spot.</p>}
     <section className="leaderboard" aria-labelledby={`${id}-scores`}>

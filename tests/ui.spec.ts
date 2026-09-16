@@ -2,20 +2,22 @@ import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
 import { EventEmitter, once } from 'node:events';
 import { mkdtempSync, mkdirSync, rmSync } from 'node:fs';
+import { createRequire } from 'node:module';
 import os from 'node:os';
 import path from 'node:path';
 import { after, before, test } from 'node:test';
 import { chromium } from 'playwright-core';
-import type { Browser, Page } from 'playwright-core';
+import type { Browser, BrowserContext, Locator, Page } from 'playwright-core';
 import { createApplication } from '../server/app.ts';
 import { maxCompletionTokens, MCP_GUIDANCE, POLICY, PREFIX_TOKENS, RequestError } from '../server/model.ts';
 import type { ModelGateway } from '../server/model.ts';
 import { buildPrompts, countTokens, gameTokens, tokenChips, unpackBoard } from '../server/tokens.ts';
-import { lookaheadSnapshot, lookupFutureMoves, McpLookupError } from '../server/mcp.ts';
+import { lookaheadSnapshot, lookupFutureMoves, McpLookupError, mcpPromptContext } from '../server/mcp.ts';
 import { Game, placementsFor, tokenLabel, tokenShape } from '../shared/game.ts';
 import { costForUsage, emptyMetrics } from '../shared/protocol.ts';
 import type { AiOptions, McpLookup, Usage } from '../shared/protocol.ts';
 
+const jsQR = createRequire(import.meta.url)('jsqr') as typeof import('jsqr').default;
 let browser: Browser;
 const screenshots = path.resolve('data/tetris-qa');
 before(async () => {
@@ -24,7 +26,7 @@ before(async () => {
 });
 after(async () => { await browser?.close(); });
 
-async function fixture(viewport = { width: 1366, height: 768 }, autoJoin = true) {
+async function fixture(viewport = { width: 1366, height: 768 }, autoJoin = true, networkJoin = false, initialOptions?: Partial<AiOptions>) {
   const dataDirectory = mkdtempSync(path.join(os.tmpdir(), 'tetris-ui-'));
   const controls = { hold: false, chooseHold: false, invalid: false, truncated: false, fail: false, mcpFail: false, cacheMiss: false, mixedCache: false, missingReasoning: false, firstPlacement: false, inFlight: 0, maxInFlight: 0 };
   const events = new EventEmitter();
@@ -44,7 +46,7 @@ async function fixture(viewport = { width: 1366, height: 768 }, autoJoin = true)
     const originalTokens = options.compression ? prompts.packedTokens : prompts.rawTokens;
     const systemPrompt = POLICY + (mcpLookup ? MCP_GUIDANCE : '');
     if (mcpLookup) {
-      const context = { server: mcpLookup.server, tool: mcpLookup.tool, analysis: JSON.parse(mcpLookup.result) };
+      const context = mcpPromptContext(mcpLookup);
       const verbose = JSON.stringify({ ...JSON.parse(prompts.verbose), mcpLookup: context });
       const packed = JSON.stringify({ ...JSON.parse(prompts.packed), mcpLookup: context });
       prompts = { verbose, packed, rawTokens: countTokens(verbose), packedTokens: countTokens(packed) };
@@ -92,9 +94,19 @@ async function fixture(viewport = { width: 1366, height: 768 }, autoJoin = true)
     checkedAt: new Date().toISOString(), sourceUrl: 'https://prices.azure.com/api/retail/prices',
     meters: Object.fromEntries(['input', 'cachedInput', 'cacheWrite', 'output'].map(key => [key, { id: key, name: `Test ${key}`, effectiveFrom: '2026-08-01T00:00:00Z' }])) as Record<'input' | 'cachedInput' | 'cacheWrite' | 'output', { id: string; name: string; effectiveFrom: string }>,
   } };
-  await new Promise<void>(resolve => application.server.listen(0, '127.0.0.1', resolve));
+  await new Promise<void>(resolve => application.server.listen(0, networkJoin ? '0.0.0.0' : '127.0.0.1', resolve));
   const address = application.server.address() as { port: number };
+  if (networkJoin) {
+    const network = Object.values(os.networkInterfaces()).flat().find(entry => entry?.family === 'IPv4' && !entry.internal);
+    assert.ok(network, 'A network address is required for the audience join test');
+    application.room.config.publicUrl = `http://${network.address}:${address.port}`;
+  }
   const context = await browser.newContext({ viewport, deviceScaleFactor: 1 });
+  if (initialOptions) await context.addInitScript(options => {
+    if (sessionStorage.getItem('tetris-luna-options') === null) {
+      sessionStorage.setItem('tetris-luna-options', JSON.stringify({ compression: false, cache: false, ...options }));
+    }
+  }, initialOptions);
   const page = await context.newPage();
   page.setDefaultTimeout(8000);
   const errors: string[] = [];
@@ -124,6 +136,113 @@ async function waitPieces(page: Page, count: number) {
 async function waitRequests(page: Page, count: number) {
   await page.waitForFunction(expected => Number(document.querySelector('[data-testid="ai-requests"]')?.textContent?.replace(/\D/g, '')) === expected, count);
 }
+
+async function scanQr(canvas: Locator): Promise<string> {
+  const image = await canvas.evaluate((element: HTMLCanvasElement) => {
+    const bounds = element.getBoundingClientRect();
+    const rendered = document.createElement('canvas');
+    rendered.width = Math.round(bounds.width);
+    rendered.height = Math.round(bounds.height);
+    const context = rendered.getContext('2d')!;
+    context.drawImage(element, 0, 0, rendered.width, rendered.height);
+    return { width: rendered.width, height: rendered.height, pixels: Array.from(context.getImageData(0, 0, rendered.width, rendered.height).data) };
+  });
+  assert.equal(image.width, image.height);
+  assert.ok(image.pixels.slice(0, image.width * 4).every(channel => channel === 255), 'QR must retain its white quiet zone in every theme');
+  const decoded = jsQR(new Uint8ClampedArray(image.pixels), image.width, image.height, { inversionAttempts: 'dontInvert' });
+  assert.ok(decoded, 'Rendered QR pixels must decode at their displayed size');
+  return decoded.data;
+}
+
+for (const viewport of [{ width: 1366, height: 768 }, { width: 390, height: 844 }]) {
+  test(`Luna-dependent switches require Ask Luna and retain settings at ${viewport.width}px`, async context => {
+    const setup = await fixture(viewport);
+    context.after(setup.close);
+    const { page } = setup;
+    setup.controls.hold = true;
+    const luna = page.getByRole('checkbox', { name: 'Ask Luna', exact: true });
+    const options = ['Reasoning', 'MCP', 'Compression', 'Cache'].map(name => page.getByRole('checkbox', { name, exact: true }));
+    assert.equal(await luna.isChecked(), false);
+    for (const option of options) {
+      assert.equal(await option.isDisabled(), true);
+      await option.click({ force: true });
+      assert.equal(await option.isChecked(), false);
+    }
+    await luna.focus();
+    await page.keyboard.press('Tab');
+    assert.equal(await page.locator('.luna-controls input:focus').count(), 0);
+    assert.equal(setup.calls.length, 0);
+    await page.screenshot({ path: path.join(screenshots, `luna-controls-off-${viewport.width}.png`), animations: 'disabled' });
+    await luna.check();
+    await setup.waitForCalls(1);
+    for (const option of options) {
+      assert.equal(await option.isEnabled(), true);
+      await option.check();
+    }
+    await page.screenshot({ path: path.join(screenshots, `luna-controls-on-${viewport.width}.png`), animations: 'disabled' });
+    assert.deepEqual(setup.calls[0].options, { compression: false, cache: false, reasoning: false, mcp: false, autopilot: true });
+    await luna.uncheck();
+    for (const option of options) {
+      assert.equal(await option.isDisabled(), true);
+      assert.equal(await option.isChecked(), true);
+    }
+    setup.release();
+    await waitRequests(page, 1);
+    assert.equal(await page.locator('.game-canvas').getAttribute('data-pieces'), '0');
+    await page.reload();
+    await page.locator('.tetris-app[data-playing="true"]').waitFor();
+    assert.equal(await luna.isChecked(), false);
+    for (const option of options) {
+      assert.equal(await option.isDisabled(), true);
+      assert.equal(await option.isChecked(), true);
+    }
+    assert.equal(setup.calls.length, 1);
+    await luna.check();
+    await setup.waitForCalls(2);
+    assert.deepEqual(setup.calls[1].options, { compression: true, cache: true, reasoning: true, mcp: true, autopilot: true });
+    for (const option of options) {
+      assert.equal(await option.isEnabled(), true);
+      await option.uncheck();
+    }
+    await luna.uncheck();
+    for (const option of options) assert.equal(await option.isDisabled(), true);
+    setup.release();
+    await waitRequests(page, 2);
+    assert.deepEqual(setup.errors, []);
+  });
+}
+
+test('Luna remains enabled across window visibility changes without background moves', async context => {
+  const setup = await fixture();
+  context.after(setup.close);
+  const { page } = setup;
+  setup.controls.hold = true;
+  const luna = page.getByRole('checkbox', { name: 'Ask Luna', exact: true });
+  await luna.check();
+  await setup.waitForCalls(1);
+  await page.evaluate(() => {
+    Object.defineProperty(document, 'hidden', { configurable: true, get: () => true });
+    document.dispatchEvent(new Event('visibilitychange'));
+  });
+  assert.equal(await luna.isChecked(), true);
+  setup.release();
+  await waitRequests(page, 1);
+  await page.waitForTimeout(1200);
+  assert.equal(setup.calls.length, 1);
+  assert.equal(await page.locator('.game-canvas').getAttribute('data-pieces'), '0');
+  await page.evaluate(() => {
+    Object.defineProperty(document, 'hidden', { configurable: true, get: () => false });
+    document.dispatchEvent(new Event('visibilitychange'));
+  });
+  await setup.waitForCalls(2);
+  assert.equal(await luna.isChecked(), true);
+  setup.release();
+  await waitPieces(page, 1);
+  await luna.uncheck();
+  assert.equal(setup.controls.maxInFlight, 1);
+  assert.equal(setup.player().metrics.requests, 2);
+  assert.deepEqual(setup.errors, []);
+});
 
 test('classic Tetris joins by name with standard pieces, live rankings, and free manual controls', async context => {
   const setup = await fixture();
@@ -293,8 +412,120 @@ test('shared leaderboard joins independent players, updates scores, pages all en
   assert.deepEqual(setup.errors, []);
 });
 
+test('audience QR codes decode at desktop and mobile sizes and join an independent player', { timeout: 45000 }, async context => {
+  const setup = await fixture({ width: 1366, height: 900 }, false, true);
+  let audience: BrowserContext | undefined;
+  context.after(async () => { await audience?.close(); await setup.close(); });
+  const { page, application } = setup;
+  await page.goto(`${new URL(page.url()).origin}/?token=do-not-share&name=Private#private`);
+  await page.getByRole('button', { name: 'Share game', exact: true }).click();
+  const inlineQr = page.getByRole('img', { name: 'Audience join QR code', exact: true });
+  await inlineQr.waitFor();
+  const invite = await scanQr(inlineQr);
+  context.diagnostic('Inline QR decoded');
+  assert.equal(invite, application.room.view().joinUrl);
+  assert.deepEqual([...new URL(invite).searchParams.keys()], ['room']);
+  assert.equal(new URL(invite).searchParams.get('room'), application.room.code);
+  assert.equal(new URL(invite).hash, '');
+  assert.equal(await page.getByRole('textbox', { name: 'Game invite link', exact: true }).inputValue(), invite);
+  await page.evaluate(() => {
+    Object.defineProperty(navigator, 'clipboard', { configurable: true, value: { writeText: async (value: string) => { (window as unknown as { copiedInvite: string }).copiedInvite = value; } } });
+  });
+  await page.getByRole('button', { name: 'Copy game link', exact: true }).click();
+  assert.equal(await page.evaluate(() => (window as unknown as { copiedInvite: string }).copiedInvite), invite);
+  assert.equal(application.room.players.size, 0);
+  await page.getByRole('button', { name: 'Enlarge join QR code', exact: true }).click();
+  const dialog = page.getByRole('dialog', { name: `Join room ${application.room.code}`, exact: true });
+  await dialog.waitFor();
+  for (const theme of ['light', 'dark']) {
+    await page.evaluate(value => { document.documentElement.dataset.theme = value; }, theme);
+    for (const viewport of [{ width: 1366, height: 900 }, { width: 390, height: 844 }, { width: 320, height: 710 }]) {
+      await page.setViewportSize(viewport);
+      assert.equal(await scanQr(dialog.getByRole('img', { name: 'Audience join QR code', exact: true })), invite);
+      const bounds = await dialog.boundingBox();
+      const usableWidth = await page.evaluate(() => document.documentElement.clientWidth);
+      assert.ok(bounds && bounds.x >= 0 && bounds.y >= 0 && bounds.x + bounds.width <= usableWidth + 1 && bounds.y + bounds.height <= viewport.height + 1);
+      assert.equal(await dialog.evaluate(element => element.scrollWidth > element.clientWidth + 1), false);
+      const close = await dialog.getByRole('button', { name: 'Close join QR code', exact: true }).boundingBox();
+      assert.ok(close && close.width >= 44 && close.height >= 44);
+      await page.screenshot({ path: path.join(screenshots, `audience-qr-${theme}-${viewport.width}.png`), animations: 'disabled' });
+    }
+  }
+  audience = await browser.newContext({ viewport: { width: 390, height: 844 }, deviceScaleFactor: 1 });
+  context.diagnostic('All responsive QR views decoded');
+  const phone = await audience.newPage();
+  phone.setDefaultTimeout(8000);
+  phone.setDefaultNavigationTimeout(12000);
+  await phone.goto(invite);
+  await phone.getByRole('textbox', { name: 'Name', exact: true }).fill('QR Guest');
+  await phone.getByRole('radio', { name: 'Classic', exact: true }).check();
+  await phone.getByRole('button', { name: 'Join game', exact: true }).click();
+  await phone.locator('.tetris-app[data-playing="true"]').waitFor();
+  assert.equal(await phone.getByTestId('room-code').innerText(), application.room.code);
+  assert.equal(await phone.getByTestId('player-name').innerText(), 'QR Guest');
+  assert.equal(await phone.getByRole('checkbox', { name: 'Ask Luna', exact: true }).isChecked(), false);
+  await phone.getByRole('button', { name: 'Hard drop (Space)', exact: true }).click();
+  await waitPieces(phone, 1);
+  await phone.getByRole('button', { name: 'Pause game', exact: true }).click();
+  assert.equal(application.room.players.size, 1);
+  assert.equal(setup.calls.length, 0);
+  assert.deepEqual(setup.errors, []);
+});
+
+test('sharing an audience QR never interrupts Luna or changes the selected room link', async context => {
+  const setup = await fixture(undefined, true, false, { compression: true });
+  context.after(setup.close);
+  const { page, application } = setup;
+  application.room.config.publicUrl = 'https://audience.example.test/ignored?token=private#private';
+  setup.controls.hold = true;
+  const luna = page.getByRole('checkbox', { name: 'Ask Luna', exact: true });
+  await luna.check();
+  await setup.waitForCalls(1);
+  await page.getByRole('button', { name: 'Share game', exact: true }).click();
+  await page.getByRole('button', { name: 'Enlarge join QR code', exact: true }).click();
+  const dialog = page.getByRole('dialog', { name: `Join room ${application.room.code}`, exact: true });
+  const expected = `https://audience.example.test/?room=${application.room.code}`;
+  assert.equal(await scanQr(dialog.getByRole('img', { name: 'Audience join QR code', exact: true })), expected);
+  await page.keyboard.press('KeyP');
+  assert.equal(await luna.isChecked(), true);
+  setup.release();
+  await waitPieces(page, 1);
+  await setup.waitForCalls(2);
+  assert.equal(await luna.isChecked(), true);
+  assert.equal(await dialog.getByRole('link').getAttribute('href'), expected);
+  await page.keyboard.press('Escape');
+  await dialog.waitFor({ state: 'hidden' });
+  assert.equal(await luna.isChecked(), true);
+  await luna.uncheck();
+  setup.release();
+  await waitRequests(page, 2);
+  assert.equal(await page.locator('.game-canvas').getAttribute('data-pieces'), '1');
+  assert.equal(setup.calls.length, 2);
+  assert.deepEqual(setup.errors, []);
+});
+
+test('localhost sharing does not display an unusable audience QR and copy failures retain the link', async context => {
+  const setup = await fixture({ width: 320, height: 710 }, false);
+  context.after(setup.close);
+  const { page } = setup;
+  await page.getByRole('button', { name: 'Share game', exact: true }).click();
+  await page.getByText(/Audience QR unavailable on localhost/).waitFor();
+  assert.equal(await page.getByRole('img', { name: 'Audience join QR code', exact: true }).count(), 0);
+  assert.equal(await page.getByRole('button', { name: 'Enlarge join QR code', exact: true }).count(), 0);
+  await page.evaluate(() => { Object.defineProperty(navigator, 'clipboard', { value: { writeText: async () => { throw new Error('Clipboard denied'); } } }); });
+  await page.getByRole('button', { name: 'Copy game link', exact: true }).click();
+  await page.getByRole('alert').filter({ hasText: 'Select the game link to copy it.' }).waitFor();
+  const input = page.getByRole('textbox', { name: 'Game invite link', exact: true });
+  await input.focus();
+  assert.equal(await input.evaluate((element: HTMLInputElement) => element.selectionEnd! - element.selectionStart!), (await input.inputValue()).length);
+  await page.getByRole('button', { name: 'Share game', exact: true }).click();
+  assert.equal(await input.count(), 0);
+  assert.equal(setup.calls.length, 0);
+  assert.deepEqual(setup.errors, []);
+});
+
 test('sentence games retain Luna-selected Hold moves and reported AI spend across sentence changes', async context => {
-  const setup = await fixture({ width: 1366, height: 768 }, false);
+  const setup = await fixture({ width: 1366, height: 768 }, false, false, { compression: true, cache: true });
   context.after(setup.close);
   const { page } = setup;
   await page.getByRole('textbox', { name: 'Name', exact: true }).fill('Sentence Pilot');
@@ -304,8 +535,6 @@ test('sentence games retain Luna-selected Hold moves and reported AI spend acros
   const playerId = setup.player().record.id;
   setup.controls.hold = true;
   setup.controls.chooseHold = true;
-  await page.getByRole('checkbox', { name: 'Compression', exact: true }).check();
-  await page.getByRole('checkbox', { name: 'Cache', exact: true }).check();
   await page.getByRole('checkbox', { name: 'Ask Luna', exact: true }).check();
   await setup.waitForCalls(1);
   assert.equal(JSON.parse(setup.calls[0].prompt).randomizer, 'repeating');
@@ -439,7 +668,7 @@ test('sentence editor shows server failures in the dialog and can retry without 
 });
 
 test('AI allowance setup counts Luna, MCP and reasoning together and can be raised without resetting the game', async context => {
-  const setup = await fixture({ width: 390, height: 844 }, false);
+  const setup = await fixture({ width: 390, height: 844 }, false, false, { compression: true, reasoning: true, mcp: true });
   context.after(setup.close);
   const { page } = setup;
   await page.getByRole('textbox', { name: 'Name', exact: true }).fill('Allowance Player');
@@ -454,9 +683,6 @@ test('AI allowance setup counts Luna, MCP and reasoning together and can be rais
   assert.equal(setup.player().record.token_limit, 16000);
   assert.ok(setup.player().game.tokens.length > 0);
   setup.controls.hold = true;
-  await page.getByRole('checkbox', { name: 'Compression', exact: true }).check();
-  await page.getByRole('checkbox', { name: 'Reasoning', exact: true }).check();
-  await page.getByRole('checkbox', { name: 'MCP', exact: true }).check();
   await page.getByRole('checkbox', { name: 'Ask Luna', exact: true }).check();
   await setup.waitForCalls(1);
   await page.waitForFunction(() => /\d/.test(document.querySelector('[data-testid="allowance-reserved"]')?.textContent ?? ''));
@@ -475,7 +701,8 @@ test('AI allowance setup counts Luna, MCP and reasoning together and can be rais
   assert.equal(numeric(await page.getByTestId('ai-tokens-left').innerText()), 16000 - spent);
   assert.equal(numeric(await page.getByTestId('ai-tokens').innerText()), spent);
   assert.equal(numeric(await page.getByTestId('reasoning-tokens').innerText()), 256);
-  assert.equal(await page.getByRole('checkbox', { name: 'Ask Luna', exact: true }).isChecked(), false);
+  assert.equal(await page.getByRole('checkbox', { name: 'Ask Luna', exact: true }).isChecked(), true);
+  assert.equal(await page.getByTestId('game-status').innerText(), 'Luna paused');
   assert.equal(setup.calls.length, 1);
   const run = setup.player().runId;
   const score = await page.getByTestId('game-score').innerText();
@@ -498,12 +725,18 @@ test('AI allowance setup counts Luna, MCP and reasoning together and can be rais
   assert.equal(numeric(await page.getByTestId('ai-tokens-left').innerText()), 100000 - spent);
   assert.equal(await page.getByTestId('game-score').innerText(), score);
   assert.equal(await page.getByTestId('ai-cost').innerText(), cost);
+  await setup.waitForCalls(2);
+  assert.equal(await page.getByRole('checkbox', { name: 'Ask Luna', exact: true }).isChecked(), true);
+  await page.getByRole('checkbox', { name: 'Ask Luna', exact: true }).uncheck();
+  setup.release();
+  await waitRequests(page, 2);
+  const totalSpent = spent + setup.calls[1].usage.input + setup.calls[1].usage.output;
   await page.reload();
   await page.locator('.tetris-app[data-playing="true"]').waitFor();
   assert.equal(numeric(await page.getByTestId('ai-token-limit').innerText()), 100000);
-  assert.equal(numeric(await page.getByTestId('ai-tokens-left').innerText()), 100000 - spent);
+  assert.equal(numeric(await page.getByTestId('ai-tokens-left').innerText()), 100000 - totalSpent);
   assert.equal(await page.getByRole('checkbox', { name: 'Ask Luna', exact: true }).isChecked(), false);
-  assert.equal(setup.calls.length, 1);
+  assert.equal(setup.calls.length, 2);
   await page.evaluate(() => window.scrollTo(0, 0));
   await page.screenshot({ path: path.join(screenshots, 'token-countdown-desktop.png'), animations: 'disabled' });
   await page.setViewportSize({ width: 390, height: 844 });
@@ -512,7 +745,7 @@ test('AI allowance setup counts Luna, MCP and reasoning together and can be rais
 });
 
 test('the token balance only falls with reported usage and never rebounds when reservations release', async context => {
-  const setup = await fixture();
+  const setup = await fixture(undefined, true, false, { compression: true });
   context.after(setup.close);
   const { page } = setup;
   setup.controls.hold = true;
@@ -523,7 +756,6 @@ test('the token balance only falls with reported usage and never rebounds when r
     (window as unknown as { balanceHistory: number[] }).balanceHistory = history;
     new MutationObserver(() => { if (history.at(-1) !== value()) history.push(value()); }).observe(counter, { childList: true, characterData: true, subtree: true });
   });
-  await page.getByRole('checkbox', { name: 'Compression', exact: true }).check();
   await page.getByRole('checkbox', { name: 'Ask Luna', exact: true }).check();
   await setup.waitForCalls(1);
   await page.waitForFunction(() => /\d/.test(document.querySelector('[data-testid="allowance-reserved"]')?.textContent ?? ''));
@@ -550,16 +782,15 @@ test('the token balance only falls with reported usage and never rebounds when r
 });
 
 test('a completion token cap is reported separately while the remaining allowance stays visible', async context => {
-  const setup = await fixture();
+  const setup = await fixture(undefined, true, false, { compression: true, reasoning: true });
   context.after(setup.close);
   const { page } = setup;
   setup.controls.truncated = true;
-  await page.getByRole('checkbox', { name: 'Compression', exact: true }).check();
-  await page.getByRole('checkbox', { name: 'Reasoning', exact: true }).check();
   await page.getByRole('checkbox', { name: 'Ask Luna', exact: true }).check();
   await page.getByRole('alert').filter({ hasText: 'completion cap, not your total allowance' }).waitFor();
   await waitRequests(page, 1);
-  assert.equal(await page.getByRole('checkbox', { name: 'Ask Luna', exact: true }).isChecked(), false);
+  assert.equal(await page.getByRole('checkbox', { name: 'Ask Luna', exact: true }).isChecked(), true);
+  await page.getByRole('checkbox', { name: 'Ask Luna', exact: true }).uncheck();
   assert.equal(await page.locator('.game-canvas').getAttribute('data-pieces'), '0');
   const used = setup.calls[0].usage.input + setup.calls[0].usage.output;
   assert.equal(numeric(await page.getByTestId('ai-tokens-left').innerText()), 1000000 - used);
@@ -594,23 +825,26 @@ test('allowance countdown separates shared room tokens, request slots, and unrep
   assert.equal(numeric(await page.getByTestId('available-tokens-now').innerText()), 4000);
   assert.equal(numeric(await page.getByTestId('ai-tokens').innerText()), 0);
   assert.equal(numeric(await page.getByTestId('personal-tokens-left').innerText()), 1000000);
+  await page.getByRole('button', { name: 'Retry Luna', exact: true }).waitFor();
+  assert.equal(await page.getByRole('checkbox', { name: 'Ask Luna', exact: true }).isChecked(), true);
+  assert.equal(await page.getByRole('checkbox', { name: 'Ask Luna', exact: true }).isEnabled(), true);
+  assert.equal(setup.calls.length, 1);
+  await page.getByRole('checkbox', { name: 'Ask Luna', exact: true }).uncheck();
   assert.equal(await page.getByRole('checkbox', { name: 'Ask Luna', exact: true }).isEnabled(), false);
   assert.deepEqual(setup.errors, []);
 });
 
 test('MCP toggles call the actual tool and preserve its exact lookup in a paused inspector', async context => {
-  const setup = await fixture({ width: 390, height: 844 });
+  const setup = await fixture({ width: 390, height: 844 }, true, false, { compression: true, reasoning: true, mcp: true });
   context.after(setup.close);
   const { page } = setup;
   setup.controls.hold = true;
-  assert.equal(await page.getByRole('checkbox', { name: 'MCP', exact: true }).isChecked(), false);
+  assert.equal(await page.getByRole('checkbox', { name: 'MCP', exact: true }).isChecked(), true);
+  assert.equal(await page.getByRole('checkbox', { name: 'MCP', exact: true }).isDisabled(), true);
   await page.getByRole('button', { name: 'Inspect MCP lookup', exact: true }).click();
   await page.getByTestId('mcp-empty').waitFor();
   assert.equal(setup.calls.length, 0);
   await page.getByRole('button', { name: 'Close MCP lookup', exact: true }).click();
-  await page.getByRole('checkbox', { name: 'MCP', exact: true }).check();
-  await page.getByRole('checkbox', { name: 'Reasoning', exact: true }).check();
-  await page.getByRole('checkbox', { name: 'Compression', exact: true }).check();
   assert.equal(await page.getByTestId('mcp-next').innerText(), '2-piece next');
   assert.equal(setup.calls.length, 0);
   assert.equal(numeric(await page.getByTestId('ai-cost').innerText()), 0);
@@ -632,7 +866,7 @@ test('MCP toggles call the actual tool and preserve its exact lookup in a paused
   await page.getByRole('button', { name: 'Inspect MCP lookup', exact: true }).click();
   const dialog = page.getByRole('dialog', { name: 'MCP lookup', exact: true });
   await dialog.waitFor();
-  assert.equal(await page.getByRole('checkbox', { name: 'Ask Luna', exact: true }).isChecked(), false);
+  assert.equal(await page.getByRole('checkbox', { name: 'Ask Luna', exact: true }).isChecked(), true);
   assert.equal(await dialog.getByTestId('mcp-server').innerText(), 'tetris-board-facts');
   assert.equal(await dialog.getByTestId('mcp-tool').innerText(), 'analyze_future_moves');
   assert.equal(await dialog.getByTestId('mcp-forecast-row').count(), JSON.parse(lookup.result).candidatesEvaluated);
@@ -663,7 +897,12 @@ test('MCP toggles call the actual tool and preserve its exact lookup in a paused
   assert.equal(await page.locator('.game-canvas').getAttribute('data-status'), 'paused');
   await page.keyboard.press('Escape');
   await dialog.waitFor({ state: 'hidden' });
-  assert.equal(setup.calls.length, 2);
+  await setup.waitForCalls(3);
+  await page.getByRole('checkbox', { name: 'MCP', exact: true }).check();
+  await page.getByRole('checkbox', { name: 'Ask Luna', exact: true }).uncheck();
+  setup.release();
+  await waitRequests(page, 3);
+  assert.equal(await page.locator('.game-canvas').getAttribute('data-pieces'), '1');
   await page.setViewportSize({ width: 1024, height: 600 });
   await page.evaluate(() => window.scrollTo(0, 0));
   const separated = await page.evaluate(() => {
@@ -677,7 +916,7 @@ test('MCP toggles call the actual tool and preserve its exact lookup in a paused
   });
   assert.ok(separated.roomTop >= Math.max(separated.controlsBottom, separated.promptBottom), JSON.stringify(separated));
   assert.ok(separated.resultsLeft >= separated.toggleRight, JSON.stringify(separated));
-  await page.getByRole('checkbox', { name: 'MCP', exact: true }).check();
+  assert.equal(await page.getByRole('checkbox', { name: 'MCP', exact: true }).isDisabled(), true);
   await page.reload();
   await page.locator('.tetris-app[data-playing="true"]').waitFor();
   assert.equal(await page.getByRole('checkbox', { name: 'MCP', exact: true }).isChecked(), true);
@@ -685,27 +924,24 @@ test('MCP toggles call the actual tool and preserve its exact lookup in a paused
   await page.getByRole('button', { name: 'Inspect MCP lookup', exact: true }).click();
   await page.getByTestId('mcp-empty').waitFor();
   assert.equal(await page.getByTestId('mcp-forecast-row').count(), 0);
-  assert.equal(setup.calls.length, 2);
+  assert.equal(setup.calls.length, 3);
   assert.deepEqual(setup.errors, []);
 });
 
-test('MCP failures stop play without a model request or phantom cost and can recover with MCP off', async context => {
-  const setup = await fixture();
+test('MCP failures retain Luna selection without phantom cost and recover after an options change', async context => {
+  const setup = await fixture(undefined, true, false, { compression: true, mcp: true });
   context.after(setup.close);
   const { page } = setup;
   setup.controls.mcpFail = true;
   setup.controls.hold = true;
-  await page.getByRole('checkbox', { name: 'Compression', exact: true }).check();
-  await page.getByRole('checkbox', { name: 'MCP', exact: true }).check();
   await page.getByRole('checkbox', { name: 'Ask Luna', exact: true }).check();
   await page.getByRole('alert').filter({ hasText: 'MCP lookup failed before contacting Luna.' }).waitFor();
-  assert.equal(await page.getByRole('checkbox', { name: 'Ask Luna', exact: true }).isChecked(), false);
+  assert.equal(await page.getByRole('checkbox', { name: 'Ask Luna', exact: true }).isChecked(), true);
   assert.equal(setup.calls.length, 0);
   assert.equal(numeric(await page.getByTestId('ai-cost').innerText()), 0);
   assert.equal(setup.player().record.attempts, 0);
   assert.equal(setup.application.room.usage(setup.player()).unmeteredRequests, 0);
   await page.getByRole('checkbox', { name: 'MCP', exact: true }).uncheck();
-  await page.getByRole('checkbox', { name: 'Ask Luna', exact: true }).check();
   await setup.waitForCalls(1);
   await page.getByRole('button', { name: 'Stop Luna', exact: true }).click();
   setup.release();
@@ -715,16 +951,76 @@ test('MCP failures stop play without a model request or phantom cost and can rec
   assert.deepEqual(setup.errors, []);
 });
 
+test('Luna automatically recovers from transient MCP, provider and invalid-reply errors', async context => {
+  for (const failure of ['mcp', 'provider', 'invalid']) await context.test(failure, async child => {
+    const setup = await fixture(undefined, true, false, { compression: true, mcp: failure === 'mcp' });
+    child.after(setup.close);
+    const { page } = setup;
+    setup.controls.mcpFail = failure === 'mcp';
+    setup.controls.fail = failure === 'provider';
+    setup.controls.invalid = failure === 'invalid';
+    const luna = page.getByRole('checkbox', { name: 'Ask Luna', exact: true });
+    await luna.check();
+    await page.getByRole('alert').filter({ hasText: 'Retrying in' }).waitFor();
+    assert.equal(await luna.isChecked(), true);
+    assert.equal(setup.player().game.pieces, 0);
+    if (failure === 'mcp') {
+      assert.equal(setup.calls.length, 0);
+      assert.equal(setup.player().record.attempts, 0);
+    }
+    setup.controls.mcpFail = false;
+    setup.controls.fail = false;
+    setup.controls.invalid = false;
+    setup.controls.hold = true;
+    await setup.waitForCalls(failure === 'mcp' ? 1 : 2);
+    setup.release();
+    await waitPieces(page, 1);
+    await luna.uncheck();
+    assert.equal(setup.application.room.usage(setup.player()).unmeteredRequests, failure === 'provider' ? 1 : 0);
+    assert.equal(setup.controls.maxInFlight, 1);
+    assert.deepEqual(setup.errors, []);
+  });
+});
+
+test('Luna bounds automatic retries and an explicit Stop cancels recovery', { timeout: 30000 }, async context => {
+  const setup = await fixture(undefined, true, false, { compression: true });
+  context.after(setup.close);
+  const { page } = setup;
+  setup.controls.invalid = true;
+  const luna = page.getByRole('checkbox', { name: 'Ask Luna', exact: true });
+  await luna.check();
+  const retry = page.getByRole('button', { name: 'Retry Luna', exact: true });
+  await retry.waitFor({ timeout: 20000 });
+  assert.equal(await luna.isChecked(), true);
+  assert.equal(await page.getByTestId('game-status').innerText(), 'Luna paused');
+  assert.equal(setup.calls.length, 4);
+  await page.waitForTimeout(2200);
+  assert.equal(setup.calls.length, 4);
+  assert.equal(setup.player().game.pieces, 0);
+  setup.controls.invalid = false;
+  setup.controls.hold = true;
+  await retry.click();
+  await setup.waitForCalls(5);
+  await luna.uncheck();
+  setup.release();
+  await waitRequests(page, 5);
+  await page.waitForTimeout(2200);
+  assert.equal(await luna.isChecked(), false);
+  assert.equal(setup.calls.length, 5);
+  assert.equal(setup.player().game.pieces, 0);
+  assert.equal(setup.controls.maxInFlight, 1);
+  assert.deepEqual(setup.errors, []);
+});
+
 test('reasoning toggles apply to the next request, report actual tokens and retain late billed usage', async context => {
-  const setup = await fixture({ width: 390, height: 844 });
+  const setup = await fixture({ width: 390, height: 844 }, true, false, { compression: true, reasoning: true });
   context.after(setup.close);
   const { page } = setup;
   setup.controls.hold = true;
-  assert.equal(await page.getByRole('checkbox', { name: 'Reasoning', exact: true }).isChecked(), false);
+  assert.equal(await page.getByRole('checkbox', { name: 'Reasoning', exact: true }).isChecked(), true);
+  assert.equal(await page.getByRole('checkbox', { name: 'Reasoning', exact: true }).isDisabled(), true);
   assert.equal(await page.getByTestId('reasoning-tokens').innerText(), '0');
   assert.equal(await page.getByTestId('last-reasoning-tokens').innerText(), '--');
-  await page.getByRole('checkbox', { name: 'Reasoning', exact: true }).check();
-  await page.getByRole('checkbox', { name: 'Compression', exact: true }).check();
   assert.equal(await page.getByTestId('reasoning-next').innerText(), 'Low effort next');
   assert.equal(setup.calls.length, 0);
   assert.equal(numeric(await page.getByTestId('ai-cost').innerText()), 0);
@@ -792,12 +1088,16 @@ test('missing reasoning counts stay unknown and old preferences default reasonin
   assert.equal(await page.getByRole('checkbox', { name: 'Compression', exact: true }).isChecked(), true);
   setup.controls.hold = true;
   setup.controls.missingReasoning = true;
-  await page.getByRole('checkbox', { name: 'Reasoning', exact: true }).check();
   await page.getByRole('checkbox', { name: 'Ask Luna', exact: true }).check();
   await setup.waitForCalls(1);
+  await page.getByRole('checkbox', { name: 'Reasoning', exact: true }).check();
+  setup.release();
+  await waitPieces(page, 1);
+  await setup.waitForCalls(2);
+  assert.equal(setup.calls[1].options.reasoning, true);
   await page.getByRole('button', { name: 'Stop Luna', exact: true }).click();
   setup.release();
-  await waitRequests(page, 1);
+  await waitRequests(page, 2);
   assert.equal(await page.getByTestId('last-reasoning-tokens').innerText(), 'Not reported');
   assert.equal(await page.getByTestId('reasoning-tokens').innerText(), '0');
   assert.ok(numeric(await page.getByTestId('ai-cost').innerText()) > 0);
@@ -811,51 +1111,132 @@ test('optimization switches give immediate next-request feedback without inventi
   assert.equal(await page.getByTestId('compression-next').innerText(), 'Cell JSON next');
   assert.equal(await page.getByTestId('cache-next').innerText(), 'Full input next');
   assert.equal(await page.getByTestId('cache-result-label').innerText(), 'Cache off');
+  setup.controls.hold = true;
+  await page.getByRole('checkbox', { name: 'Ask Luna', exact: true }).check();
+  await setup.waitForCalls(1);
   await page.getByRole('checkbox', { name: 'Compression', exact: true }).check();
   await page.getByRole('checkbox', { name: 'Cache', exact: true }).check();
   assert.equal(await page.getByTestId('compression-next').innerText(), 'Packed rows next');
   assert.equal(await page.getByTestId('cache-next').innerText(), 'Reuse rules next');
   for (const id of ['ai-cost', 'ai-savings', 'compression-adjustment', 'cache-adjustment', 'unoptimized-cost']) assert.equal(numeric(await page.getByTestId(id).textContent()), 0);
   assert.equal(await page.getByTestId('cache-totals').innerText(), '0 hits / 0 misses');
-  assert.equal(await page.getByTestId('cache-result-label').innerText(), 'Cache ready');
+  assert.equal(await page.getByTestId('cache-result-label').innerText(), 'Checking cache');
   assert.equal(await page.getByRole('button', { name: 'Inspect cached instructions', exact: true }).isEnabled(), false);
   assert.equal(await page.getByRole('button', { name: 'Inspect last prompt', exact: true }).isEnabled(), false);
-  assert.equal(setup.calls.length, 0);
+  assert.equal(setup.calls.length, 1);
   await page.getByRole('checkbox', { name: 'Compression', exact: true }).uncheck();
   await page.getByRole('checkbox', { name: 'Cache', exact: true }).uncheck();
   assert.equal(await page.getByTestId('compression-next').innerText(), 'Cell JSON next');
   assert.equal(await page.getByTestId('cache-next').innerText(), 'Full input next');
-  assert.equal(setup.calls.length, 0);
+  assert.equal(setup.calls.length, 1);
+  await page.getByRole('checkbox', { name: 'Ask Luna', exact: true }).uncheck();
+  setup.release();
+  await waitRequests(page, 1);
   assert.deepEqual(setup.errors, []);
 });
 
-test('Ask Luna plays an entire standard game and stops at game over without restarting', { timeout: 35000 }, async context => {
-  const setup = await fixture();
-  context.after(setup.close);
-  const { page } = setup;
-  setup.controls.firstPlacement = true;
-  await page.getByRole('checkbox', { name: 'Compression', exact: true }).check();
-  await page.getByRole('checkbox', { name: 'Ask Luna', exact: true }).check();
-  await page.getByRole('heading', { name: 'Game over', exact: true }).waitFor({ timeout: 30000 });
-  await setup.waitForGame(game => game.status === 'over');
-  assert.ok(setup.calls.length >= 5);
-  assert.equal(setup.player().game.pieces, setup.calls.length);
-  assert.equal(setup.player().metrics.requests, setup.calls.length);
-  assert.equal(await page.getByRole('checkbox', { name: 'Ask Luna', exact: true }).isChecked(), false);
-  assert.equal(setup.controls.maxInFlight, 1);
-  assert.ok(setup.admittedAt.slice(1).every((time, index) => time - setup.admittedAt[index] >= 1000));
-  assert.deepEqual(setup.errors, []);
-});
+for (const scenario of [
+  { name: 'Luna only', options: {} },
+  { name: 'Compression', options: { compression: true } },
+  { name: 'Cache', options: { cache: true } },
+  { name: 'Reasoning', options: { reasoning: true } },
+  { name: 'MCP', options: { mcp: true } },
+  { name: 'all options', options: { compression: true, cache: true, reasoning: true, mcp: true } },
+]) {
+  test(`Ask Luna plays an entire standard game starting with ${scenario.name}`, { timeout: 60000 }, async context => {
+    const options = { compression: false, cache: false, reasoning: false, mcp: false, ...scenario.options };
+    const setup = await fixture(undefined, true, false, options);
+    context.after(setup.close);
+    const { page } = setup;
+    setup.controls.firstPlacement = true;
+    const run = setup.player().runId;
+    await page.getByRole('checkbox', { name: 'Ask Luna', exact: true }).check();
+    await page.waitForFunction(() => document.querySelector('.game-canvas')?.getAttribute('data-status') === 'over' || document.querySelector('[data-testid="game-status"]')?.textContent === 'Luna paused', null, { timeout: 55000 });
+    let beforeRecovery = Infinity;
+    if (setup.player().game.status !== 'over') {
+      assert.match(await page.locator('.notice').innerText(), /per-request cap/);
+      assert.equal(await page.getByRole('checkbox', { name: 'Ask Luna', exact: true }).isChecked(), true);
+      assert.equal(await page.locator('.luna-controls input:enabled').count(), 5);
+      beforeRecovery = setup.calls.length;
+      assert.equal(setup.player().metrics.requests, beforeRecovery);
+      assert.equal(setup.application.room.usage(setup.player()).unmeteredRequests, 0);
+      await page.getByRole('checkbox', { name: 'Compression', exact: true }).check();
+      await page.getByRole('checkbox', { name: 'Reasoning', exact: true }).uncheck();
+      await page.getByRole('checkbox', { name: 'MCP', exact: true }).uncheck();
+      await page.getByRole('heading', { name: 'Game over', exact: true }).waitFor({ timeout: 30000 });
+    }
+    await setup.waitForGame(game => game.status === 'over');
+    const requests = setup.calls.length;
+    const metrics = setup.player().metrics;
+    context.diagnostic(`${scenario.name}: ${requests} placements; ${beforeRecovery === Infinity ? 'no request-cap interruption' : `request-cap recovery after ${beforeRecovery} requests`}`);
+    assert.ok(requests >= 5);
+    assert.equal(setup.player().runId, run);
+    assert.equal(setup.player().record.token_limit, 1000000);
+    assert.equal(setup.player().game.pieces, requests);
+    assert.equal(metrics.requests, requests);
+    for (const [index, call] of setup.calls.entries()) {
+      const expected = index < beforeRecovery ? options : { compression: true, cache: options.cache, reasoning: Boolean(call.options.reasoning), mcp: Boolean(call.options.mcp) };
+      assert.ok(!expected.reasoning || options.reasoning);
+      assert.ok(!expected.mcp || options.mcp);
+      assert.deepEqual(call.options, { ...expected, autopilot: true });
+      assert.equal(call.usage.reasoning, expected.reasoning ? 256 : 0);
+      assert.equal(call.prompt, expected.compression ? call.packed : call.verbose);
+      assert.equal(call.mcpLookup?.transport, expected.mcp ? 'stdio' : undefined);
+      assert.equal(call.mcpLookup?.tool, expected.mcp ? 'analyze_future_moves' : undefined);
+    }
+    if (beforeRecovery !== Infinity) assert.deepEqual(setup.calls.at(-1)!.options, { compression: true, cache: options.cache, reasoning: false, mcp: false, autopilot: true });
+    assert.equal(metrics.reasoning, setup.calls.reduce((total, call) => total + call.usage.reasoning!, 0));
+    assert.equal(metrics.cacheHits, options.cache ? requests - 1 : 0);
+    assert.equal(metrics.cacheMisses, options.cache ? 1 : 0);
+    assert.equal(metrics.cacheBypassed, options.cache ? 0 : requests);
+    assert.equal(metrics.compressionSaved > 0, options.compression || beforeRecovery !== Infinity);
+    const cost = costForUsage(metrics, setup.application.room.pricing.snapshot!.usdPerMillion).total;
+    assert.ok(Math.abs(numeric(await page.getByTestId('ai-cost').innerText()) - cost) < 1e-8);
+    const score = numeric(await page.getByTestId('game-score').innerText());
+    assert.equal(score, setup.player().game.score);
+    assert.equal(await page.getByRole('checkbox', { name: 'Ask Luna', exact: true }).isChecked(), false);
+    assert.equal(await page.locator('.luna-controls input:enabled').count(), 0);
+    assert.equal(setup.controls.maxInFlight, 1);
+    assert.ok(setup.admittedAt.slice(1).every((time, index) => time - setup.admittedAt[index] >= 1000));
+    for (const viewport of [{ width: 320, height: 710 }, { width: 390, height: 844 }]) {
+      await page.setViewportSize(viewport);
+      await page.evaluate(() => window.scrollTo(0, 0));
+      const overlay = await page.locator('.gameover-overlay').evaluate(element => {
+        const bounds = element.getBoundingClientRect();
+        return { left: bounds.left, right: bounds.right, top: bounds.top, bottom: bounds.bottom, children: [...element.children].map(child => {
+          const rect = child.getBoundingClientRect();
+          return { text: child.textContent, left: rect.left, right: rect.right, top: rect.top, bottom: rect.bottom };
+        }) };
+      });
+      for (const child of overlay.children) assert.ok(child.left >= overlay.left - 1 && child.right <= overlay.right + 1 && child.top >= overlay.top - 1 && child.bottom <= overlay.bottom + 1, JSON.stringify({ scenario: scenario.name, viewport, overlay }));
+      await page.screenshot({ path: path.join(screenshots, `game-over-${scenario.name.replaceAll(' ', '-').toLowerCase()}-${viewport.width}.png`), animations: 'disabled' });
+    }
+    await page.reload();
+    await page.locator('.tetris-app[data-playing="true"]').waitFor();
+    await page.getByRole('heading', { name: 'Game over', exact: true }).waitFor();
+    assert.equal(numeric(await page.getByTestId('game-score').innerText()), score);
+    assert.equal(numeric(await page.getByTestId('ai-requests').innerText()), requests);
+    assert.equal(await page.locator('.luna-controls input:enabled').count(), 0);
+    await page.getByRole('button', { name: 'Play again', exact: true }).click();
+    await page.waitForFunction(() => document.querySelector('.game-canvas')?.getAttribute('data-status') === 'playing');
+    assert.notEqual(setup.player().runId, run);
+    assert.equal(numeric(await page.getByTestId('game-score').innerText()), 0);
+    assert.equal(await page.getByRole('checkbox', { name: 'Ask Luna', exact: true }).isChecked(), false);
+    assert.equal(await page.locator('.luna-controls input:disabled').count(), 4);
+    assert.equal(setup.player().record.best_score, score);
+    assert.equal(setup.calls.length, requests);
+    assert.deepEqual(setup.errors, []);
+  });
+}
 
 test('a Luna-selected Hold is executed and synchronized as one placement without a substitute move', async context => {
-  const setup = await fixture();
+  const setup = await fixture(undefined, true, false, { compression: true });
   context.after(setup.close);
   const { page } = setup;
   setup.controls.hold = true;
   setup.controls.chooseHold = true;
   const original = setup.player().game.piece;
   const next = setup.player().game.queue.peek()[0];
-  await page.getByRole('checkbox', { name: 'Compression', exact: true }).check();
   await page.getByRole('checkbox', { name: 'Ask Luna', exact: true }).check();
   await setup.waitForCalls(1);
   const offered = JSON.parse(setup.calls[0].prompt).placements;
@@ -907,6 +1288,10 @@ test('Luna snapshots live settings, prices actual usage, and cannot apply a move
   assert.ok(numeric(await page.getByTestId('cache-request-adjustment').textContent()) > 0);
   assert.match(await page.getByTestId('compression-adjustment').innerText(), /^-\$/);
   assert.match(await page.getByTestId('cache-adjustment').innerText(), /^\+\$/);
+  const costBeforeSwitches = await page.getByTestId('ai-cost').textContent();
+  await page.getByRole('checkbox', { name: 'Compression', exact: true }).uncheck();
+  await page.getByRole('checkbox', { name: 'Cache', exact: true }).uncheck();
+  assert.equal(await page.getByTestId('ai-cost').textContent(), costBeforeSwitches);
   await page.getByRole('button', { name: 'Stop Luna', exact: true }).click();
   setup.release();
   await waitRequests(page, 3);
@@ -936,9 +1321,8 @@ test('Luna snapshots live settings, prices actual usage, and cannot apply a move
   assert.ok(compressionDelta < 0 && cacheDelta < 0);
   assert.ok(Math.abs(before + compressionDelta + cacheDelta - expected) < 3e-8);
   const costText = await page.getByTestId('ai-cost').textContent();
-  await page.getByRole('checkbox', { name: 'Compression', exact: true }).uncheck();
-  await page.getByRole('checkbox', { name: 'Cache', exact: true }).uncheck();
-  assert.equal(await page.getByTestId('ai-cost').textContent(), costText);
+  assert.equal(await page.getByRole('checkbox', { name: 'Compression', exact: true }).isDisabled(), true);
+  assert.equal(await page.getByRole('checkbox', { name: 'Cache', exact: true }).isDisabled(), true);
   assert.equal(await page.getByTestId('cache-result-label').innerText(), 'Cache hit');
   assert.equal(numeric(await page.getByTestId('compression-adjustment').textContent()), compressionDelta);
   assert.equal(numeric(await page.getByTestId('cache-adjustment').textContent()), cacheDelta);
@@ -1006,7 +1390,7 @@ test('Luna snapshots live settings, prices actual usage, and cannot apply a move
   assert.deepEqual(setup.errors, []);
 });
 
-test('prompt inspection freezes the displayed request while a stopped in-flight response is still billed', async context => {
+test('prompt inspection preserves Luna selection, freezes receipts and resumes on close', async context => {
   const setup = await fixture();
   context.after(setup.close);
   const { page } = setup;
@@ -1028,25 +1412,27 @@ test('prompt inspection freezes the displayed request while a stopped in-flight 
   await waitRequests(page, 2);
   assert.equal(await page.getByTestId('sent-prompt').textContent(), setup.calls[0].prompt);
   assert.equal(await page.getByTestId('compression-after').locator('pre').textContent(), setup.calls[0].packed);
-  assert.equal(await page.getByRole('checkbox', { name: 'Ask Luna', exact: true }).isChecked(), false);
+  assert.equal(await page.getByRole('checkbox', { name: 'Ask Luna', exact: true }).isChecked(), true);
   assert.equal(await page.locator('.game-canvas').getAttribute('data-pieces'), '1');
   await page.getByRole('button', { name: 'Close prompt', exact: true }).click();
+  await setup.waitForCalls(3);
+  await page.getByRole('checkbox', { name: 'Ask Luna', exact: true }).uncheck();
   await page.getByRole('button', { name: 'Inspect last prompt', exact: true }).click();
   assert.equal(await page.getByTestId('sent-prompt').textContent(), setup.calls[1].prompt);
   assert.equal(await page.getByTestId('compression-before').locator('pre').textContent(), setup.calls[1].verbose);
   assert.match(await page.getByTestId('compression-verdict').textContent() ?? '', /Compression was ON/);
   await page.getByRole('button', { name: 'Close prompt', exact: true }).click();
-  assert.equal(setup.calls.length, 2);
+  setup.release();
+  await waitRequests(page, 3);
+  assert.equal(setup.calls.length, 3);
   assert.deepEqual(setup.errors, []);
 });
 
 test('cache activity runs live and preserves selected hits and misses as later replies arrive', { timeout: 18000 }, async context => {
-  const setup = await fixture();
+  const setup = await fixture(undefined, true, false, { compression: true, cache: true });
   context.after(setup.close);
   const { page } = setup;
   setup.controls.hold = true;
-  await page.getByRole('checkbox', { name: 'Cache', exact: true }).check();
-  await page.getByRole('checkbox', { name: 'Compression', exact: true }).check();
   await page.getByRole('checkbox', { name: 'Ask Luna', exact: true }).check();
   await setup.waitForCalls(1);
   setup.controls.mixedCache = true;
@@ -1105,11 +1491,10 @@ test('cache activity runs live and preserves selected hits and misses as later r
 });
 
 test('a cache write alone shows a premium, while missing usage or prices never become free', { timeout: 18000 }, async context => {
-  const setup = await fixture();
+  const setup = await fixture(undefined, true, false, { cache: true });
   context.after(setup.close);
   const { page } = setup;
   setup.controls.hold = true;
-  await page.getByRole('checkbox', { name: 'Cache', exact: true }).check();
   await page.getByRole('checkbox', { name: 'Ask Luna', exact: true }).check();
   await setup.waitForCalls(1);
   await page.getByRole('button', { name: 'Stop Luna', exact: true }).click();
@@ -1131,8 +1516,9 @@ test('a cache write alone shows a premium, while missing usage or prices never b
   setup.controls.hold = false;
   setup.controls.fail = true;
   await page.getByRole('checkbox', { name: 'Ask Luna', exact: true }).check();
-  await page.getByText('Test model unavailable.', { exact: true }).waitFor();
-  assert.equal(await page.getByRole('checkbox', { name: 'Ask Luna', exact: true }).isChecked(), false);
+  await page.getByRole('alert').filter({ hasText: 'Test model unavailable.' }).waitFor();
+  assert.equal(await page.getByRole('checkbox', { name: 'Ask Luna', exact: true }).isChecked(), true);
+  await page.getByRole('checkbox', { name: 'Ask Luna', exact: true }).uncheck();
   assert.equal(setup.player().record.attempts, 2);
   assert.equal(setup.player().metrics.requests, 1);
   await page.getByText('AI COST / PENDING USAGE', { exact: true }).waitFor();
@@ -1148,11 +1534,9 @@ test('a cache write alone shows a premium, while missing usage or prices never b
 });
 
 test('the running cache history is bounded, survives a new game, and never reconstructs absent replies', { timeout: 40000 }, async context => {
-  const setup = await fixture();
+  const setup = await fixture(undefined, true, false, { compression: true, cache: true });
   context.after(setup.close);
   const { page } = setup;
-  await page.getByRole('checkbox', { name: 'Compression', exact: true }).check();
-  await page.getByRole('checkbox', { name: 'Cache', exact: true }).check();
   await page.getByRole('checkbox', { name: 'Ask Luna', exact: true }).check();
   await page.waitForFunction(() => Number(document.querySelector('[data-testid="ai-requests"]')?.textContent?.replace(/\D/g, '')) >= 22, null, { timeout: 32000 });
   await page.getByRole('button', { name: 'Stop Luna', exact: true }).click();
@@ -1195,11 +1579,12 @@ test('private usage reaches the ticker even when the player is outside every leg
   assert.equal(setup.application.room.view().pointsLeaderboard.some(entry => entry.id === player.record.id), false);
   setup.controls.fail = true;
   await page.getByRole('checkbox', { name: 'Ask Luna', exact: true }).check();
-  await page.getByText('Test model unavailable.', { exact: true }).waitFor();
+  await page.getByRole('alert').filter({ hasText: 'Test model unavailable.' }).waitFor();
   await page.getByText('AI COST / PENDING USAGE', { exact: true }).waitFor();
   assert.equal(player.record.attempts, 1);
   assert.equal(player.metrics.requests, 0);
-  assert.equal(await page.getByRole('checkbox', { name: 'Ask Luna', exact: true }).isChecked(), false);
+  assert.equal(await page.getByRole('checkbox', { name: 'Ask Luna', exact: true }).isChecked(), true);
+  await page.getByRole('checkbox', { name: 'Ask Luna', exact: true }).uncheck();
   assert.deepEqual(setup.errors, []);
 });
 
@@ -1216,7 +1601,7 @@ test('ordinary play continues past thirty seconds with no timer or forced recap'
 });
 
 test('returning sentence sessions retain their blocks, costs and options on restart', async context => {
-  const setup = await fixture();
+  const setup = await fixture(undefined, true, false, { compression: true, cache: true });
   context.after(setup.close);
   const { page } = setup;
   const previous = setup.application.room.join('Old Player', setup.application.room.code, undefined, 'prototype', 'old token pieces');
@@ -1234,8 +1619,8 @@ test('returning sentence sessions retain their blocks, costs and options on rest
   const cost = await page.getByTestId('ai-cost').textContent();
   assert.equal(await page.getByTestId('cache-unclassified').textContent(), '1 earlier request unclassified');
   assert.equal(await page.getByTestId('cache-totals').textContent(), '0 hits / 0 misses');
-  await page.getByRole('checkbox', { name: 'Cache', exact: true }).check();
-  await page.getByRole('checkbox', { name: 'Compression', exact: true }).check();
+  assert.equal(await page.getByRole('checkbox', { name: 'Cache', exact: true }).isDisabled(), true);
+  assert.equal(await page.getByRole('checkbox', { name: 'Compression', exact: true }).isDisabled(), true);
   assert.equal(await page.locator('.game-canvas').getAttribute('data-status'), 'paused');
   const run = setup.player().runId;
   setup.player().started -= 3000;
@@ -1253,7 +1638,7 @@ test('returning sentence sessions retain their blocks, costs and options on rest
   assert.deepEqual(setup.errors, []);
 });
 
-test('hidden tabs and reconnects stop Luna without dropping charged usage', { timeout: 20000 }, async context => {
+test('hidden tabs and reconnects preserve Luna without dropping charged usage or applying stale moves', { timeout: 20000 }, async context => {
   for (const transition of ['hidden', 'disconnect']) await context.test(transition, async child => {
     const setup = await fixture();
     child.after(setup.close);
@@ -1261,15 +1646,21 @@ test('hidden tabs and reconnects stop Luna without dropping charged usage', { ti
     setup.controls.hold = true;
     await page.getByRole('checkbox', { name: 'Ask Luna', exact: true }).check();
     await setup.waitForCalls(1);
-    if (transition === 'hidden') await page.evaluate(() => { Object.defineProperty(document, 'hidden', { configurable: true, get: () => true }); document.dispatchEvent(new Event('visibilitychange')); });
-    else for (const socket of setup.application.io.sockets.sockets.values()) socket.conn.close();
+    await page.evaluate(() => { Object.defineProperty(document, 'hidden', { configurable: true, get: () => true }); document.dispatchEvent(new Event('visibilitychange')); });
+    if (transition === 'disconnect') for (const socket of setup.application.io.sockets.sockets.values()) socket.conn.close();
     setup.release();
     await page.locator('.tetris-app[data-playing="true"]').waitFor();
     await waitRequests(page, 1);
-    assert.equal(await page.getByRole('checkbox', { name: 'Ask Luna', exact: true }).isChecked(), false);
+    assert.equal(await page.getByRole('checkbox', { name: 'Ask Luna', exact: true }).isChecked(), true);
     assert.equal(setup.player().game.pieces, 0);
     assert.equal(setup.player().metrics.requests, 1);
     assert.equal(setup.calls.length, 1);
+    await page.evaluate(() => { Object.defineProperty(document, 'hidden', { configurable: true, get: () => false }); document.dispatchEvent(new Event('visibilitychange')); });
+    await setup.waitForCalls(2);
+    setup.release();
+    await waitPieces(page, 1);
+    await page.getByRole('checkbox', { name: 'Ask Luna', exact: true }).uncheck();
+    assert.equal(setup.controls.maxInFlight, 1);
     assert.deepEqual(setup.errors, []);
   });
 });
@@ -1288,11 +1679,13 @@ test('the game, cost ticker and controls fit laptop and phone viewports with vis
       const colors = new Set<string>();
       for (let offset = 0; offset < pixels.length; offset += 16) colors.add(`${pixels[offset]},${pixels[offset + 1]},${pixels[offset + 2]}`);
       const targets = [...document.querySelectorAll('.game-controls button, .game-switch input, .cache-receipt button')].map(element => { const rect = element.getBoundingClientRect(); return { name: element.getAttribute('aria-label'), width: rect.width, height: rect.height }; });
-      return { width: innerWidth, height: innerHeight, documentWidth: document.documentElement.scrollWidth, boxes, colors: colors.size, targets };
+      const typography = [...document.querySelectorAll<HTMLElement>('.game-switch')].map(element => ({ name: element.querySelector('input')?.getAttribute('aria-label'), fontSize: parseFloat(getComputedStyle(element).fontSize), detailSize: element.querySelector('small') ? parseFloat(getComputedStyle(element.querySelector('small')!).fontSize) : null, clipped: element.scrollWidth > element.clientWidth + 1 }));
+      return { width: innerWidth, height: innerHeight, documentWidth: document.documentElement.scrollWidth, boxes, colors: colors.size, targets, typography };
     });
     assert.ok(layout.documentWidth <= layout.width, JSON.stringify(layout));
     for (const box of layout.boxes) assert.ok(box.top >= 0 && box.bottom <= layout.height + 1 && box.left >= 0 && box.right <= layout.width && !box.clipped, JSON.stringify({ viewport, box }));
     for (const target of layout.targets) assert.ok(target.width >= 44 && target.height >= 44, JSON.stringify({ viewport, target }));
+    for (const text of layout.typography) assert.ok(text.fontSize >= 12 && !text.clipped && (text.detailSize === null || text.detailSize >= (viewport.width <= 480 ? 10 : 9)), JSON.stringify({ viewport, text }));
     assert.ok(layout.colors > 4, 'The canvas must contain visible board and piece pixels');
     await page.screenshot({ path: path.join(screenshots, `tetris-${viewport.width}.png`), animations: 'disabled' });
   }

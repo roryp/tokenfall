@@ -276,7 +276,7 @@ export class Room {
       if (error instanceof McpLookupError) {
         player.record.attempts -= 1;
         this.save(player);
-        throw new RequestError(error.message, 'mcp');
+        throw new RequestError(error.message, error.reason === 'context' ? 'mcp-context' : 'mcp');
       }
       throw error;
     } finally { this.pendingTokens.delete(player.record.id); release(); }
