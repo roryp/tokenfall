@@ -123,6 +123,61 @@ The image runs as non-root Node 24 and listens on port 3100. Managed identity pr
 
 Cloud state uses SQLite with `DELETE` journaling and full synchronization on the existing Azure Files mount. Keep one replica, one active revision, and no traffic splitting: this is a single-writer service. The mount's `nobrl` option and shared-key authentication are required by the existing Container Apps SMB setup; secure transfer remains enabled. Active boards do not survive a process restart, but recorded usage, best scores, sentences, and player credentials do. The restored browser no longer forces sentence-based sessions into classic games.
 
+## Reset Leaderboard And History
+
+### Local Reset Panel (Authentication Pending)
+
+The in-app reset panel is available for local testing only. Enable it explicitly on a loopback development server:
+
+```powershell
+$env:LOCAL_ROOM_MAINTENANCE = 'true'
+$env:HOST = '127.0.0.1'
+$env:DATA_DIRECTORY = 'data/maintenance-preview'
+npm run build
+npm start
+```
+
+Open **Room maintenance** beside the room code. Opening stops Luna and pauses/syncs your game. Select **Leaderboard + history** or **Scores only**, review the counts, and enter the room code. Other games must be paused and pending AI requests must finish first. Refresh the preview after any new results or room changes. Cancelling leaves data unchanged and Luna off.
+
+Every reset verifies a recovery backup before writing. Full reset clears saved players, both leaderboards, browser receipts and old sessions; scores-only preserves identities and AI accounting and offers **Rejoin game**. The room code stays the same. Database and cached-game state reset together without restarting the server. Confirmations expire after two minutes and cannot be reused.
+
+There is **no authentication yet**. The feature is off by default, startup rejects enabling it with a public bind address, production mode or managed identity, and the endpoints reject forwarded and non-local/cross-origin requests. This is not a substitute for admin authentication. Do not expose the local test server through a tunnel; leave this flag unset on Azure until authentication is implemented.
+
+### Maintenance Scripts
+
+The default `all` reset **deletes saved players**, both leaderboard lists, scores, sentences, sessions, and in-app AI usage/cost history. Everyone must join again. It replenishes the application's room allowance; it does **not** erase Azure billing or provider-side caches. The room code/link, deployment configuration, and recovery backups stay intact.
+
+Preview the deployed room without changing data:
+
+```powershell
+npm run reset:azure
+```
+
+Apply using the room code printed by the preview:
+
+```powershell
+npm run reset:azure -- -Apply -ConfirmRoom CBB8C7
+```
+
+The Azure wrapper uses the existing `tokenfall-dev` azd environment; select another with `-Environment`. It requires PowerShell 7, `az`, `azd`, and access to execute commands and restart the existing Container App. It refuses active players or pending AI requests, creates and verifies a SQLite backup, clears data transactionally, restarts the same revision to discard cached games, and verifies the public lists are empty. It does not provision or redeploy anything. The backup path is printed; keep it private because it contains the original player data.
+
+The wrapper sends the checksum-verified script over one authenticated exec connection; credentials are never printed. If Azure returns HTTP 429, respect its cooldown before rerunning. Reset writes are not automatically retried.
+
+For a **stopped local server**, use the database in its actual data directory:
+
+```powershell
+npm run reset -- --database data/tokenfall.sqlite
+npm run reset -- --database data/tokenfall.sqlite --apply --confirm-room YOUR01 --server-stopped
+```
+
+Replace `YOUR01` with the preview's room code, then start the server again. Do not use `--server-stopped` while that database's server is running. `--mode scores` locally or `-Mode scores` on Azure only zeroes scores and retains player entries and usage; it does **not** empty the leaderboard. The reset does not delete local evaluation reports, screenshots, or previous backups.
+
+Focused tests:
+
+```powershell
+node --test --test-name-pattern="room reset script" tests/server.test.ts
+```
+
 ## Verify
 
 ```powershell

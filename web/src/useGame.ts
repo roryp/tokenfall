@@ -5,7 +5,7 @@ import type { Socket } from 'socket.io-client';
 import { Game, FPS, refreshPlacement } from '../../shared/game.ts';
 import type { Action, GameView } from '../../shared/game.ts';
 import { costForUsage, emptyMetrics, MCP_LOOKUP_TIMEOUT_MS } from '../../shared/protocol.ts';
-import type { AiOptions, ClientEvents, Insight, InputAck, InputBatch, JoinResult, Metrics, PlayerUsage, Reply, RoomView, ServerEvents, TokenAllowance } from '../../shared/protocol.ts';
+import type { AiOptions, ClientEvents, Insight, InputAck, InputBatch, JoinResult, Metrics, PlayerUsage, Reply, RoomResetMode, RoomView, ServerEvents, TokenAllowance } from '../../shared/protocol.ts';
 
 type GameSocket = Socket<ServerEvents, ClientEvents>;
 interface Session { token: string; name: string; room: string }
@@ -47,6 +47,7 @@ export function useGame() {
   const [autopilotStatus, setAutopilotStatus] = useState<'retrying' | 'blocked' | null>(null);
   const [inspectionPaused, setInspectionPaused] = useState(false);
   const [requestOptions, setRequestOptions] = useState<AiOptions | null>(null);
+  const [resetVersion, setResetVersion] = useState(0);
   const socket = useRef<GameSocket | null>(null);
   const game = useRef<Game | null>(null);
   const roomRef = useRef<RoomView | null>(null);
@@ -112,6 +113,46 @@ export function useGame() {
     setInspectionPaused(false);
   }
 
+  async function prepareMaintenance() {
+    toggleAutopilot(false);
+    pauseForInspection();
+    return !active.current || await flushAll();
+  }
+
+  function clearRoomSession(mode: RoomResetMode) {
+    stopAutopilot();
+    requestSerial.current += 1;
+    requestPending.current = false;
+    active.current = false;
+    joiningRef.current = false;
+    joinFailed.current = true;
+    runId.current = '';
+    sequence.current = 0;
+    sentEvents.current = 0;
+    pendingBatch.current = null;
+    sending.current = null;
+    game.current = null;
+    historyPlayer.current = '';
+    resumeAfterInspection();
+    setJoined(false);
+    setJoining(false);
+    setPlayer(null);
+    setBusy(false);
+    setRequestOptions(null);
+    setInsight(null);
+    setRequestHistory([]);
+    setView(new Game('preview').view());
+    setResetVersion(version => version + 1);
+    if (mode === 'all') {
+      session.current = null;
+      setSessionName(undefined);
+      setMetrics(emptyMetrics());
+      setAllowance(null);
+      setUnmeteredRequests(0);
+      try { sessionStorage.removeItem('tokenfall-session'); } catch { return; }
+    }
+  }
+
   function deferAutopilot(message: string, retryable = true, retryAfterMs = 0) {
     if (!pilotActive.current) return;
     retryCount.current += 1;
@@ -174,11 +215,8 @@ export function useGame() {
         joinFailed.current = true;
         setNotice(!error && !reply.ok ? reply.error : 'Could not connect. Join again to retry.');
         if (!error && !reply.ok && reply.code === 'session') {
-          stopAutopilot();
-          session.current = null;
-          setSessionName(undefined);
+          clearRoomSession('all');
           joinFailed.current = false;
-          try { sessionStorage.removeItem('tokenfall-session'); } catch { return; }
         }
         return;
       }
@@ -361,6 +399,10 @@ export function useGame() {
   const onJoin = useEffectEvent(join);
   const onFlush = useEffectEvent(flush);
   const onPilotStep = useEffectEvent(requestMove);
+  const onRoomReset = useEffectEvent((reset: { mode: RoomResetMode }) => {
+    clearRoomSession(reset.mode);
+    setNotice(reset.mode === 'all' ? 'Room history cleared. Join again for a new game.' : 'Scores cleared. Rejoin for a new game; AI usage was retained.');
+  });
 
   useEffect(() => {
     const timer = setInterval(() => void onPilotStep(), 100);
@@ -393,11 +435,13 @@ export function useGame() {
       if (session.current?.room === nextRoom.code && !active.current && !joiningRef.current && !joinFailed.current) onJoin();
     });
     connection.on('usage', usage => {
+      if (!active.current) return;
       setMetrics(current => usage.metrics.requests >= current.requests ? usage.metrics : current);
       setUnmeteredRequests(usage.unmeteredRequests);
       setAllowance(current => !current || (usage.allowance && usage.allowance.used >= current.used) ? usage.allowance ?? null : current);
     });
     connection.on('notice', setNotice);
+    connection.on('roomReset', onRoomReset);
     return () => { active.current = false; pilotActive.current = false; pilotEpoch.current += 1; connection.disconnect(); socket.current = null; };
   }, []);
 
@@ -432,5 +476,5 @@ export function useGame() {
 
   const rates = room?.pricing.snapshot?.usdPerMillion;
   const cost = rates ? costForUsage(metrics, rates) : null;
-  return { room, connected, joined, joining, player, sessionName, view, metrics, allowance, adjustAllowance, insight, requestHistory, cost, busy, notice, setNotice, options, setOptions, autopilot, autopilotStatus, inspectionPaused, pauseForInspection, resumeAfterInspection, retryAutopilot, toggleAutopilot, requestOptions, unmeteredRequests, join, act, restart };
+  return { room, connected, joined, joining, player, sessionName, view, metrics, allowance, adjustAllowance, insight, requestHistory, cost, busy, notice, setNotice, options, setOptions, autopilot, autopilotStatus, inspectionPaused, pauseForInspection, resumeAfterInspection, prepareMaintenance, resetVersion, retryAutopilot, toggleAutopilot, requestOptions, unmeteredRequests, join, act, restart };
 }

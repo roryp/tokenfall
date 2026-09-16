@@ -4,12 +4,13 @@ import path from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { Game, FPS, placementsFor } from '../shared/game.ts';
 import { costForUsage, emptyMetrics, MAX_REQUEST_TOKENS, pointsPerCent, tokenAllowance } from '../shared/protocol.ts';
-import type { AiOptions, InputAck, InputBatch, JoinResult, LeaderboardEntry, Metrics, PlayerUsage, PromptPreview, RoomView, TokenPricing } from '../shared/protocol.ts';
+import type { AiOptions, InputAck, InputBatch, JoinResult, LeaderboardEntry, Metrics, PlayerUsage, PromptPreview, RoomResetMode, RoomResetPreview, RoomView, TokenPricing } from '../shared/protocol.ts';
 import type { AppConfig } from './config.ts';
 import { AI_COOLDOWN_MS, AUTOPILOT_COOLDOWN_MS, MAX_OUTPUT_TOKENS, maxCompletionTokens, ModelGate, PREFIX_TOKENS, ROOM_REQUEST_LIMIT, ROOM_TOKEN_BUDGET, RequestError } from './model.ts';
 import type { ModelGateway } from './model.ts';
 import { addUsage, buildPrompts, gameTokens } from './tokens.ts';
 import { MAX_MCP_CONTEXT_TOKENS, McpLookupError } from './mcp.ts';
+import { resetRoom } from '../scripts/reset-room.ts';
 
 interface PlayerRecord {
   id: string;
@@ -45,6 +46,8 @@ export class Room {
   pricing: TokenPricing = { status: 'loading', snapshot: null };
   private previewTimes = new Map<string, number>();
   private pendingTokens = new Map<string, number>();
+  private resetting = false;
+  private resetPreviews = new Map<string, { mode: RoomResetMode; expiresAt: number; fingerprint: string }>();
   config: AppConfig;
   gateway: ModelGateway;
 
@@ -75,7 +78,61 @@ export class Room {
   get online() { return [...this.players.values()].filter(player => player.socketId !== null).length; }
   records() { return this.database.prepare('SELECT * FROM players ORDER BY best_score DESC, best_lines DESC, updated ASC').all() as unknown as PlayerRecord[]; }
 
+  get maintenanceStatus() {
+    return {
+      online: this.online,
+      activeGames: [...this.players.values()].filter(player => player.socketId && player.game.status === 'playing').length,
+      pendingRequests: this.pendingTokens.size,
+      resetting: this.resetting,
+    };
+  }
+
+  private assertAvailable(player?: Player) {
+    if (this.resetting) throw new RequestError('Room reset in progress. Try again shortly.', 'maintenance');
+    if (player && this.players.get(player.record.id) !== player) throw new RequestError('Your previous session expired. Join again.', 'session');
+  }
+
+  private resetFingerprint() { return createHash('sha256').update(JSON.stringify(this.records())).digest('hex'); }
+
+  previewReset(mode: RoomResetMode): RoomResetPreview {
+    this.assertAvailable();
+    const now = Date.now();
+    for (const [id, preview] of this.resetPreviews) if (preview.expiresAt <= now) this.resetPreviews.delete(id);
+    if (this.resetPreviews.size >= 20) this.resetPreviews.delete(this.resetPreviews.keys().next().value!);
+    const confirmationId = randomUUID();
+    const expiresAt = now + 120000;
+    this.resetPreviews.set(confirmationId, { mode, expiresAt, fingerprint: this.resetFingerprint() });
+    const records = this.records();
+    const totals = this.totals();
+    return { room: this.code, mode, confirmationId, expiresAt, before: { players: records.length, nonzeroScores: records.filter(record => record.best_score > 0).length, requests: totals.metrics.requests, usedTokens: totals.metrics.input + totals.metrics.output, attempts: totals.attempts } };
+  }
+
+  async reset(mode: RoomResetMode, confirmRoom: string, confirmationId?: string) {
+    this.assertAvailable();
+    if (confirmRoom !== this.code) throw new RequestError('Enter the current room code to confirm the reset.', 'validation');
+    if (confirmationId !== undefined) {
+      const preview = this.resetPreviews.get(confirmationId);
+      this.resetPreviews.delete(confirmationId);
+      if (!preview || preview.expiresAt <= Date.now() || preview.mode !== mode || preview.fingerprint !== this.resetFingerprint()) throw new RequestError('The room changed or this preview expired. Refresh the preview before resetting.', 'reset-preview');
+    }
+    const assertIdle = async () => {
+      const status = this.maintenanceStatus;
+      if (status.activeGames > 0) throw new RequestError('Pause all games before resetting the room.', 'room-active');
+      if (status.pendingRequests > 0 || this.gate.reserved > 0) throw new RequestError('Wait for pending Luna requests before resetting the room.', 'room-active');
+    };
+    this.resetting = true;
+    try {
+      await assertIdle();
+      const result = await resetRoom({ databasePath: path.join(this.config.dataDirectory, 'tokenfall.sqlite'), mode, apply: true, confirmRoom, assertIdle });
+      this.players.clear();
+      this.previewTimes.clear();
+      this.resetPreviews.clear();
+      return result;
+    } finally { this.resetting = false; }
+  }
+
   save(player: Player) {
+    this.assertAvailable(player);
     player.record.metrics = JSON.stringify(player.metrics);
     const record = player.record;
     this.database.prepare(`INSERT INTO players (id, token_hash, name, best_score, best_lines, best_level, metrics, attempts, updated, token_text, token_limit)
@@ -102,6 +159,7 @@ export class Room {
   }
 
   join(name: string, code: string, token: string | undefined, socketId: string, text?: string, classic = false, tokenLimit?: number): JoinResult {
+    this.assertAvailable();
     if (code !== this.code) throw new RequestError('That room code is not active.', 'room');
     if (classic && text !== undefined) throw new RequestError('Classic games do not use token text.', 'validation');
     const now = Date.now();
@@ -157,6 +215,7 @@ export class Room {
   }
 
   setAllowance(player: Player, tokenLimit: number): PlayerUsage {
+    this.assertAvailable(player);
     const current = this.usage(player).allowance;
     this.validateAllowance(tokenLimit, current.used + current.reserved + current.unconfirmed);
     player.record.token_limit = tokenLimit;
@@ -181,10 +240,11 @@ export class Room {
     if (player.game.status === 'playing') player.game.act('pause');
     player.socketId = null;
     player.lastSeen = Date.now();
-    this.save(player);
+    if (!this.resetting) this.save(player);
   }
 
   inputs(player: Player, batch: InputBatch, now = Date.now()): InputAck {
+    this.assertAvailable(player);
     if (batch.runId !== player.runId) throw new RequestError('This input belongs to an earlier game. Reconnect to sync.', 'resync');
     if (batch.sequence <= player.sequence) return this.ack(player);
     if (batch.sequence !== player.sequence + 1) throw new RequestError('An input batch is missing. Reconnect to sync.', 'resync');
@@ -217,6 +277,7 @@ export class Room {
   }
 
   restart(player: Player, text?: string, tokenLimit?: number) {
+    this.assertAvailable(player);
     const now = Date.now();
     if (now - player.started < 2000) throw new RequestError('Wait a moment before restarting.', 'cooldown', 2000);
     if (text !== undefined && text.length === 0) throw new RequestError('Enter some text to make your token blocks.', 'token-setup');
@@ -250,6 +311,7 @@ export class Room {
   }
 
   async assist(player: Player, options: AiOptions) {
+    this.assertAvailable(player);
     if (player.game.status === 'over') throw new RequestError('Start a new game before asking Luna.', 'game-over');
     const totals = this.totals();
     if (totals.attempts >= ROOM_REQUEST_LIMIT) throw new RequestError(`The room AI request allowance is used: 0 of ${ROOM_REQUEST_LIMIT.toLocaleString()} requests left. Manual play is still available.`, 'room-requests');
@@ -322,6 +384,7 @@ export class Room {
       allowance: this.roomAllowance(totals), requestsRemaining: Math.max(0, ROOM_REQUEST_LIMIT - totals.attempts), requestTokenLimit: MAX_REQUEST_TOKENS,
       pricing: this.pricing, unmeteredRequests: Math.max(0, totals.attempts - totals.metrics.requests),
       aiCooldownMs: AI_COOLDOWN_MS, autopilotCooldownMs: AUTOPILOT_COOLDOWN_MS,
+      ...(this.config.localMaintenance ? { maintenance: this.maintenanceStatus } : {}),
     };
   }
 

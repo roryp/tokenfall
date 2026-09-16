@@ -10,6 +10,8 @@
     "dev": "node --watch server/index.ts",
     "start": "node server/index.ts",
     "mcp:server": "node server/mcp-server.ts",
+    "reset": "node scripts/reset-room.ts",
+    "reset:azure": "pwsh -NoProfile -File scripts/reset-room.ps1 -Azure",
     "typecheck": "tsc --noEmit",
     "build": "npm run typecheck && npm --prefix web run build",
     "test": "node --test tests/*.test.ts",

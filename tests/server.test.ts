@@ -1,8 +1,10 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { spawnSync } from 'node:child_process';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { DatabaseSync } from 'node:sqlite';
 import { fileURLToPath } from 'node:url';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
@@ -19,6 +21,7 @@ import { Room } from '../server/room.ts';
 import { buildPrompts, countTokens, gameTokens } from '../server/tokens.ts';
 import { lookaheadSnapshot, lookupBoardFacts, lookupFutureMoves, McpLookupError, MAX_MCP_CONTEXT_TOKENS } from '../server/mcp.ts';
 import { analyzeFutureMoves, boardFactsSchema, lookaheadOutputSchema } from '../server/mcp-server.ts';
+import { resetRoom } from '../scripts/reset-room.ts';
 
 function fixture() {
   const dataDirectory = mkdtempSync(path.join(os.tmpdir(), 'tokenfall-test-'));
@@ -45,6 +48,256 @@ function insightFor(game: Game): Insight {
     prompt: 'Test prompt', outputText: '{}', inputChips: [], outputChips: [],
   };
 }
+
+for (const mode of ['all', 'scores'] as const) test(`room reset script ${mode} mode backs up history and preserves the room`, async () => {
+  const setup = fixture();
+  let room = new Room(setup.config, setup.gateway);
+  try {
+    const session = room.join('Old player', room.code, undefined, 'reset', 'Saved sentence.');
+    const player = room.playerFor('reset');
+    player.record.best_score = 4321;
+    player.record.best_lines = 12;
+    player.record.best_level = 3;
+    player.metrics = { ...emptyMetrics(), requests: 4, input: 10000, output: 100, cached: 1000, reasoning: 20 };
+    player.record.attempts = 5;
+    room.disconnect('reset');
+    room.join('Zero-score player', room.code, undefined, 'zero');
+    room.disconnect('zero');
+    const saved = room.records();
+    const code = room.code;
+    room.close();
+    const databasePath = path.join(setup.dataDirectory, 'tokenfall.sqlite');
+    const preview = await resetRoom({ databasePath, mode });
+    assert.equal(preview.applied, false);
+    assert.deepEqual(preview.before, { players: 2, nonzeroScores: 1, requests: 4, usedTokens: 10100, attempts: 5 });
+    const result = await resetRoom({ databasePath, mode, apply: true, confirmRoom: code, serverStopped: true });
+    assert.equal(result.applied, true);
+    assert.ok(result.backupPath);
+    const recovery = new DatabaseSync(result.backupPath, { readOnly: true });
+    try {
+      assert.deepEqual(recovery.prepare('SELECT * FROM players ORDER BY best_score DESC, best_lines DESC, updated ASC').all(), saved);
+      assert.equal(recovery.prepare("SELECT value FROM settings WHERE key = 'room'").get()!.value, code);
+    } finally { recovery.close(); }
+    room = new Room(setup.config, setup.gateway);
+    assert.equal(room.code, code);
+    if (mode === 'all') {
+      assert.deepEqual(room.view().pointsLeaderboard, []);
+      assert.deepEqual(room.view().leaderboard, []);
+      assert.deepEqual(room.totals(), { metrics: emptyMetrics(), attempts: 0 });
+      assert.equal(room.view().allowance.remaining, ROOM_TOKEN_BUDGET);
+      assert.equal(room.view().requestsRemaining, ROOM_REQUEST_LIMIT);
+      assert.throws(() => room.join(session.name, code, session.token, 'old'), /expired/);
+      const fresh = room.join('Fresh player', code, undefined, 'fresh');
+      assert.notEqual(fresh.playerId, session.playerId);
+      assert.equal(fresh.metrics.requests, 0);
+    } else {
+      assert.equal(room.records().length, 2);
+      assert.ok(room.records().every(record => record.best_score === 0 && record.best_lines === 0 && record.best_level === 1));
+      assert.equal(room.join(session.name, code, session.token, 'old').metrics.requests, 4);
+      assert.equal(room.view().allowance.used, 10100);
+    }
+  } finally { if (room.database.isOpen) room.close(); rmSync(setup.dataDirectory, { recursive: true, force: true }); }
+});
+
+test('room reset script refuses unsafe confirmation, active games, changed data and backup overwrite', async () => {
+  const setup = fixture();
+  const room = new Room(setup.config, setup.gateway);
+  try {
+    room.join('Retained player', room.code, undefined, 'reset-guard');
+    room.disconnect('reset-guard');
+    const databasePath = path.join(setup.dataDirectory, 'tokenfall.sqlite');
+    const options = { databasePath, apply: true, confirmRoom: room.code, serverStopped: true };
+    await assert.rejects(resetRoom({ databasePath: path.join(setup.dataDirectory, 'missing.sqlite') }), /does not exist/);
+    await assert.rejects(resetRoom({ ...options, confirmRoom: 'WRONG0' }), /confirmation does not match/);
+    await assert.rejects(resetRoom({ ...options, confirmRoom: undefined }), /requires --confirm-room/);
+    await assert.rejects(resetRoom({ ...options, serverStopped: false }), /Stop the server/);
+    await assert.rejects(resetRoom({ ...options, backupPath: databasePath }), /overwrite/);
+    await assert.rejects(resetRoom({ ...options, assertIdle: async () => { throw new Error('Players are online'); } }), /Players are online/);
+    let checks = 0;
+    await assert.rejects(resetRoom({ ...options, assertIdle: async () => {
+      if (++checks === 2) room.database.exec('UPDATE players SET best_score = 777');
+    } }), /Players changed/);
+    assert.equal(room.records().length, 1);
+    assert.equal(room.records()[0].best_score, 777);
+  } finally { room.close(); rmSync(setup.dataDirectory, { recursive: true, force: true }); }
+});
+
+test('room reset script CLI previews by default and requires confirmation before clearing all rows', () => {
+  const setup = fixture();
+  let room = new Room(setup.config, setup.gateway);
+  const session = room.join('CLI player', room.code, undefined, 'cli');
+  room.disconnect('cli');
+  const code = room.code;
+  room.close();
+  try {
+    const script = fileURLToPath(new URL('../scripts/reset-room.ts', import.meta.url));
+    const args = [script, '--database', path.join(setup.dataDirectory, 'tokenfall.sqlite')];
+    const preview = spawnSync(process.execPath, args, { encoding: 'utf8' });
+    assert.equal(preview.status, 0, preview.stderr);
+    const summary = JSON.parse(preview.stdout.match(/RESET_RESULT (.+)/)![1]);
+    assert.equal(summary.applied, false);
+    assert.equal(summary.mode, 'all');
+    assert.equal(summary.before.players, 1);
+    assert.equal(spawnSync(process.execPath, [...args, '--apply', '--server-stopped'], { encoding: 'utf8' }).status, 1);
+    assert.equal(spawnSync(process.execPath, [...args, '--apply', '--confirm-room', 'WRONG0', '--server-stopped'], { encoding: 'utf8' }).status, 1);
+    room = new Room(setup.config, setup.gateway);
+    assert.equal(room.records().length, 1);
+    assert.equal(room.records()[0].id, session.playerId);
+    room.close();
+    const applied = spawnSync(process.execPath, [...args, '--apply', '--confirm-room', code, '--server-stopped'], { encoding: 'utf8' });
+    assert.equal(applied.status, 0, applied.stderr);
+    assert.equal(JSON.parse(applied.stdout.match(/RESET_RESULT (.+)/)![1]).after.players, 0);
+    room = new Room(setup.config, setup.gateway);
+    assert.deepEqual(room.view().pointsLeaderboard, []);
+    assert.equal(room.code, code);
+  } finally { if (room.database.isOpen) room.close(); rmSync(setup.dataDirectory, { recursive: true, force: true }); }
+});
+
+for (const mode of ['all', 'scores'] as const) test(`in-app room reset ${mode} clears cached games without allowing stale writes`, async () => {
+  const setup = fixture();
+  const room = new Room(setup.config, setup.gateway);
+  try {
+    const session = room.join('Reset Player', room.code, undefined, 'reset-ui');
+    const player = room.playerFor('reset-ui');
+    player.game.act('hardDrop');
+    player.game.act('pause');
+    player.record.best_score = 1234;
+    player.metrics = { ...emptyMetrics(), requests: 1, input: 2000, output: 20 };
+    player.record.attempts = 1;
+    room.save(player);
+    const previousRun = player.runId;
+    const operation = room.reset(mode, room.code);
+    assert.equal(room.maintenanceStatus.resetting, true);
+    assert.throws(() => room.join('Late join', room.code, undefined, 'late'), /reset in progress/);
+    assert.throws(() => room.setAllowance(player, 100000), /reset in progress/);
+    await assert.rejects(room.reset(mode, room.code), /reset in progress/);
+    const result = await operation;
+    assert.equal(result.applied, true);
+    assert.ok(result.backupPath);
+    assert.equal(room.players.size, 0);
+    assert.equal(room.maintenanceStatus.resetting, false);
+    assert.throws(() => room.save(player), /expired/);
+    assert.throws(() => room.inputs(player, { runId: previousRun, sequence: 1, frame: 0, events: [] }), /expired/);
+    room.disconnect('reset-ui');
+    if (mode === 'all') {
+      assert.deepEqual(room.view().pointsLeaderboard, []);
+      assert.deepEqual(room.view().leaderboard, []);
+      assert.equal(room.view().allowance.used, 0);
+      assert.throws(() => room.join(session.name, room.code, session.token, 'new'), /expired/);
+    } else {
+      assert.equal(room.view().pointsLeaderboard[0].score, 0);
+      assert.equal(room.view().allowance.used, 2020);
+      const rejoined = room.join(session.name, room.code, session.token, 'new');
+      assert.notEqual(rejoined.runId, previousRun);
+      assert.equal(room.playerFor('new').game.pieces, 0);
+      assert.equal(rejoined.metrics.requests, 1);
+    }
+  } finally { room.close(); rmSync(setup.dataDirectory, { recursive: true, force: true }); }
+});
+
+test('in-app room reset refuses active games and pending Luna requests and releases its lock', async () => {
+  const setup = fixture();
+  let release!: (insight: Insight) => void;
+  const room = new Room(setup.config, { complete: async () => new Promise<Insight>(resolve => { release = resolve; }) });
+  try {
+    room.join('Busy Player', room.code, undefined, 'busy');
+    const player = room.playerFor('busy');
+    await assert.rejects(room.reset('all', 'WRONG0'), /room code/);
+    await assert.rejects(room.reset('all', room.code), /Pause all games/);
+    player.game.act('pause');
+    const pending = room.assist(player, { compression: true, cache: false });
+    await assert.rejects(room.reset('all', room.code), /pending Luna requests/);
+    assert.equal(room.maintenanceStatus.resetting, false);
+    release(insightFor(player.game));
+    await pending;
+    assert.equal(room.records()[0].attempts, 1);
+    assert.equal(room.totals().metrics.requests, 1);
+    assert.equal((await room.reset('all', room.code)).after?.players, 0);
+  } finally { room.close(); rmSync(setup.dataDirectory, { recursive: true, force: true }); }
+});
+
+test('local maintenance API is opt-in, validates origin and consumes reset previews once', async () => {
+  const setup = fixture();
+  assert.throws(() => createApplication({ ...setup.config, localMaintenance: true, host: '0.0.0.0' }, setup.gateway), /local loopback/);
+  const application = createApplication({ ...setup.config, localMaintenance: true, host: '127.0.0.1' }, setup.gateway);
+  await new Promise<void>(resolve => application.server.listen(0, '127.0.0.1', resolve));
+  const address = application.server.address() as { port: number };
+  const base = `http://127.0.0.1:${address.port}`;
+  const post = (route: string, payload: object, headers: Record<string, string> = {}) => fetch(`${base}/api/maintenance/${route}`, { method: 'POST', headers: { 'Content-Type': 'application/json', Origin: base, 'X-Room-Maintenance': '1', ...headers }, body: JSON.stringify(payload) });
+  try {
+    application.room.join('Old player', application.room.code, undefined, 'old');
+    application.room.playerFor('old').game.act('pause');
+    assert.equal((await post('preview', { mode: 'all' }, { Origin: 'https://attacker.invalid' })).status, 403);
+    assert.equal((await post('preview', { mode: 'all' }, { 'X-Room-Maintenance': '' })).status, 403);
+    assert.equal((await post('preview', { mode: 'all' }, { 'X-Forwarded-Host': 'public.example' })).status, 403);
+    assert.equal((await post('preview', { mode: 'all', databasePath: '/data/other.sqlite' })).status, 400);
+    const preview = await (await post('preview', { mode: 'all' })).json();
+    assert.equal(preview.before.players, 1);
+    const request = { mode: 'all', confirmRoom: application.room.code, confirmationId: preview.confirmationId };
+    assert.equal((await post('reset', { ...request, confirmRoom: 'WRONG0' })).status, 400);
+    const response = await post('reset', request);
+    assert.equal(response.status, 200);
+    const result = await response.json();
+    assert.equal(result.after.players, 0);
+    assert.equal(result.backup.includes('/'), false);
+    assert.equal(result.backup.includes('\\'), false);
+    assert.equal((await post('reset', request)).status, 409);
+    assert.equal(application.room.players.size, 0);
+    assert.deepEqual(application.room.view().pointsLeaderboard, []);
+    application.room.config.localMaintenance = false;
+    assert.equal((await post('preview', { mode: 'all' })).status, 404);
+    assert.equal(application.room.view().maintenance, undefined);
+  } finally { await application.close(); rmSync(setup.dataDirectory, { recursive: true, force: true }); }
+});
+
+test('in-app room reset rejects changed and expired previews without deleting players', async context => {
+  const setup = fixture();
+  const room = new Room(setup.config, setup.gateway);
+  try {
+    const preview = room.previewReset('all');
+    room.join('New player', room.code, undefined, 'new');
+    room.playerFor('new').game.act('pause');
+    await assert.rejects(room.reset('all', room.code, preview.confirmationId), /room changed/);
+    const current = room.previewReset('scores');
+    await assert.rejects(room.reset('all', room.code, current.confirmationId), /room changed/);
+    context.mock.timers.enable({ apis: ['Date'], now: Date.now() });
+    const expired = room.previewReset('all');
+    context.mock.timers.tick(120001);
+    await assert.rejects(room.reset('all', room.code, expired.confirmationId), /preview expired/);
+    assert.equal(room.records().length, 1);
+    assert.equal(room.maintenanceStatus.resetting, false);
+  } finally { room.close(); rmSync(setup.dataDirectory, { recursive: true, force: true }); }
+});
+
+test('in-app room reset leaves records and sessions intact when the backup cannot be created', async () => {
+  const setup = fixture();
+  const room = new Room(setup.config, setup.gateway);
+  try {
+    room.join('Keep Player', room.code, undefined, 'keep');
+    const player = room.playerFor('keep');
+    player.game.act('pause');
+    player.record.best_score = 777;
+    room.save(player);
+    const before = room.records();
+    const backupDirectory = path.join(setup.dataDirectory, 'backups');
+    writeFileSync(backupDirectory, 'Blocked backup directory');
+    await assert.rejects(room.reset('all', room.code));
+    assert.deepEqual(room.records(), before);
+    assert.equal(room.playerFor('keep'), player);
+    assert.equal(room.maintenanceStatus.resetting, false);
+    rmSync(backupDirectory);
+    assert.equal((await room.reset('all', room.code)).after?.players, 0);
+  } finally { room.close(); rmSync(setup.dataDirectory, { recursive: true, force: true }); }
+});
+
+test('local maintenance configuration is explicit and refuses production or public binding', () => {
+  const environment = { AZURE_OPENAI_ENDPOINT: 'https://fixture.invalid', AZURE_OPENAI_DEPLOYMENT: 'fixture', AZURE_TENANT_ID: 'fixture', AZURE_CLIENT_ID: '', HOST: '127.0.0.1', NODE_ENV: 'development', LOCAL_ROOM_MAINTENANCE: 'false' };
+  assert.equal(loadConfig(environment).localMaintenance, false);
+  assert.equal(loadConfig({ ...environment, LOCAL_ROOM_MAINTENANCE: 'true' }).localMaintenance, true);
+  for (const changes of [{ HOST: '0.0.0.0' }, { NODE_ENV: 'production' }, { AZURE_CLIENT_ID: 'cloud-identity' }]) {
+    assert.throws(() => loadConfig({ ...environment, ...changes, LOCAL_ROOM_MAINTENANCE: 'true' }), /local loopback/);
+  }
+});
 
 test('AI allowance counts output and MCP input once and distinguishes unavailable reservations from reported spend', () => {
   const usage = { ...emptyMetrics(), input: 12000, output: 2000, reasoning: 1500, cached: 4000 };

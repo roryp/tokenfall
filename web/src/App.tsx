@@ -140,6 +140,10 @@ export default function App() {
   useEffect(() => { if (editingSentence) sentenceDialog.current?.showModal(); }, [editingSentence]);
   useEffect(() => { if (editingAllowance) allowanceDialog.current?.showModal(); }, [editingAllowance]);
   useEffect(() => { if (mcpOpen) mcpDialog.current?.showModal(); }, [mcpOpen]);
+  useEffect(() => {
+    if (!game.resetVersion) return;
+    for (const dialog of [promptDialog, sentenceDialog, allowanceDialog, mcpDialog]) dialog.current?.close();
+  }, [game.resetVersion]);
 
   function inspect(instructions = false) {
     const selected = latest ?? (instructions ? game.requestHistory[0]?.insight : null);

@@ -5,6 +5,8 @@
 !server/**
 !shared/
 !shared/**
+!scripts/
+!scripts/reset-room.ts
 !web/
 !web/dist/
 !web/dist/**

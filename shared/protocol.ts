@@ -149,6 +149,24 @@ export interface LeaderboardEntry {
   online: boolean;
   metrics: Metrics;
 }
+export type RoomResetMode = 'all' | 'scores';
+export interface RoomMaintenanceStatus { online: number; activeGames: number; pendingRequests: number; resetting: boolean }
+export interface RoomResetSummary { players: number; nonzeroScores: number; requests: number; usedTokens: number; attempts: number }
+export interface RoomResetPreview {
+  room: string;
+  mode: RoomResetMode;
+  confirmationId: string;
+  expiresAt: number;
+  before: RoomResetSummary;
+}
+export interface RoomResetResult {
+  id: string;
+  room: string;
+  mode: RoomResetMode;
+  before: RoomResetSummary;
+  after: RoomResetSummary;
+  backup: string;
+}
 export interface RoomView {
   code: string;
   online: number;
@@ -168,6 +186,7 @@ export interface RoomView {
   unmeteredRequests: number;
   aiCooldownMs: number;
   autopilotCooldownMs: number;
+  maintenance?: RoomMaintenanceStatus;
 }
 export interface PlayerUsage {
   metrics: Metrics;
@@ -191,6 +210,7 @@ export interface ServerEvents {
   room: (room: RoomView) => void;
   usage: (usage: PlayerUsage) => void;
   notice: (message: string) => void;
+  roomReset: (reset: { id: string; mode: RoomResetMode }) => void;
 }
 export interface ClientEvents {
   join: (data: { name: string; room: string; token?: string; text?: string; classic?: boolean; tokenLimit?: number }, reply: (result: Reply<JoinResult>) => void) => void;

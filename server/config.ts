@@ -15,6 +15,7 @@ export interface AppConfig {
   pricingRegion?: string;
   managedIdentityClientId?: string;
   sqliteJournalMode?: 'WAL' | 'DELETE';
+  localMaintenance?: boolean;
 }
 
 export function loadConfig(environment: NodeJS.ProcessEnv = process.env): AppConfig {
@@ -38,10 +39,12 @@ export function loadConfig(environment: NodeJS.ProcessEnv = process.env): AppCon
   if (host !== '127.0.0.1' && host !== '0.0.0.0') throw new Error('HOST must be loopback or 0.0.0.0.');
   const sqliteJournalMode = values.SQLITE_JOURNAL_MODE ?? 'WAL';
   if (sqliteJournalMode !== 'WAL' && sqliteJournalMode !== 'DELETE') throw new Error('Unsupported SQLite journal mode.');
+  const localMaintenance = values.LOCAL_ROOM_MAINTENANCE === 'true';
+  if (localMaintenance && (host !== '127.0.0.1' || values.NODE_ENV === 'production' || values.AZURE_CLIENT_ID)) throw new Error('Unauthenticated room maintenance is restricted to a local loopback development server.');
   return {
     port, host, endpoint: values.AZURE_OPENAI_ENDPOINT, deployment: values.AZURE_OPENAI_DEPLOYMENT,
     tenantId: values.AZURE_TENANT_ID, dataDirectory: path.resolve(values.DATA_DIRECTORY ?? path.join(ROOT, 'data')), publicUrl: values.PUBLIC_BASE_URL,
     pricingRegion: values.AZURE_LOCATION,
-    managedIdentityClientId: values.AZURE_CLIENT_ID, sqliteJournalMode,
+    managedIdentityClientId: values.AZURE_CLIENT_ID, sqliteJournalMode, localMaintenance,
   };
 }

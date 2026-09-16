@@ -1,11 +1,12 @@
 import { createServer } from 'node:http';
+import { randomUUID } from 'node:crypto';
 import path from 'node:path';
 import express from 'express';
 import { Server } from 'socket.io';
 import { z } from 'zod';
 import { ACTIONS } from '../shared/game.ts';
 import { MAX_REQUEST_TOKENS, MAX_TOKEN_ALLOWANCE } from '../shared/protocol.ts';
-import type { ClientEvents, ServerEvents, Reply } from '../shared/protocol.ts';
+import type { ClientEvents, ServerEvents, Reply, RoomResetResult } from '../shared/protocol.ts';
 import { ROOT } from './config.ts';
 import type { AppConfig } from './config.ts';
 import { LunaGateway, RequestError } from './model.ts';
@@ -32,6 +33,7 @@ export function errorReply(error: unknown): Reply<never> {
 }
 
 export function createApplication(config: AppConfig, gateway: ModelGateway = new LunaGateway(config)) {
+  if (config.localMaintenance && (config.host === '0.0.0.0' || config.managedIdentityClientId || process.env.NODE_ENV === 'production')) throw new Error('Unauthenticated room maintenance is restricted to a local loopback development server.');
   const app = express();
   const server = createServer(app);
   const room = new Room(config, gateway);
@@ -60,6 +62,43 @@ export function createApplication(config: AppConfig, gateway: ModelGateway = new
       if (window.count > 300) { response.status(429).json({ error: 'Token lab is busy. Try again in a moment.' }); return; }
       response.json({ count: countTokens(text), tokens: tokenChips(text, 256), encoding: 'o200k_base', estimate: true });
     } catch (error) { response.status(400).json(errorReply(error)); }
+  });
+  app.use('/api/maintenance', (request, response, next) => {
+    if (!config.localMaintenance) { response.status(404).json({ error: 'Not found.' }); return; }
+    const address = server.address();
+    const host = request.headers.host;
+    const localHost = address && typeof address !== 'string' && ['127.0.0.1', 'localhost'].some(name => host === `${name}:${address.port}`);
+    const localPeer = ['127.0.0.1', '::1', '::ffff:127.0.0.1'].includes(request.socket.remoteAddress ?? '');
+    const origin = request.headers.origin;
+    if (!localHost || !localPeer || request.headers.forwarded || request.headers['x-forwarded-for'] || request.headers['x-forwarded-host'] || origin !== `http://${host}` || request.headers['x-room-maintenance'] !== '1') {
+      response.status(403).json({ error: 'Room maintenance is available only from this local app.' }); return;
+    }
+    if (!request.is('application/json')) { response.status(415).json({ error: 'A JSON request is required.' }); return; }
+    response.setHeader('Cache-Control', 'no-store');
+    next();
+  });
+  const resetModeSchema = z.enum(['all', 'scores']);
+  app.post('/api/maintenance/preview', (request, response) => {
+    try {
+      const { mode } = z.object({ mode: resetModeSchema }).strict().parse(request.body);
+      response.json(room.previewReset(mode));
+    } catch (error) { response.status(error instanceof z.ZodError ? 400 : 409).json(errorReply(error)); }
+  });
+  app.post('/api/maintenance/reset', async (request, response) => {
+    try {
+      const { mode, confirmRoom, confirmationId } = z.object({ mode: resetModeSchema, confirmRoom: z.string().length(6), confirmationId: z.string().uuid() }).strict().parse(request.body);
+      const reset = await room.reset(mode, confirmRoom, confirmationId);
+      const result: RoomResetResult = { id: randomUUID(), room: room.code, mode, before: reset.before, after: reset.after!, backup: path.basename(reset.backupPath!) };
+      io.emit('roomReset', { id: result.id, mode });
+      io.emit('room', room.view());
+      response.json(result);
+    } catch (error) {
+      if (error instanceof z.ZodError || error instanceof RequestError) response.status(error instanceof z.ZodError || error.code === 'validation' ? 400 : 409).json(errorReply(error));
+      else {
+        console.error('Room reset failed:', error instanceof Error ? error.message : 'Unknown error');
+        response.status(500).json({ error: 'The reset could not be completed. No data was cleared. Check the server backup directory and refresh the preview.' });
+      }
+    }
   });
   app.use('/api', (_request, response) => response.status(404).json({ error: 'Not found.' }));
   app.use(express.static(path.join(ROOT, 'web', 'dist'), { maxAge: 0 }));

@@ -11,6 +11,7 @@ COPY --from=dependencies --chown=node:node /app/node_modules ./node_modules
 COPY --chown=node:node package.json ./
 COPY --chown=node:node server ./server
 COPY --chown=node:node shared ./shared
+COPY --chown=node:node scripts/reset-room.ts ./scripts/reset-room.ts
 COPY --chown=node:node web/dist ./web/dist
 RUN mkdir -p /data && chown node:node /data
 USER node

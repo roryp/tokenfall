@@ -1,9 +1,9 @@
 import { useEffect, useId, useRef, useState } from 'react';
-import { ArrowUp, Check, ChevronLeft, ChevronRight, Copy, LocateFixed, Maximize2, Play, QrCode, Quote, RotateCcw, Trophy, Users, X } from 'lucide-react';
+import { ArrowUp, Check, ChevronLeft, ChevronRight, Copy, LocateFixed, Maximize2, Play, QrCode, Quote, RotateCcw, Settings2, Trash2, Trophy, Users, X } from 'lucide-react';
 import { QRCodeCanvas } from 'qrcode.react';
 import { DEFAULT_TOKEN_TEXT, tokenLabel, tokenShape } from '../../shared/game.ts';
 import { DEFAULT_TOKEN_ALLOWANCE, MAX_REQUEST_TOKENS, MAX_TOKEN_ALLOWANCE, reportedTokenBalance } from '../../shared/protocol.ts';
-import type { RoomView, TokenAllowance, TokenChip } from '../../shared/protocol.ts';
+import type { RoomResetMode, RoomResetPreview, RoomResetResult, RoomView, TokenAllowance, TokenChip } from '../../shared/protocol.ts';
 import { PiecePreview } from './GameBoard.tsx';
 import { formatMoney } from './format.ts';
 import type { useGame } from './useGame.ts';
@@ -73,6 +73,90 @@ export function GameSetup({ initialText = DEFAULT_TOKEN_TEXT, initialTokenLimit 
   </form>;
 }
 
+function RoomMaintenance({ game }: { game: ReturnType<typeof useGame> }) {
+  const id = useId();
+  const dialog = useRef<HTMLDialogElement | null>(null);
+  const pending = useRef(false);
+  const previewRequest = useRef<AbortController | null>(null);
+  const [open, setOpen] = useState(false);
+  const [mode, setMode] = useState<RoomResetMode>('all');
+  const [preview, setPreview] = useState<RoomResetPreview | null>(null);
+  const [previewExpired, setPreviewExpired] = useState(false);
+  const [confirmation, setConfirmation] = useState('');
+  const [loading, setLoading] = useState(false);
+  const [submitting, setSubmitting] = useState(false);
+  const [error, setError] = useState('');
+  const [result, setResult] = useState<RoomResetResult | null>(null);
+  const status = game.room?.maintenance;
+  const blocked = status?.pendingRequests ? 'Waiting for pending Luna requests.' : status?.activeGames ? 'Pause the other active games before resetting.' : status?.resetting ? 'A room reset is already in progress.' : '';
+  const expired = preview !== null && previewExpired;
+  const valid = preview?.mode === mode && confirmation.trim() === preview.room && !expired && !blocked && game.connected && !loading && !submitting;
+  useEffect(() => { if (open) dialog.current?.showModal(); }, [open]);
+  useEffect(() => () => previewRequest.current?.abort(), []);
+  useEffect(() => {
+    if (!preview) return;
+    const timer = window.setTimeout(() => setPreviewExpired(true), Math.max(0, preview.expiresAt - Date.now()));
+    return () => window.clearTimeout(timer);
+  }, [preview]);
+
+  async function refreshPreview(selected: RoomResetMode) {
+    previewRequest.current?.abort();
+    const controller = new AbortController();
+    previewRequest.current = controller;
+    setPreview(null);
+    setPreviewExpired(false);
+    setConfirmation('');
+    setError('');
+    setLoading(true);
+    try {
+      if (!await game.prepareMaintenance()) throw new Error('Could not pause and sync your game. Reconnect and try again.');
+      const response = await fetch('/api/maintenance/preview', { method: 'POST', headers: { 'Content-Type': 'application/json', 'X-Room-Maintenance': '1' }, body: JSON.stringify({ mode: selected }), signal: AbortSignal.any([controller.signal, AbortSignal.timeout(10000)]) });
+      const data = await response.json();
+      if (!response.ok) throw new Error(data.error || 'Preview unavailable.');
+      if (!controller.signal.aborted) setPreview(data);
+    } catch (failure) {
+      if (!controller.signal.aborted) setError(failure instanceof Error ? failure.message : 'Preview unavailable.');
+    } finally { if (!controller.signal.aborted) setLoading(false); }
+  }
+
+  async function submit() {
+    if (!valid || !preview || pending.current) return;
+    pending.current = true;
+    setSubmitting(true);
+    setError('');
+    try {
+      const response = await fetch('/api/maintenance/reset', { method: 'POST', headers: { 'Content-Type': 'application/json', 'X-Room-Maintenance': '1' }, body: JSON.stringify({ mode, confirmRoom: confirmation.trim(), confirmationId: preview.confirmationId }), signal: AbortSignal.timeout(30000) });
+      const data = await response.json();
+      if (!response.ok) throw new Error(data.error || 'Reset failed. Refresh the preview before retrying.');
+      setResult(data);
+      setPreview(null);
+      setConfirmation('');
+    } catch (failure) {
+      setPreview(null);
+      setError(failure instanceof Error && failure.name !== 'TimeoutError' && failure.name !== 'TypeError' ? failure.message : 'The reset result could not be confirmed. Check the room and refresh the preview before retrying.');
+    } finally { pending.current = false; setSubmitting(false); }
+  }
+
+  return <>
+    <button className="icon-button" aria-label="Room maintenance" title="Room maintenance (local test)" disabled={!game.connected || game.joining} onClick={() => { setOpen(true); setResult(null); void refreshPreview(mode); }}><Settings2 size={19} /></button>
+    <dialog className="prompt-dialog reset-dialog" ref={dialog} aria-labelledby={`${id}-title`} onCancel={event => { if (pending.current) event.preventDefault(); }} onClose={() => { setOpen(false); previewRequest.current?.abort(); game.resumeAfterInspection(); }}>
+      <header><div><h2 id={`${id}-title`}>Room maintenance</h2><small className="reset-local">Local test / no sign-in</small></div><button className="icon-button" aria-label="Close room maintenance" title="Close room maintenance" disabled={submitting} onClick={() => dialog.current?.close()}><X size={19} /></button></header>
+      {open && (result ? <div className="reset-result" role="status" data-testid="reset-result"><Check size={24} /><h3>{result.mode === 'all' ? 'Leaderboard and history cleared' : 'Scores cleared'}</h3><p>{result.mode === 'all' ? `${result.before.players.toLocaleString()} saved ${result.before.players === 1 ? 'player' : 'players'} removed. Everyone must join again.` : `Scores reset for ${result.before.players.toLocaleString()} ${result.before.players === 1 ? 'player' : 'players'}. Names and AI usage retained.`}</p><dl className="allowance-breakdown"><div><dt>Room</dt><dd>{result.room}</dd></div><div><dt>Players remaining</dt><dd>{result.after.players.toLocaleString()}</dd></div><div><dt>AI requests retained</dt><dd>{result.after.requests.toLocaleString()}</dd></div></dl><p className="reset-backup">Recovery backup <code>{result.backup}</code></p><button className="primary-button" onClick={() => dialog.current?.close()}><Check size={18} />Done</button></div> : <form className="reset-form" onSubmit={event => { event.preventDefault(); void submit(); }}>
+        <fieldset className="reset-options" disabled={loading || submitting}><legend>Reset scope</legend>{(['all', 'scores'] as const).map(value => <label key={value}><input type="radio" name={`${id}-mode`} aria-label={value === 'all' ? 'Leaderboard and history' : 'Scores only'} checked={mode === value} onChange={() => { setMode(value); void refreshPreview(value); }} /><span>{value === 'all' ? 'Leaderboard + history' : 'Scores only'}<small>{value === 'all' ? 'Remove saved players, games and in-app AI usage.' : 'Keep player names and AI usage.'}</small></span></label>)}</fieldset>
+        <div className="reset-preview-heading"><h3>Room {game.room?.code}</h3><button type="button" className="icon-button" aria-label="Refresh reset preview" title="Refresh reset preview" disabled={loading || submitting || !game.connected} onClick={() => void refreshPreview(mode)}><RotateCcw size={18} /></button></div>
+        {loading ? <p role="status">Loading preview...</p> : preview && <dl className="allowance-breakdown" data-testid="reset-preview"><div><dt>Saved players</dt><dd data-testid="reset-player-count">{preview.before.players.toLocaleString()}</dd></div><div><dt>Nonzero scores</dt><dd>{preview.before.nonzeroScores.toLocaleString()}</dd></div><div><dt>AI requests</dt><dd>{preview.before.requests.toLocaleString()}</dd></div><div><dt>Tokens used</dt><dd>{preview.before.usedTokens.toLocaleString()}</dd></div></dl>}
+        <dl className="allowance-breakdown reset-live"><div><dt>Active games</dt><dd data-testid="reset-active-games">{status?.activeGames ?? 0}</dd></div><div><dt>Pending Luna requests</dt><dd data-testid="reset-pending-requests">{status?.pendingRequests ?? 0}</dd></div></dl>
+        {blocked && <p className="field-error" role="status">{blocked}</p>}
+        {expired && <p className="field-error" role="status">Preview expired. Refresh before resetting.</p>}
+        {error && <p className="field-error" role="alert">{error}</p>}
+        <p className="reset-warning">{mode === 'all' ? 'Saved players and in-app history will be deleted. Azure billing and the room link are unchanged.' : 'Current games and saved high scores will be cleared. Player names and AI usage are unchanged.'} A recovery backup is required.</p>
+        <div className="allowance-field"><label htmlFor={`${id}-confirmation`}>Confirm room code</label><input id={`${id}-confirmation`} aria-label="Confirm room code" value={confirmation} onChange={event => setConfirmation(event.target.value.toUpperCase())} maxLength={6} placeholder={game.room?.code} autoComplete="off" spellCheck={false} disabled={!preview || loading || submitting} /></div>
+        <div className="reset-actions"><button type="button" className="reset-cancel" disabled={submitting} onClick={() => dialog.current?.close()}>Cancel</button><button type="submit" className="primary-button reset-submit" disabled={!valid}><Trash2 size={18} />{submitting ? 'Resetting...' : mode === 'all' ? 'Clear room' : 'Reset scores'}</button></div>
+      </form>)}
+    </dialog>
+  </>;
+}
+
 export function RoomPanel({ game, onEdit, onReturn }: { game: ReturnType<typeof useGame>; onEdit: () => void; onReturn: () => void }) {
   const id = useId();
   const [ranking, setRanking] = useState('points');
@@ -97,7 +181,7 @@ export function RoomPanel({ game, onEdit, onReturn }: { game: ReturnType<typeof 
     catch { game.setNotice('Select the game link to copy it.'); }
   }
   return <aside className="room-panel" aria-label="Game room">
-    <header className="room-heading"><div><span>ROOM <b data-testid="room-code">{room?.code ?? '------'}</b></span><small><Users size={14} />{game.connected ? `${room?.online ?? 0}/${room?.capacity ?? 50} online` : 'Reconnecting'}</small></div><div className="room-actions"><button className="icon-button" aria-label="Share game" title="Share game / audience QR" aria-expanded={sharing} aria-controls={`${id}-share`} disabled={!room} onClick={() => setSharing(value => !value)}><QrCode size={19} /></button>{game.joined && <button className="icon-button" aria-label="Back to game" title="Back to game" onClick={onReturn}><ArrowUp size={19} /></button>}</div></header>
+    <header className="room-heading"><div><span>ROOM <b data-testid="room-code">{room?.code ?? '------'}</b></span><small><Users size={14} />{game.connected ? `${room?.online ?? 0}/${room?.capacity ?? 50} online` : 'Reconnecting'}</small></div><div className="room-actions">{room?.maintenance && <RoomMaintenance game={game} />}<button className="icon-button" aria-label="Share game" title="Share game / audience QR" aria-expanded={sharing} aria-controls={`${id}-share`} disabled={!room} onClick={() => setSharing(value => !value)}><QrCode size={19} /></button>{game.joined && <button className="icon-button" aria-label="Back to game" title="Back to game" onClick={onReturn}><ArrowUp size={19} /></button>}</div></header>
     <div className="allowance-strip" aria-label="AI allowance balances">
       {game.joined && <span>Personal <b data-testid="personal-tokens-left">{game.allowance ? reportedTokenBalance(game.allowance).toLocaleString() : '--'}</b> / <b data-testid="ai-token-limit">{game.allowance?.limit.toLocaleString() ?? '--'}</b></span>}<span>Room <b data-testid="room-tokens-left">{room?.allowance ? reportedTokenBalance(room.allowance).toLocaleString() : '--'}</b> tokens left</span><span><b data-testid="room-requests-left">{room?.requestsRemaining?.toLocaleString() ?? '--'}</b> room requests left</span>
       {game.joined && <span>Available now <b data-testid="available-tokens-now">{game.allowance && room?.allowance ? Math.min(game.allowance.remaining, room.allowance.remaining).toLocaleString() : '--'}</b></span>}

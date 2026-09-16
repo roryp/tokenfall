@@ -26,7 +26,7 @@ before(async () => {
 });
 after(async () => { await browser?.close(); });
 
-async function fixture(viewport = { width: 1366, height: 768 }, autoJoin = true, networkJoin = false, initialOptions?: Partial<AiOptions>) {
+async function fixture(viewport = { width: 1366, height: 768 }, autoJoin = true, networkJoin = false, initialOptions?: Partial<AiOptions>, localMaintenance = false) {
   const dataDirectory = mkdtempSync(path.join(os.tmpdir(), 'tetris-ui-'));
   const controls = { hold: false, chooseHold: false, invalid: false, truncated: false, fail: false, mcpFail: false, cacheMiss: false, mixedCache: false, missingReasoning: false, firstPlacement: false, inFlight: 0, maxInFlight: 0 };
   const events = new EventEmitter();
@@ -79,7 +79,7 @@ async function fixture(viewport = { width: 1366, height: 768 }, autoJoin = true,
       };
     } finally { controls.inFlight -= 1; }
   } };
-  const application = createApplication({ port: 0, endpoint: 'https://fixture.invalid', deployment: 'gpt-5.6-luna', tenantId: 'fixture', dataDirectory }, gateway);
+  const application = createApplication({ port: 0, endpoint: 'https://fixture.invalid', deployment: 'gpt-5.6-luna', tenantId: 'fixture', dataDirectory, localMaintenance }, gateway);
   let seed = 0;
   const gameFor = application.room.gameFor.bind(application.room);
   application.room.gameFor = text => text ? gameFor(text) : new Game(`standard-ui-${seed++}`);
@@ -153,6 +153,167 @@ async function scanQr(canvas: Locator): Promise<string> {
   assert.ok(decoded, 'Rendered QR pixels must decode at their displayed size');
   return decoded.data;
 }
+
+test('room maintenance clears the leaderboard, browser history and old sessions without restarting the server', async context => {
+  const setup = await fixture(undefined, true, false, undefined, true);
+  context.after(setup.close);
+  const { page, application } = setup;
+  const oldId = setup.player().record.id;
+  const code = application.room.code;
+  await page.getByRole('button', { name: 'Hard drop (Space)', exact: true }).click();
+  await waitPieces(page, 1);
+  setup.controls.hold = true;
+  await page.getByRole('checkbox', { name: 'Ask Luna', exact: true }).check();
+  await setup.waitForCalls(1);
+  await page.getByRole('checkbox', { name: 'Ask Luna', exact: true }).uncheck();
+  setup.release();
+  await waitRequests(page, 1);
+  await page.getByRole('button', { name: 'Room maintenance', exact: true }).click();
+  const dialog = page.getByRole('dialog', { name: 'Room maintenance', exact: true });
+  await dialog.getByTestId('reset-preview').waitFor();
+  assert.equal(await dialog.getByTestId('reset-player-count').innerText(), '1');
+  const submit = dialog.getByRole('button', { name: 'Clear room', exact: true });
+  assert.equal(await submit.isEnabled(), false);
+  await dialog.getByRole('textbox', { name: 'Confirm room code', exact: true }).fill('WRONG0');
+  assert.equal(await submit.isEnabled(), false);
+  await dialog.getByRole('button', { name: 'Cancel', exact: true }).click();
+  assert.equal(application.room.records().length, 1);
+  assert.equal(application.room.totals().metrics.requests, 1);
+  await page.getByRole('button', { name: 'Room maintenance', exact: true }).click();
+  await dialog.getByTestId('reset-preview').waitFor();
+  for (const theme of ['light', 'dark']) for (const viewport of [{ width: 1366, height: 900 }, { width: 390, height: 844 }, { width: 320, height: 710 }]) {
+    await page.setViewportSize(viewport);
+    await page.evaluate(theme => document.documentElement.setAttribute('data-theme', theme), theme);
+    const bounds = await dialog.boundingBox();
+    assert.ok(bounds && bounds.x >= 0 && bounds.x + bounds.width <= viewport.width && bounds.y >= 0 && bounds.y + bounds.height <= viewport.height);
+    assert.equal(await dialog.evaluate(element => element.scrollWidth > element.clientWidth + 1), false);
+    await page.screenshot({ path: path.join(screenshots, `room-reset-${theme}-${viewport.width}.png`), animations: 'disabled' });
+  }
+  await dialog.getByRole('textbox', { name: 'Confirm room code', exact: true }).fill(code);
+  let resetRequests = 0;
+  page.on('request', request => { if (request.url().endsWith('/api/maintenance/reset')) resetRequests += 1; });
+  await submit.evaluate((button: HTMLButtonElement) => { button.click(); button.click(); });
+  await dialog.getByTestId('reset-result').waitFor();
+  assert.equal(resetRequests, 1);
+  assert.match(await dialog.getByTestId('reset-result').innerText(), /Leaderboard and history cleared/);
+  assert.deepEqual(application.room.records(), []);
+  assert.equal(application.room.players.size, 0);
+  assert.equal(application.room.totals().metrics.requests, 0);
+  assert.equal(await page.evaluate(() => sessionStorage.getItem('tokenfall-session')), null);
+  assert.equal(await page.locator('.tetris-app').getAttribute('data-autopilot'), 'false');
+  assert.equal(await page.getByRole('button', { name: 'Inspect cached instructions', exact: true, includeHidden: true }).isEnabled(), false);
+  await dialog.getByRole('button', { name: 'Done', exact: true }).click();
+  await page.getByRole('cell', { name: 'No players yet.', exact: true }).waitFor();
+  await page.reload();
+  await page.getByRole('textbox', { name: 'Name', exact: true }).fill('Fresh Player');
+  await page.getByRole('radio', { name: 'Classic', exact: true }).check();
+  await page.getByRole('button', { name: 'Join game', exact: true }).click();
+  await page.locator('.tetris-app[data-playing="true"]').waitFor();
+  assert.notEqual(setup.player().record.id, oldId);
+  assert.equal(setup.player().game.pieces, 0);
+  assert.equal(setup.calls.length, 1);
+  assert.deepEqual(setup.errors, []);
+});
+
+test('room maintenance scores-only resets both tabs and keeps identities and reported usage', async context => {
+  const setup = await fixture(undefined, true, false, undefined, true);
+  const otherContext = await browser.newContext({ viewport: { width: 390, height: 844 }, deviceScaleFactor: 1 });
+  context.after(async () => { await otherContext.close(); await setup.close(); });
+  const { page, application } = setup;
+  await page.getByRole('button', { name: 'Hard drop (Space)', exact: true }).click();
+  await waitPieces(page, 1);
+  setup.controls.hold = true;
+  await page.getByRole('checkbox', { name: 'Ask Luna', exact: true }).check();
+  await setup.waitForCalls(1);
+  await page.getByRole('checkbox', { name: 'Ask Luna', exact: true }).uncheck();
+  setup.release();
+  await waitRequests(page, 1);
+  const session = await page.evaluate(() => sessionStorage.getItem('tokenfall-session'));
+  const metrics = { ...setup.player().metrics };
+  const other = await otherContext.newPage();
+  await other.goto(page.url());
+  await other.getByRole('textbox', { name: 'Name', exact: true }).fill('Other Player');
+  await other.getByRole('radio', { name: 'Classic', exact: true }).check();
+  await other.getByRole('button', { name: 'Join game', exact: true }).click();
+  await other.locator('.tetris-app[data-playing="true"]').waitFor();
+  await other.getByRole('button', { name: 'Hard drop (Space)', exact: true }).click();
+  await waitPieces(other, 1);
+  await page.getByRole('button', { name: 'Room maintenance', exact: true }).click();
+  const dialog = page.getByRole('dialog', { name: 'Room maintenance', exact: true });
+  await dialog.getByTestId('reset-preview').waitFor();
+  await dialog.getByRole('radio', { name: 'Scores only', exact: true }).check();
+  await dialog.getByTestId('reset-preview').waitFor();
+  await dialog.getByRole('textbox', { name: 'Confirm room code', exact: true }).fill(application.room.code);
+  assert.equal(await dialog.getByRole('button', { name: 'Reset scores', exact: true }).isEnabled(), false);
+  await other.getByRole('button', { name: 'Pause game', exact: true }).click();
+  await page.waitForFunction(() => document.querySelector('[data-testid="reset-active-games"]')?.textContent === '0');
+  await dialog.getByRole('button', { name: 'Refresh reset preview', exact: true }).click();
+  await dialog.getByTestId('reset-preview').waitFor();
+  await dialog.getByRole('textbox', { name: 'Confirm room code', exact: true }).fill(application.room.code);
+  await dialog.getByRole('button', { name: 'Reset scores', exact: true }).click();
+  await dialog.getByTestId('reset-result').waitFor();
+  assert.equal(application.room.records().length, 2);
+  assert.ok(application.room.records().every(record => record.best_score === 0 && record.best_lines === 0));
+  assert.deepEqual(application.room.totals().metrics, metrics);
+  assert.equal(await page.evaluate(() => sessionStorage.getItem('tokenfall-session')), session);
+  await other.getByRole('button', { name: 'Rejoin game', exact: true }).waitFor();
+  assert.equal(await other.locator('.tetris-app').getAttribute('data-autopilot'), 'false');
+  await dialog.getByRole('button', { name: 'Done', exact: true }).click();
+  await page.getByRole('button', { name: 'Rejoin game', exact: true }).click();
+  await page.locator('.tetris-app[data-playing="true"]').waitFor();
+  assert.equal(await page.locator('.game-canvas').getAttribute('data-pieces'), '0');
+  assert.equal(numeric(await page.getByTestId('ai-requests').innerText()), 1);
+  assert.equal(await page.getByRole('button', { name: 'Inspect cached instructions', exact: true }).isEnabled(), false);
+  assert.equal(setup.calls.length, 1);
+  assert.deepEqual(setup.errors, []);
+});
+
+test('room maintenance waits for pending Luna usage and can retry a failed reset', async context => {
+  const setup = await fixture({ width: 390, height: 844 }, true, false, undefined, true);
+  context.after(setup.close);
+  const { page, application } = setup;
+  setup.controls.hold = true;
+  await page.getByRole('checkbox', { name: 'Ask Luna', exact: true }).check();
+  await setup.waitForCalls(1);
+  await page.getByRole('button', { name: 'Room maintenance', exact: true }).click();
+  const dialog = page.getByRole('dialog', { name: 'Room maintenance', exact: true });
+  await dialog.getByTestId('reset-preview').waitFor();
+  await page.waitForFunction(() => document.querySelector('[data-testid="reset-pending-requests"]')?.textContent === '1');
+  assert.equal(await page.getByRole('checkbox', { name: 'Ask Luna', exact: true }).isChecked(), false);
+  await dialog.getByRole('textbox', { name: 'Confirm room code', exact: true }).fill(application.room.code);
+  const submit = dialog.getByRole('button', { name: 'Clear room', exact: true });
+  assert.equal(await submit.isEnabled(), false);
+  setup.release();
+  await waitRequests(page, 1);
+  await page.waitForFunction(() => document.querySelector('[data-testid="reset-pending-requests"]')?.textContent === '0');
+  await submit.click();
+  await dialog.getByRole('alert').filter({ hasText: 'room changed' }).waitFor();
+  assert.equal(application.room.records().length, 1);
+  let fail = true;
+  await page.route('**/api/maintenance/reset', route => fail ? route.fulfill({ status: 500, contentType: 'application/json', body: JSON.stringify({ error: 'Backup unavailable. No data was cleared.' }) }) : route.continue());
+  await dialog.getByRole('button', { name: 'Refresh reset preview', exact: true }).click();
+  await dialog.getByTestId('reset-preview').waitFor();
+  await dialog.getByRole('textbox', { name: 'Confirm room code', exact: true }).fill(application.room.code);
+  await submit.click();
+  await dialog.getByRole('alert').filter({ hasText: 'Backup unavailable' }).waitFor();
+  assert.equal(application.room.totals().metrics.requests, 1);
+  fail = false;
+  await dialog.getByRole('button', { name: 'Refresh reset preview', exact: true }).click();
+  await dialog.getByTestId('reset-preview').waitFor();
+  await dialog.getByRole('textbox', { name: 'Confirm room code', exact: true }).fill(application.room.code);
+  await submit.click();
+  await dialog.getByTestId('reset-result').waitFor();
+  assert.equal(application.room.records().length, 0);
+  assert.equal(setup.calls.length, 1);
+  assert.deepEqual(setup.errors, []);
+});
+
+test('room maintenance is absent by default', async context => {
+  const setup = await fixture();
+  context.after(setup.close);
+  assert.equal(await setup.page.getByRole('button', { name: 'Room maintenance', exact: true }).count(), 0);
+  assert.equal(setup.calls.length, 0);
+});
 
 for (const viewport of [{ width: 1366, height: 768 }, { width: 390, height: 844 }]) {
   test(`Luna-dependent switches require Ask Luna and retain settings at ${viewport.width}px`, async context => {

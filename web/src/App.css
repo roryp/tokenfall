@@ -37,6 +37,22 @@ body {
 .allowance-field > input { width: 100%; min-height: 44px; padding: 10px 12px; background: var(--cp-surface); color: var(--cp-text); border: 1px solid var(--cp-border-strong); border-radius: 4px; font: 16px var(--cp-mono); }
 .allowance-field > small { color: var(--cp-text-muted); font-size: 11px; line-height: 1.5; }
 .allowance-dialog { max-width: 500px; }
+.reset-dialog { max-width: 500px; text-align: left; }
+.reset-local { display: block; margin-top: 4px; color: var(--cp-text-muted); font: 10px var(--cp-mono); }
+.reset-form, .reset-result { display: grid; gap: 12px; margin-top: 16px; min-width: 0; }
+.reset-options { border: 0; padding: 0; margin: 0; min-width: 0; }
+.reset-options legend { margin-bottom: 8px; font-size: 12px; font-weight: 650; }
+.reset-options label { display: flex; align-items: center; gap: 10px; min-height: 58px; padding: 8px 0; border-bottom: 1px solid var(--cp-border); cursor: pointer; font-size: 13px; }
+.reset-options input { flex-shrink: 0; width: 18px; height: 18px; accent-color: var(--cp-accent); }
+.reset-options small { display: block; margin-top: 4px; font-size: 11px; color: var(--cp-text-muted); }
+.reset-preview-heading { display: flex; align-items: center; justify-content: space-between; min-height: 44px; }
+.reset-live { padding-top: 10px; border-top: 1px solid var(--cp-border); }
+.reset-warning { padding-left: 10px; border-left: 3px solid var(--cp-warning); }
+.reset-actions { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+.reset-cancel { min-height: 44px; background: var(--cp-surface-soft); color: var(--cp-text); border: 1px solid var(--cp-border); border-radius: 4px; }
+.reset-submit { background: var(--cp-danger); color: var(--cp-accent-fg); }
+.reset-result > svg { color: var(--cp-success); }
+.reset-backup code { display: block; margin-top: 4px; overflow-wrap: anywhere; font-size: 11px; }
 .allowance-form { display: grid; gap: 12px; margin-top: 12px; }
 .allowance-breakdown { display: grid; gap: 8px; margin: 0; font-size: 12px; }
 .allowance-breakdown > div { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; }
