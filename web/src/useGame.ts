@@ -114,7 +114,6 @@ export function useGame() {
   }
 
   async function prepareMaintenance() {
-    toggleAutopilot(false);
     pauseForInspection();
     return !active.current || await flushAll();
   }
@@ -310,7 +309,7 @@ export function useGame() {
   }
 
   async function requestMove() {
-    if (requestPending.current || pilotBlocked.current || inspection.current || Date.now() < nextRequestAt.current || !pilotActive.current || document.hidden || !game.current || !active.current || !socket.current?.connected) return;
+    if (requestPending.current || joiningRef.current || pilotBlocked.current || inspection.current || Date.now() < nextRequestAt.current || !pilotActive.current || document.hidden || !game.current || !active.current || !socket.current?.connected) return;
     if (game.current.status === 'over') { stopAutopilot(); return; }
     requestPending.current = true;
     const serial = ++requestSerial.current;
@@ -319,7 +318,7 @@ export function useGame() {
     const selected = { cache: options.cache, compression: options.compression, reasoning: Boolean(options.reasoning), mcp: Boolean(options.mcp), autopilot: true };
     setRequestOptions(selected);
     setBusy(true);
-    if (!await flushAll() || serial !== requestSerial.current || originalRun !== runId.current || !pilotActive.current || epoch !== pilotEpoch.current || document.hidden || inspection.current) {
+    if (!await flushAll() || serial !== requestSerial.current || originalRun !== runId.current || !pilotActive.current || epoch !== pilotEpoch.current || document.hidden || inspection.current || joiningRef.current) {
       if (serial === requestSerial.current) { requestPending.current = false; setBusy(false); setRequestOptions(null); }
       return;
     }
@@ -358,22 +357,27 @@ export function useGame() {
 
   async function restart(text?: string, tokenLimit?: number): Promise<boolean> {
     if (!socket.current?.connected || !active.current || requestPending.current || joiningRef.current) return false;
-    stopAutopilot();
-    if (!await flushAll()) return false;
+    const wasInspecting = inspection.current;
     joiningRef.current = true;
     setJoining(true);
-    return new Promise(resolve => {
-      const receive = (error: Error | null, reply: Reply<JoinResult>) => {
-        joiningRef.current = false;
-        setJoining(false);
-        if (error || !reply.ok) { setNotice(!error && !reply.ok ? reply.error : 'Could not start a new game. Try again.'); resolve(false); return; }
-        installSession(reply.data);
-        setNotice('');
-        resolve(true);
-      };
-      if (text === undefined) socket.current!.timeout(8000).emit('restart', receive);
-      else socket.current!.timeout(8000).emit('configure', { text, tokenLimit }, receive);
-    });
+    pauseForInspection();
+    try {
+      if (!await flushAll()) return false;
+      return await new Promise<boolean>(resolve => {
+        const receive = (error: Error | null, reply: Reply<JoinResult>) => {
+          if (error || !reply.ok) { setNotice(!error && !reply.ok ? reply.error : 'Could not start a new game. Try again.'); resolve(false); return; }
+          installSession(reply.data);
+          setNotice('');
+          resolve(true);
+        };
+        if (text === undefined) socket.current!.timeout(8000).emit('restart', receive);
+        else socket.current!.timeout(8000).emit('configure', { text, tokenLimit }, receive);
+      });
+    } finally {
+      joiningRef.current = false;
+      setJoining(false);
+      if (!wasInspecting) resumeAfterInspection();
+    }
   }
 
   async function adjustAllowance(tokenLimit: number): Promise<boolean> {

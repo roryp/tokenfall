@@ -1,10 +1,10 @@
 import { useEffect, useRef, useState } from 'react';
-import { Bot, Brain, Columns2, FileJson2, History, Layers3, Pause, Play, Plug, RotateCcw, ScanSearch, SlidersHorizontal, Trophy, Wifi, WifiOff, X } from 'lucide-react';
+import { Bot, Brain, Columns2, FileJson2, History, Layers3, Pause, Play, Plug, Quote, ReceiptText, RotateCcw, ScanSearch, SlidersHorizontal, Trophy, Wifi, WifiOff, X } from 'lucide-react';
 import type { LucideIcon } from 'lucide-react';
 import { costForUsage, MAX_REQUEST_TOKENS, reportedTokenBalance } from '../../shared/protocol.ts';
 import type { Insight, McpLookaheadResult, TokenRates } from '../../shared/protocol.ts';
 import { GameBoard, GameControls, PiecePreview } from './GameBoard.tsx';
-import { AllowanceEditor, GameSetup, RoomPanel } from './RoomPanel.tsx';
+import { AllowanceEditor, GameSetup, RoomMaintenance, RoomPanel, RoomShare } from './RoomPanel.tsx';
 import { formatMoney } from './format.ts';
 import { useGame } from './useGame.ts';
 import type { RequestRecord } from './useGame.ts';
@@ -59,9 +59,9 @@ function CompressionComparison({ insight }: { insight: Insight }) {
   </>;
 }
 
-function CacheReceipt({ insight, rates, pending, enabled, hasHistory, canInspect, onInspect }: {
+function CacheReceipt({ insight, rates, pending, enabled, hasHistory }: {
   insight: Insight | null; rates: TokenRates | undefined; pending: boolean;
-  enabled: boolean; hasHistory: boolean; canInspect: boolean; onInspect: () => void;
+  enabled: boolean; hasHistory: boolean;
 }) {
   const usage = insight?.usage;
   const state = usage && usage.cached > 0 ? 'hit' : usage && usage.cacheWrites > 0 ? 'write' : insight?.cacheEnabled ? 'miss' : insight ? 'off' : 'pending';
@@ -69,7 +69,7 @@ function CacheReceipt({ insight, rates, pending, enabled, hasHistory, canInspect
   const adjustment = usage && rates ? (usage.cached * (rates.cachedInput - rates.input) + usage.cacheWrites * (rates.cacheWrite - rates.input)) / 1000000 : null;
   const instructions = usage ? usage.cached > 0 ? usage.cacheWrites > 0 ? `${number(usage.cached)} reused + ${number(usage.cacheWrites)} written` : `${number(usage.cached)} input tokens reused` : usage.cacheWrites > 0 ? `${number(usage.cacheWrites)} written; none reused` : '0 tokens reused' : pending ? 'Awaiting usage' : hasHistory ? 'Awaiting a new receipt' : enabled ? 'Eligible next request' : 'Reuse disabled';
   return <section className={`cache-receipt cache-${state}`} aria-label="Latest cache result" data-testid="cache-receipt" data-cache-state={state}>
-    <header><Layers3 size={15} /><strong data-testid="cache-result-label">{label}</strong><small>{insight ? 'Last reply' : 'Next request'}</small><button className="icon-button" aria-label="Inspect cached instructions" title="Live cache activity and instruction text" disabled={!canInspect} onClick={onInspect}><History size={17} /></button></header>
+    <header><Layers3 size={15} /><strong data-testid="cache-result-label">{label}</strong><small>{insight ? 'Last reply' : 'Next request'}</small></header>
     <div className="cache-parts"><div className="cached-part"><span>Fixed Tetris instructions</span><b data-testid="cache-reused">{instructions}</b></div><div><span>Board + next move</span><b>{insight ? 'Processed fresh' : 'Always processed fresh'}</b></div></div>
     {insight && <footer><span>Cache effect, this reply <small>est.</small></span><b data-testid="cache-request-adjustment" className={adjustment !== null && adjustment < 0 ? 'saved-cost' : adjustment !== null && adjustment > 0 ? 'write-premium' : ''}>{signedMoney(adjustment)}</b></footer>}
   </section>;
@@ -115,6 +115,9 @@ export default function App() {
   const [inspectedLookup, setInspectedLookup] = useState<RequestRecord | null>(null);
   const [mcpOpen, setMcpOpen] = useState(false);
   const mcpDialog = useRef<HTMLDialogElement | null>(null);
+  const [costsOpen, setCostsOpen] = useState(false);
+  const costsDialog = useRef<HTMLDialogElement | null>(null);
+  const [rankingsOpen, setRankingsOpen] = useState(false);
   const lastLookup = game.requestHistory.find(record => record.insight.mcpLookup);
   const lookupRecord = mcpOpen ? inspectedLookup ?? lastLookup : null;
   const latest = game.insight;
@@ -134,15 +137,16 @@ export default function App() {
   const remainingTokens = game.allowance && game.room?.allowance ? Math.min(reportedTokenBalance(game.allowance), reportedTokenBalance(game.room.allowance)) : null;
   const availableTokens = game.allowance && game.room?.allowance ? Math.min(game.allowance.remaining, game.room.allowance.remaining) : null;
   const pricing = game.room?.pricing.status;
-  const status = !game.connected ? 'Connecting' : !game.joined ? 'Ready' : game.busy ? 'Luna is thinking' : game.autopilot ? game.inspectionPaused || game.autopilotStatus === 'blocked' ? 'Luna paused' : game.autopilotStatus === 'retrying' ? 'Luna retrying' : 'Luna playing' : game.view.status === 'over' ? 'Game over' : game.view.status === 'paused' ? 'Paused' : 'Manual play';
+  const status = !game.connected ? 'Connecting' : !game.joined ? 'Ready' : game.autopilot ? game.inspectionPaused || game.joining || game.autopilotStatus === 'blocked' ? 'Luna paused' : game.busy ? 'Luna is thinking' : game.autopilotStatus === 'retrying' ? 'Luna retrying' : 'Luna playing' : game.view.status === 'over' ? 'Game over' : game.view.status === 'paused' ? 'Manual paused' : 'Manual play';
   const cacheResult = latest ? latest.usage.cached > 0 ? `${number(latest.usage.cached)} cached` : latest.usage.cacheWrites > 0 ? `${number(latest.usage.cacheWrites)} cache write` : latest.cacheEnabled ? 'Cache miss' : 'Cache off' : '';
   useEffect(() => { if (inspectedPrompt) promptDialog.current?.showModal(); }, [inspectedPrompt]);
   useEffect(() => { if (editingSentence) sentenceDialog.current?.showModal(); }, [editingSentence]);
   useEffect(() => { if (editingAllowance) allowanceDialog.current?.showModal(); }, [editingAllowance]);
   useEffect(() => { if (mcpOpen) mcpDialog.current?.showModal(); }, [mcpOpen]);
+  useEffect(() => { if (costsOpen) costsDialog.current?.showModal(); }, [costsOpen]);
   useEffect(() => {
     if (!game.resetVersion) return;
-    for (const dialog of [promptDialog, sentenceDialog, allowanceDialog, mcpDialog]) dialog.current?.close();
+    for (const dialog of [promptDialog, sentenceDialog, allowanceDialog, mcpDialog, costsDialog]) dialog.current?.close();
   }, [game.resetVersion]);
 
   function inspect(instructions = false) {
@@ -156,8 +160,7 @@ export default function App() {
 
   function showRankings() {
     if (!game.autopilot) game.act('pause');
-    document.querySelector<HTMLElement>('.leaderboard h2')?.focus({ preventScroll: true });
-    document.querySelector('.room-panel')?.scrollIntoView({ block: 'start' });
+    setRankingsOpen(true);
   }
 
   function showMcpResults() {
@@ -166,14 +169,19 @@ export default function App() {
     setMcpOpen(true);
   }
 
+  function showAllowance() {
+    game.pauseForInspection();
+    game.setNotice('');
+    setEditingAllowance(true);
+  }
+
   return <main className="room-layout" data-playing={game.joined}>
     <div className="tetris-app" data-playing={game.joined} data-autopilot={game.autopilot}>
     <header className="game-header">
       <h1><span className="tetris-mark" aria-hidden="true"><i /><i /><i /><i /></span>TETRIS</h1>
       <div className="header-actions">
         <span className={`connection ${game.connected ? 'connected' : ''}`} title={game.connected ? 'Connected' : 'Reconnecting'} aria-label={game.connected ? 'Connected' : 'Reconnecting'}>{game.connected ? <Wifi size={16} /> : <WifiOff size={16} />}</span>
-        <button className="icon-button" aria-label="Show leaderboard" title="Leaderboard" onClick={showRankings}><Trophy size={19} /></button>
-        <button className="icon-button" aria-label={game.autopilot ? 'Stop Luna' : game.view.status === 'paused' ? 'Resume game' : 'Pause game'} title={game.autopilot ? 'Stop Luna' : game.view.status === 'paused' ? 'Resume (P)' : 'Pause (P)'} disabled={!game.joined || game.view.status === 'over'} onClick={() => game.autopilot ? game.toggleAutopilot(false) : game.act(game.view.status === 'paused' ? 'resume' : 'pause')}>
+        <button className="icon-button" aria-label={game.autopilot ? 'Stop Luna' : game.view.status === 'paused' ? 'Resume game' : 'Pause game'} title={game.autopilot ? 'Stop Luna' : game.view.status === 'paused' ? 'Resume manual play (P)' : 'Pause manual play (P)'} disabled={!game.autopilot && (!game.joined || game.view.status === 'over')} onClick={() => game.autopilot ? game.toggleAutopilot(false) : game.act(game.view.status === 'paused' ? 'resume' : 'pause')}>
           {game.view.status === 'paused' && !game.autopilot ? <Play size={20} /> : <Pause size={20} />}
         </button>
         <button className="icon-button" aria-label="New game" title="New game" disabled={!game.joined || game.busy || game.joining} onClick={() => void game.restart()}><RotateCcw size={19} /></button>
@@ -181,51 +189,58 @@ export default function App() {
       {(game.notice || game.autopilotStatus === 'blocked') && <div className="notice" role="alert"><span>{game.notice || 'Luna is paused.'}</span>{game.autopilotStatus === 'blocked' && <button className="icon-button" aria-label="Retry Luna" title="Retry Luna" disabled={!game.joined || !game.connected} onClick={game.retryAutopilot}><RotateCcw size={18} /></button>}<button className="icon-button" aria-label="Dismiss message" title="Dismiss" onClick={() => game.setNotice('')}><X size={18} /></button></div>}
     </header>
 
+    <section className="information-panel" aria-labelledby="information-title">
+      <h2 id="information-title">Information &amp; tools</h2>
+      <div className="information-links">
+        <button className="information-button" aria-label="Inspect MCP lookup" aria-haspopup="dialog" onClick={showMcpResults}><ScanSearch size={18} /><span>MCP results</span></button>
+        <button className="information-button" aria-label="Inspect cached instructions" aria-haspopup="dialog" title={game.requestHistory.length ? 'Live cache activity and instruction text' : 'Available after a Luna reply in this tab'} disabled={!game.requestHistory.length} onClick={() => inspect(true)}><History size={18} /><span>Cache activity</span></button>
+        <button className="information-button" aria-label="Inspect last prompt" aria-haspopup="dialog" title={latest ? 'Compression before / after' : 'Available after a Luna reply in this tab'} disabled={!latest} onClick={() => inspect()}><Columns2 size={18} /><span><span className="information-full-label">Compression</span><span className="information-short-label">Prompts</span></span></button>
+        <button className="information-button" aria-haspopup="dialog" onClick={() => { if (!game.autopilot) game.act('pause'); setCostsOpen(true); }}><ReceiptText size={18} /><span>AI costs</span></button>
+        <button className="information-button" aria-label="Adjust AI allowance" aria-haspopup="dialog" disabled={!game.joined || !game.allowance || !game.connected || game.joining} onClick={showAllowance}><SlidersHorizontal size={18} /><span>AI allowance</span></button>
+        <button className="information-button" aria-label="Show leaderboard" aria-haspopup="dialog" onClick={showRankings}><Trophy size={18} /><span><span className="information-full-label">Leaderboard</span><span className="information-short-label">Scores</span></span></button>
+        <RoomShare game={game} />
+        <button className="information-button" aria-label="Change sentence" aria-haspopup="dialog" disabled={!game.joined || game.busy || game.joining || !game.connected} onClick={() => { game.pauseForInspection(); game.setNotice(''); setEditingSentence(true); }}><Quote size={18} /><span>Change sentence</span></button>
+        {game.room?.maintenance && <RoomMaintenance game={game} />}
+      </div>
+    </section>
+
     <section className="cost-ticker" aria-label="AI cost ticker" aria-live="polite" aria-atomic="true">
       <div className="total-cost" title="Total reported AI spend across your games, at published USD rates. This is an estimate, not an invoice.">
         <span>{incomplete ? 'AI COST / PENDING USAGE' : 'AI COST / USD EST.'}</span>
         <strong data-testid="ai-cost" key={`cost-${game.metrics.requests}`}>{formatMoney(game.cost?.total ?? null)}</strong>
         <small>{pricing === 'live' ? 'Live rates' : pricing === 'stale' ? 'Last verified rates' : 'Rates unavailable'}</small>
       </div>
-      <button className="token-balance" aria-label="Adjust AI allowance" title="Balance after reported usage. Pending holds are shown separately in allowance details; opening pauses play." disabled={!game.joined || !game.allowance || !game.connected || game.joining} onClick={() => { game.pauseForInspection(); game.setNotice(''); setEditingAllowance(true); }}>
-        <span>AI TOKENS LEFT<SlidersHorizontal size={12} /></span><strong data-testid="ai-tokens-left" className={remainingTokens !== null && remainingTokens < MAX_REQUEST_TOKENS ? 'write-premium' : ''}>{remainingTokens === null ? '--' : number(remainingTokens)}</strong><small><b data-testid="ai-tokens">{number(game.metrics.input + game.metrics.output)}</b> used</small>
-      </button>
+      <div className="token-balance" title="Balance after reported usage. Pending holds are shown separately in AI allowance.">
+        <span>AI TOKENS LEFT</span><strong data-testid="ai-tokens-left" className={remainingTokens !== null && remainingTokens < MAX_REQUEST_TOKENS ? 'write-premium' : ''}>{remainingTokens === null ? '--' : number(remainingTokens)}</strong><small><b data-testid="ai-tokens">{number(game.metrics.input + game.metrics.output)}</b> used</small>
+      </div>
       <div title={`Estimated compression saving: ${formatMoney(compressionSaving)}. Cache-read saving minus cache-write premium: ${formatMoney(cacheSaving)}.`}>
         <span>{savings !== null && savings < 0 ? 'EXTRA WRITE COST' : 'SAVED / EST.'}</span>
         <strong className={savings !== null && savings < 0 ? 'write-premium' : 'saved-cost'} data-testid="ai-savings">{formatMoney(savings !== null ? Math.abs(savings) : null)}</strong>
         <small>Compression + cache</small>
       </div>
-      <dl className="cost-adjustments" aria-label="Session cost adjustments">
-        <div><dt>Compression <small>est.</small></dt><dd className="saved-cost" data-testid="compression-adjustment">{signedMoney(compressionAdjustment)}</dd><span>{number(game.metrics.compressionSaved)} tokens removed</span></div>
-        <div><dt>Cache <small>net</small></dt><dd className={cacheAdjustment !== null && cacheAdjustment > 0 ? 'write-premium' : 'saved-cost'} data-testid="cache-adjustment">{signedMoney(cacheAdjustment)}</dd><span data-testid="cache-totals" title="Cache-enabled requests only. A write without a read is a miss.">{number(cacheHits)} {cacheHits === 1 ? 'hit' : 'hits'} / {number(cacheMisses)} {cacheMisses === 1 ? 'miss' : 'misses'}</span></div>
-      </dl>
-      <p className="cost-baseline"><span>Before optimizations <small>est.</small> <b data-testid="unoptimized-cost">{formatMoney(beforeOptimizations)}</b></span><small data-testid="ai-requests">{number(game.metrics.requests)} requests</small>{unclassified > 0 && <span data-testid="cache-unclassified">{number(unclassified)} earlier {unclassified === 1 ? 'request' : 'requests'} unclassified</span>}</p>
-      <CacheReceipt insight={latest} rates={rates} pending={game.busy} enabled={game.options.cache} hasHistory={game.metrics.requests > 0} canInspect={game.requestHistory.length > 0} onInspect={() => inspect(true)} />
     </section>
 
     <div className="luna-controls" aria-label="Luna controls">
       <Switch label="Ask Luna" icon={Bot} checked={game.autopilot} disabled={!game.autopilot && (!game.joined || !game.connected || game.view.status === 'over' || availableTokens === 0 || game.room?.requestsRemaining === 0)} onChange={game.toggleAutopilot} title="Let Luna play the game automatically. Uses paid AI requests. Switch off to stop." />
       <div className="luna-reasoning">
-        <Switch label="Reasoning" icon={Brain} checked={Boolean(game.options.reasoning)} disabled={!game.autopilot} onChange={reasoning => game.setOptions(current => ({ ...current, reasoning }))} detail={game.options.reasoning ? 'Low effort next' : 'Off next'} title="Enable low reasoning effort for the next Luna request. Can take longer and use more billed output tokens. Changing this does not start Luna." />
+        <Switch label="Reasoning" icon={Brain} checked={game.autopilot && Boolean(game.options.reasoning)} disabled={!game.autopilot} onChange={reasoning => game.setOptions(current => ({ ...current, reasoning }))} detail={!game.autopilot ? 'Luna off' : game.options.reasoning ? 'Low effort next' : 'Off next'} title="Enable low reasoning effort for the next Luna request. Can take longer and use more billed output tokens. Changing this does not start Luna." />
         <dl className="reasoning-usage" aria-label="Reasoning token usage" aria-live="polite" aria-atomic="true" title="Provider-reported reasoning tokens. Already included in output tokens and AI cost; missing counts are not estimated.">
           <div><dt><span className="reasoning-label-detail">Reported </span>total</dt><dd data-testid="reasoning-tokens">{number(game.metrics.reasoning)}</dd></div>
           <div><dt>Last<span className="reasoning-label-detail">{latest ? ` reply / ${latest.reasoningEnabled ? 'low' : 'off'}` : ' reply'}</span></dt><dd data-testid="last-reasoning-tokens">{game.busy ? 'Pending' : latest ? latest.usage.reasoning === null ? 'Not reported' : number(latest.usage.reasoning) : '--'}</dd></div>
         </dl>
       </div>
-      <div className="luna-mcp"><Switch label="MCP" icon={Plug} checked={Boolean(game.options.mcp)} disabled={!game.autopilot} onChange={mcp => game.setOptions(current => ({ ...current, mcp }))} detail={game.options.mcp ? '2-piece next' : 'Off next'} title="Simulate the next two placements through the real MCP tool before Luna chooses. Adds analysis input tokens and latency. Does not start Luna." /><button className="mcp-results-button mcp-results-desktop" aria-label="Inspect MCP lookup" title="MCP analysis and added input cost; pauses play" onClick={showMcpResults}><ScanSearch size={16} />Results</button></div>
-      <Switch label="Compression" icon={FileJson2} checked={game.options.compression} disabled={!game.autopilot} onChange={compression => game.setOptions(current => ({ ...current, compression }))} detail={game.options.compression ? 'Packed rows next' : 'Cell JSON next'} title="Send the same board in fewer tokens. Applies to the next request, not past costs." />
-      <Switch label="Cache" icon={Layers3} checked={game.options.cache} disabled={!game.autopilot} onChange={cache => game.setOptions(current => ({ ...current, cache }))} detail={game.options.cache ? 'Reuse rules next' : 'Full input next'} title="Reuse fixed instructions at the cache-read rate. Writes can cost extra; a hit is not guaranteed. Applies to the next request, not past costs." />
+      <div className="luna-mcp"><Switch label="MCP" icon={Plug} checked={game.autopilot && Boolean(game.options.mcp)} disabled={!game.autopilot} onChange={mcp => game.setOptions(current => ({ ...current, mcp }))} detail={!game.autopilot ? 'Luna off' : game.options.mcp ? '2-piece next' : 'Off next'} title="Simulate the next two placements through the real MCP tool before Luna chooses. Adds analysis input tokens and latency. Does not start Luna." /></div>
+      <Switch label="Compression" icon={FileJson2} checked={game.autopilot && game.options.compression} disabled={!game.autopilot} onChange={compression => game.setOptions(current => ({ ...current, compression }))} detail={!game.autopilot ? 'Luna off' : game.options.compression ? 'Packed rows next' : 'Cell JSON next'} title="Send the same board in fewer tokens. Applies to the next request, not past costs." />
+      <Switch label="Cache" icon={Layers3} checked={game.autopilot && game.options.cache} disabled={!game.autopilot} onChange={cache => game.setOptions(current => ({ ...current, cache }))} detail={!game.autopilot ? 'Luna off' : game.options.cache ? 'Reuse rules next' : 'Full input next'} title="Reuse fixed instructions at the cache-read rate. Writes can cost extra; a hit is not guaranteed. Applies to the next request, not past costs." />
     </div>
 
     <div className="game-status" role="status">
       <span className={game.autopilot ? 'luna-active' : ''} data-testid="game-status"><i className={game.busy ? 'thinking' : ''} />{status}</span>
       <span className="request-status" data-testid="request-status" title={game.requestOptions ? 'Changes to the switches apply to the next request.' : undefined}>
-        {game.requestOptions ? `In flight: ${game.requestOptions.compression ? 'Packed' : 'Verbose'} / cache ${game.requestOptions.cache ? 'on' : 'off'} / reasoning ${game.requestOptions.reasoning ? 'low' : 'off'} / MCP ${game.requestOptions.mcp ? 'on' : 'off'}` : latest ? `${latest.compression ? 'Packed' : 'Verbose'} / ${cacheResult}${latest.mcpLookup ? ' / MCP used' : ''}` : ''}
+        {game.requestOptions ? `${game.autopilot ? 'In flight' : 'Finishing stopped request'}: ${game.requestOptions.compression ? 'Packed' : 'Verbose'} / cache ${game.requestOptions.cache ? 'on' : 'off'} / reasoning ${game.requestOptions.reasoning ? 'low' : 'off'} / MCP ${game.requestOptions.mcp ? 'on' : 'off'}` : latest ? `Last reply: ${latest.compression ? 'Packed' : 'Verbose'} / ${cacheResult}${latest.mcpLookup ? ' / MCP used' : ''}` : ''}
       </span>
       <div className="prompt-summary">
         <div><span data-testid="compression-detail">{latest ? latest.compression ? `Last board: ${number(latest.rawTokens)} -> ${number(latest.packedTokens)} tokens (-${lastReduction}%)` : `Last board: ${number(latest.rawTokens)} tokens, uncompressed` : game.metrics.requests ? 'Prompt available after next reply' : 'No prompt sent yet'}</span><small data-testid="last-request-cost">{latest ? `Last request ${signedMoney(lastCost)} / USD est.` : 'No charge for changing settings'}</small></div>
-        <button className="mcp-results-button mcp-results-mobile" aria-label="Inspect MCP lookup" title="MCP analysis and added input cost; pauses play" onClick={showMcpResults}><ScanSearch size={16} /><span>MCP<br />Results</span></button>
-        <button className="icon-button" aria-label="Inspect last prompt" title="Compare compression before and after; pauses play" disabled={!latest} onClick={() => inspect()}><Columns2 size={18} /></button>
       </div>
     </div>
 
@@ -241,7 +256,7 @@ export default function App() {
           <GameBoard view={game.view} joined={game.joined} suggestion={latest}>
             {!game.joined ? <div className="board-overlay"><strong>{game.joining ? 'Connecting...' : 'Ready'}</strong></div>
               : game.view.status === 'over' ? <div className="board-overlay gameover-overlay"><h2>Game over</h2><strong>{number(game.view.score)}</strong><button className="primary-button" disabled={game.busy} onClick={() => void game.restart()}><RotateCcw size={17} />Play again</button></div>
-              : game.view.status === 'paused' && !game.autopilot ? <div className="board-overlay pause-overlay"><button className="resume-button" aria-label="Resume" title="Resume (P)" onClick={() => game.act('resume')}><Play size={30} /></button><span>PAUSED</span></div> : null}
+              : game.view.status === 'paused' && !game.autopilot ? <div className="board-overlay pause-overlay"><button className="resume-button" aria-label="Resume" title="Resume manual play (P)" onClick={() => game.act('resume')}><Play size={30} /></button><span>MANUAL PLAY</span></div> : null}
           </GameBoard>
           <GameControls act={game.act} disabled={!game.joined || game.autopilot || !game.connected || game.view.status === 'over'} paused={game.view.status === 'paused'} />
         </div>
@@ -249,7 +264,19 @@ export default function App() {
       </div>
     </section>
     </div>
-    <RoomPanel game={game} onEdit={() => { game.pauseForInspection(); game.setNotice(''); setEditingSentence(true); }} onReturn={() => { window.scrollTo({ top: 0 }); document.querySelector<HTMLButtonElement>('.game-header button[aria-label="Resume game"]')?.focus({ preventScroll: true }); }} />
+    <RoomPanel game={game} rankingsOpen={rankingsOpen} onCloseRankings={() => setRankingsOpen(false)} onReturn={() => { window.scrollTo({ top: 0 }); document.querySelector<HTMLButtonElement>('.game-header button[aria-label="Resume game"]')?.focus({ preventScroll: true }); }} />
+    <dialog className="prompt-dialog costs-dialog" ref={costsDialog} aria-labelledby="costs-title" onClose={() => setCostsOpen(false)}>
+      <header><h2 id="costs-title">AI costs &amp; usage</h2><div className="inspector-actions">{game.autopilot && <button className="icon-button" aria-label="Stop Luna in costs" title="Stop Luna" onClick={() => game.toggleAutopilot(false)}><Pause size={19} /></button>}<button className="icon-button" aria-label="Close AI costs" title="Close AI costs" onClick={() => costsDialog.current?.close()}><X size={19} /></button></div></header>
+      <div className="cost-details">
+        <p className="cost-dialog-total"><strong>{formatMoney(game.cost?.total ?? null)}</strong><span>USD estimate / {incomplete ? 'usage pending' : 'reported usage'}</span></p>
+        <dl className="cost-adjustments" aria-label="Session cost adjustments">
+          <div><dt>Compression <small>est.</small></dt><dd className="saved-cost" data-testid="compression-adjustment">{signedMoney(compressionAdjustment)}</dd><span>{number(game.metrics.compressionSaved)} tokens removed</span></div>
+          <div><dt>Cache <small>net</small></dt><dd className={cacheAdjustment !== null && cacheAdjustment > 0 ? 'write-premium' : 'saved-cost'} data-testid="cache-adjustment">{signedMoney(cacheAdjustment)}</dd><span data-testid="cache-totals" title="Cache-enabled requests only. A write without a read is a miss.">{number(cacheHits)} {cacheHits === 1 ? 'hit' : 'hits'} / {number(cacheMisses)} {cacheMisses === 1 ? 'miss' : 'misses'}</span></div>
+        </dl>
+        <p className="cost-baseline"><span>Before optimizations <small>est.</small> <b data-testid="unoptimized-cost">{formatMoney(beforeOptimizations)}</b></span><small data-testid="ai-requests">{number(game.metrics.requests)} requests</small>{unclassified > 0 && <span data-testid="cache-unclassified">{number(unclassified)} earlier {unclassified === 1 ? 'request' : 'requests'} unclassified</span>}</p>
+        <CacheReceipt insight={latest} rates={rates} pending={game.busy} enabled={game.autopilot && game.options.cache} hasHistory={game.metrics.requests > 0} />
+      </div>
+    </dialog>
     <dialog className="prompt-dialog allowance-dialog" ref={allowanceDialog} aria-labelledby="allowance-title" onClose={() => { setEditingAllowance(false); game.resumeAfterInspection(); }}>
       <header><h2 id="allowance-title">AI token allowance</h2><button className="icon-button" aria-label="Close allowance" title="Close allowance" onClick={() => allowanceDialog.current?.close()}><X size={19} /></button></header>
       {editingAllowance && game.notice && <p className="field-error" role="alert">{game.notice}</p>}

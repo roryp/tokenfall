@@ -173,6 +173,7 @@ export function GameControls({ act, paused, disabled }: { act: (action: Action) 
     if (['left', 'right', 'softDrop'].includes(action)) held.current.set(source, { action, next: performance.now() + (action === 'softDrop' ? 45 : 160) });
   }
   const onKeyDown = useEffectEvent((event: KeyboardEvent) => {
+    if (document.querySelector('dialog:modal')) return;
     const keys: Record<string, Action> = { ArrowLeft: 'left', ArrowRight: 'right', ArrowDown: 'softDrop', ArrowUp: 'rotateCW', KeyX: 'rotateCW', KeyZ: 'rotateCCW', Space: 'hardDrop', KeyC: 'hold', ShiftLeft: 'hold', ShiftRight: 'hold' };
     if (event.target instanceof HTMLElement && (['INPUT', 'TEXTAREA', 'SELECT'].includes(event.target.tagName) || event.target.isContentEditable || event.target.closest('dialog, .room-panel'))) return;
     if (event.code === 'Space' && event.target instanceof HTMLButtonElement) return;
@@ -185,7 +186,7 @@ export function GameControls({ act, paused, disabled }: { act: (action: Action) 
     if (keys[event.code]) { event.preventDefault(); if (!event.repeat) press(keys[event.code], event.code); }
   });
   const onRepeat = useEffectEvent(() => {
-    if (disabled || paused) { held.current.clear(); return; }
+    if (disabled || paused || document.querySelector('dialog:modal')) { held.current.clear(); return; }
     const now = performance.now();
     for (const entry of held.current.values()) if (now >= entry.next) { act(entry.action); entry.next = now + (entry.action === 'softDrop' ? 40 : 50); }
   });

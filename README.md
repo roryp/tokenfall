@@ -8,7 +8,8 @@ Untimed Tetris with a shared room, live leaderboards, and optional GPT-5.6 Luna 
 
 - Join with a 2-16 character name. **Sentence** maps real `o200k_base` token IDs to shapes and repeats the labeled sequence; text is limited to 500 characters and 256 tokens. **Classic** uses seven-bag pieces. Both support SRS rotation, hold, ghost, next pieces, levels, and standard scoring.
 - **Leaderboard** ranks best points, including manual players. **Points / cent** divides best points by estimated cumulative player spend in US cents; zero spend, missing prices, and incomplete usage are unranked. Each list has up to 50 entries, ten per page. The room permits 50 online players and 500 saved registrations.
-- **Share game** provides a credential-free link and locally generated, enlargeable QR code. Audience QR requires a public or network-accessible URL, not localhost. Sharing and viewing rankings do not stop an enabled Luna session.
+- **Information & tools** brings MCP results, cache activity, compression, AI costs, token allowance, leaderboard, sharing, and sentence settings into one labelled panel near the top of the main screen. Each opens a popup; on phones, **Prompts** opens compression and **Scores** opens the leaderboard.
+- **Share game** opens a credential-free link and locally generated QR code in one popup. Audience QR requires a public or network-accessible URL, not localhost. Sharing and viewing rankings do not stop an enabled Luna session.
 - **New game** and **Change sentence** preserve best scores, AI usage, allowances, and preferences. They start a new board with Luna off.
 
 | Action | Keyboard |
@@ -25,16 +26,20 @@ Touch controls are also available.
 
 ### Luna Controls
 
-**Ask Luna** plays continuously, pausing the board while each paid request is pending and executing the validated move. All four options default off and are **disabled until Ask Luna is on**. Changes affect the next request; stopping Luna disables the controls without clearing preferences.
+**Ask Luna** plays continuously, pausing the board while each paid request is pending and executing the validated move. All four options default off and are **shown off and disabled whenever Ask Luna is off**. Saved preferences return when you explicitly enable Ask Luna again. Changes affect the next request, not one already in flight.
+
+The Play buttons resume **manual play**, never paid Luna requests. A stopped request may still finish and report usage, but cannot apply its move; it is labelled **Finishing stopped request** separately from the manual play status.
 
 | Option | Effect |
 | --- | --- |
 | Reasoning | Low effort instead of `none`; reported reasoning tokens are already part of output usage. |
-| MCP | Real two-placement lookahead, including Hold; adds input tokens and latency. **Results** shows the tool call and forecasts. |
-| Compression | Losslessly packs the same board into fewer input tokens. **Inspect last prompt** compares both exact encodings. |
+| MCP | Real two-placement lookahead, including Hold; adds input tokens and latency. **MCP results** shows the tool call and forecasts. |
+| Compression | Losslessly packs the same board into fewer input tokens. **Compression** in the information panel compares both exact encodings. |
 | Cache | Reuses fixed instructions when the provider confirms a hit. Writes can cost extra; hits are not guaranteed. |
 
-Hidden pages, disconnects, and the MCP, compression, sentence, and allowance dialogs suspend Luna and invalidate late moves without clearing its selection. Closing dialogs, returning to the page, or reconnecting to the same run can resume it. **Stop**, game over, new games, and page reloads leave Luna off. Already-started requests can still be charged.
+Hidden pages, disconnects, and the MCP, compression, sentence, allowance, and Admin dialogs suspend Luna and invalidate late moves without clearing its selection or options. Closing dialogs, returning to the page, or reconnecting to the same run can resume it. **Stop**, game over, new games, completed room resets, and page reloads leave Luna off. Already-started requests can still be charged.
+
+**New game** and **Start with sentence** suspend Luna while awaiting confirmation. A rejected change preserves the current run and Luna selections; a successful change starts the new run with Luna off. Pending saves block new AI requests even if their dialog is closed. All **Stop Luna** buttons remain available during disconnection.
 
 Temporary failures allow three retries with 2/4/8-second backoff or a longer server delay. Repeated failures and hard limits pause with **Retry Luna**; changing options or allowance can retry without bypassing limits. Busy/cooldown responses wait for admission without contacting the model.
 
@@ -42,7 +47,7 @@ Temporary failures allow three retries with 2/4/8-second backoff or a longer ser
 
 ## Costs And Limits
 
-New players joining through the UI receive a **1,000,000-token allowance**, adjustable from **16,000 to 8,000,000** before joining or through **AI TOKENS LEFT**. This is cumulative across games, not replenished on restart. Older saved players retain their existing allowance.
+New players joining through the UI receive a **1,000,000-token allowance**, adjustable from **16,000 to 8,000,000** before joining or through **AI allowance** in the information panel. This is cumulative across games, not replenished on restart. Older saved players retain their existing allowance.
 
 The counter shows the smaller personal/room balance after **reported input + output**, including cached input. **Available now** additionally subtracts pending reservations and conservative holds for missing usage, up to 16,000 tokens per unreported request. Holds are not reported spend. MCP input and reasoning output are counted once, not added again.
 
@@ -56,7 +61,7 @@ cost = (ordinary input * input rate
       + output * output rate) / 1,000,000
 ```
 
-Compression savings are tokenizer estimates; cache adjustments use confirmed reads/writes. The before-optimizations estimate plus signed adjustments reconciles to reported-usage cost. Cache reduces price, not allowance tokens; enabling a switch alone saves nothing.
+**AI costs** opens the detailed breakdown, cache receipt, and request totals while the main screen retains live cost, token balance, and savings. The popup keeps Luna running and includes a Stop control. Compression savings are tokenizer estimates; cache adjustments use confirmed reads/writes. The before-optimizations estimate plus signed adjustments reconciles to reported-usage cost. Cache reduces price, not allowance tokens; enabling a switch alone saves nothing.
 
 **Server safeguards:** one in-flight request per player, four concurrent per room, at least one second between automatic requests, 90 requests / 400,000 reserved tokens per minute, and 2,000 attempts / 8,000,000 tokens per persisted room. Each request reserves at most 16,000 tokens including headroom and completion allowance: 128 with reasoning off, 2,048 with it on. Provider timeouts are 20/60 seconds respectively; MCP adds a separate 15-second deadline. Raising a personal allowance does not raise these limits. Invalid/truncated replies are not played, but reported usage remains charged. These are application guards, not Azure billing caps.
 
@@ -126,13 +131,13 @@ Keep one running replica, one active revision, and no traffic splitting outside 
 
 **The public Azure website does not currently have a room-reset button.** Browser resets are available only on a local development server with maintenance enabled. Admin authentication is not implemented, so the panel is off by default and must never be exposed through a tunnel or enabled on Azure.
 
-1. Click the **Room maintenance** settings icon beside the room code. Opening it turns off **Ask Luna** and pauses/syncs your game.
+1. Click **Admin** in **Information & tools**. It appears only when local maintenance is enabled. Opening it temporarily pauses/syncs your game and suspends Luna without changing **Ask Luna** or its selected options.
 2. Select **Leaderboard + history** to remove all saved players and empty both leaderboards, or **Scores only** to clear high scores while keeping player names and AI usage. Scores only does **not** empty the leaderboard.
 3. Pause all other games and wait until **Active games** and **Pending Luna requests** both show **0**.
 4. Review the preview counts, then type the displayed six-character room code into **Confirm room code**.
 5. Click **Clear room** for a full reset, or **Reset scores** for scores only. Wait for the success message and recovery backup name, then click **Done**.
 
-Both modes clear current boards immediately without a server restart. After a full reset, everyone must join again. **Cancel** changes nothing and leaves Luna off. If the preview expires after two minutes or room data changes, click **Refresh reset preview** and enter the room code again.
+Both modes clear current boards immediately without a server restart and leave Luna off. After a full reset, everyone must join again. **Cancel**, Close, or Escape preserves all selections and resumes Luna only if it was already enabled; manual play remains paused. Failed resets preserve the selections too. If the preview expires after two minutes or room data changes, click **Refresh reset preview** and enter the room code again.
 
 #### Enable The Local Panel
 

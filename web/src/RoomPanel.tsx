@@ -1,5 +1,5 @@
 import { useEffect, useId, useRef, useState } from 'react';
-import { ArrowUp, Check, ChevronLeft, ChevronRight, Copy, LocateFixed, Maximize2, Play, QrCode, Quote, RotateCcw, Settings2, Trash2, Trophy, Users, X } from 'lucide-react';
+import { ArrowUp, Check, ChevronLeft, ChevronRight, Copy, LocateFixed, Play, QrCode, RotateCcw, Settings2, Trash2, Trophy, Users, X } from 'lucide-react';
 import { QRCodeCanvas } from 'qrcode.react';
 import { DEFAULT_TOKEN_TEXT, tokenLabel, tokenShape } from '../../shared/game.ts';
 import { DEFAULT_TOKEN_ALLOWANCE, MAX_REQUEST_TOKENS, MAX_TOKEN_ALLOWANCE, reportedTokenBalance } from '../../shared/protocol.ts';
@@ -73,7 +73,7 @@ export function GameSetup({ initialText = DEFAULT_TOKEN_TEXT, initialTokenLimit 
   </form>;
 }
 
-function RoomMaintenance({ game }: { game: ReturnType<typeof useGame> }) {
+export function RoomMaintenance({ game }: { game: ReturnType<typeof useGame> }) {
   const id = useId();
   const dialog = useRef<HTMLDialogElement | null>(null);
   const pending = useRef(false);
@@ -138,7 +138,7 @@ function RoomMaintenance({ game }: { game: ReturnType<typeof useGame> }) {
   }
 
   return <>
-    <button className="icon-button" aria-label="Room maintenance" title="Room maintenance (local test)" disabled={!game.connected || game.joining} onClick={() => { setOpen(true); setResult(null); void refreshPreview(mode); }}><Settings2 size={19} /></button>
+    <button className="information-button" aria-label="Room maintenance" aria-haspopup="dialog" title="Room maintenance (local test)" disabled={!game.connected || game.joining} onClick={() => { setOpen(true); setResult(null); void refreshPreview(mode); }}><Settings2 size={18} /><span>Admin</span></button>
     <dialog className="prompt-dialog reset-dialog" ref={dialog} aria-labelledby={`${id}-title`} onCancel={event => { if (pending.current) event.preventDefault(); }} onClose={() => { setOpen(false); previewRequest.current?.abort(); game.resumeAfterInspection(); }}>
       <header><div><h2 id={`${id}-title`}>Room maintenance</h2><small className="reset-local">Local test / no sign-in</small></div><button className="icon-button" aria-label="Close room maintenance" title="Close room maintenance" disabled={submitting} onClick={() => dialog.current?.close()}><X size={19} /></button></header>
       {open && (result ? <div className="reset-result" role="status" data-testid="reset-result"><Check size={24} /><h3>{result.mode === 'all' ? 'Leaderboard and history cleared' : 'Scores cleared'}</h3><p>{result.mode === 'all' ? `${result.before.players.toLocaleString()} saved ${result.before.players === 1 ? 'player' : 'players'} removed. Everyone must join again.` : `Scores reset for ${result.before.players.toLocaleString()} ${result.before.players === 1 ? 'player' : 'players'}. Names and AI usage retained.`}</p><dl className="allowance-breakdown"><div><dt>Room</dt><dd>{result.room}</dd></div><div><dt>Players remaining</dt><dd>{result.after.players.toLocaleString()}</dd></div><div><dt>AI requests retained</dt><dd>{result.after.requests.toLocaleString()}</dd></div></dl><p className="reset-backup">Recovery backup <code>{result.backup}</code></p><button className="primary-button" onClick={() => dialog.current?.close()}><Check size={18} />Done</button></div> : <form className="reset-form" onSubmit={event => { event.preventDefault(); void submit(); }}>
@@ -157,17 +157,13 @@ function RoomMaintenance({ game }: { game: ReturnType<typeof useGame> }) {
   </>;
 }
 
-export function RoomPanel({ game, onEdit, onReturn }: { game: ReturnType<typeof useGame>; onEdit: () => void; onReturn: () => void }) {
+export function RoomShare({ game }: { game: ReturnType<typeof useGame> }) {
   const id = useId();
-  const [ranking, setRanking] = useState('points');
-  const [page, setPage] = useState(0);
   const [sharing, setSharing] = useState(false);
+  const [feedback, setFeedback] = useState('');
   const qrDialog = useRef<HTMLDialogElement | null>(null);
   const room = game.room;
-  const entries = (ranking === 'points' ? room?.pointsLeaderboard : room?.leaderboard?.filter(entry => entry.challengeScore !== null)) ?? [];
-  const pageCount = Math.max(1, Math.ceil(entries.length / 10));
-  const currentPage = Math.min(page, pageCount - 1);
-  const ownIndex = entries.findIndex(entry => entry.id === game.player?.id);
+  useEffect(() => { if (sharing) qrDialog.current?.showModal(); }, [sharing]);
   const invite = new URL(room?.joinUrl ?? window.location.origin);
   invite.username = '';
   invite.password = '';
@@ -177,31 +173,42 @@ export function RoomPanel({ game, onEdit, onReturn }: { game: ReturnType<typeof 
   if (room) invite.searchParams.set('room', room.code);
   const audienceLink = Boolean(room) && !['localhost', '[::1]', '0.0.0.0'].includes(invite.hostname) && !invite.hostname.endsWith('.localhost') && !/^127\./.test(invite.hostname);
   async function copyInvite() {
-    try { await navigator.clipboard.writeText(invite.href); game.setNotice('Game link copied.'); }
-    catch { game.setNotice('Select the game link to copy it.'); }
+    try { await navigator.clipboard.writeText(invite.href); setFeedback('Game link copied.'); }
+    catch { setFeedback('Select the game link to copy it.'); }
   }
-  return <aside className="room-panel" aria-label="Game room">
-    <header className="room-heading"><div><span>ROOM <b data-testid="room-code">{room?.code ?? '------'}</b></span><small><Users size={14} />{game.connected ? `${room?.online ?? 0}/${room?.capacity ?? 50} online` : 'Reconnecting'}</small></div><div className="room-actions">{room?.maintenance && <RoomMaintenance game={game} />}<button className="icon-button" aria-label="Share game" title="Share game / audience QR" aria-expanded={sharing} aria-controls={`${id}-share`} disabled={!room} onClick={() => setSharing(value => !value)}><QrCode size={19} /></button>{game.joined && <button className="icon-button" aria-label="Back to game" title="Back to game" onClick={onReturn}><ArrowUp size={19} /></button>}</div></header>
-    <div className="allowance-strip" aria-label="AI allowance balances">
-      {game.joined && <span>Personal <b data-testid="personal-tokens-left">{game.allowance ? reportedTokenBalance(game.allowance).toLocaleString() : '--'}</b> / <b data-testid="ai-token-limit">{game.allowance?.limit.toLocaleString() ?? '--'}</b></span>}<span>Room <b data-testid="room-tokens-left">{room?.allowance ? reportedTokenBalance(room.allowance).toLocaleString() : '--'}</b> tokens left</span><span><b data-testid="room-requests-left">{room?.requestsRemaining?.toLocaleString() ?? '--'}</b> room requests left</span>
-      {game.joined && <span>Available now <b data-testid="available-tokens-now">{game.allowance && room?.allowance ? Math.min(game.allowance.remaining, room.allowance.remaining).toLocaleString() : '--'}</b></span>}
-      {(game.busy || (game.allowance?.reserved ?? 0) > 0) && <span data-testid="allowance-reserved">{game.allowance?.reserved ? `${game.allowance.reserved.toLocaleString()} held for current request` : 'Reservation pending'}</span>}
-      {(game.allowance?.unconfirmed ?? 0) > 0 && <span data-testid="allowance-unconfirmed">{game.allowance!.unconfirmed.toLocaleString()} held / usage unconfirmed</span>}
-    </div>
-    {sharing && <section className="room-share" id={`${id}-share`} aria-label="Share game">
-      {audienceLink ? <div className="join-qr"><header><h2>Join room {room?.code}</h2><button className="icon-button" aria-label="Enlarge join QR code" title="Enlarge QR code" onClick={() => qrDialog.current?.showModal()}><Maximize2 size={18} /></button></header><QRCodeCanvas value={invite.href} size={256} level="M" marginSize={4} role="img" aria-label="Audience join QR code" /></div> : <p className="field-error" role="status">Audience QR unavailable on localhost. A public or network-accessible game URL is required.</p>}
-      <div className="invite-link"><input aria-label="Game invite link" readOnly value={invite.href} onFocus={event => event.target.select()} /><button className="icon-button" aria-label="Copy game link" title="Copy game link" onClick={() => void copyInvite()}><Copy size={17} /></button></div>
-    </section>}
-    <dialog className="prompt-dialog join-qr-dialog" ref={qrDialog} aria-labelledby={`${id}-qr-title`}>
+  return <>
+    <button className="information-button" aria-label="Share game" aria-haspopup="dialog" disabled={!room} onClick={() => { setFeedback(''); setSharing(true); }}><QrCode size={18} /><span>Share game</span></button>
+    <dialog className="prompt-dialog join-qr-dialog" ref={qrDialog} aria-labelledby={`${id}-qr-title`} onClose={() => setSharing(false)}>
       <header><h2 id={`${id}-qr-title`}>Join room {room?.code}</h2><button className="icon-button" aria-label="Close join QR code" title="Close QR code" onClick={() => qrDialog.current?.close()}><X size={19} /></button></header>
-      {audienceLink && <QRCodeCanvas value={invite.href} size={1024} level="M" marginSize={4} role="img" aria-label="Audience join QR code" />}
-      <a className="qr-join-link" href={invite.href} target="_blank" rel="noopener noreferrer">{invite.href}</a>
-      <button className="icon-button" aria-label="Copy game link" title="Copy game link" onClick={() => void copyInvite()}><Copy size={18} /></button>
+      {sharing && <>
+        {audienceLink ? <QRCodeCanvas value={invite.href} size={1024} level="M" marginSize={4} role="img" aria-label="Audience join QR code" /> : <p className="field-error" role="status">Audience QR unavailable on localhost. A public or network-accessible game URL is required.</p>}
+        <div className="invite-link"><input aria-label="Game invite link" readOnly value={invite.href} onFocus={event => event.target.select()} /><button className="icon-button" aria-label="Copy game link" title="Copy game link" onClick={() => void copyInvite()}><Copy size={18} /></button></div>
+        <a className="qr-join-link" href={invite.href} target="_blank" rel="noopener noreferrer">{invite.href}</a>
+        {feedback && <p role="status">{feedback}</p>}
+      </>}
     </dialog>
-    {!game.joined ? game.sessionName ? <div className="returning-player"><h2>{game.sessionName}</h2><button className="primary-button" disabled={!game.connected || game.joining} onClick={() => game.join()}><Play size={18} />{game.joining ? 'Reconnecting...' : 'Rejoin game'}</button></div> : <GameSetup disabled={!game.connected || !room || room.online >= room.capacity} pending={game.joining} onSubmit={game.join} /> : <div className="player-summary"><div><strong data-testid="player-name">{game.player?.name}</strong><p title={game.player?.tokenText}>{game.player?.tokenText || 'Classic pieces'}</p></div><button className="icon-button" aria-label="Change sentence" title="Change sentence" disabled={game.busy || game.joining || !game.connected} onClick={onEdit}><Quote size={19} /></button></div>}
-    {!game.joined && room && room.online >= room.capacity && <p className="field-error" role="status">Room full. Waiting for a free spot.</p>}
-    <section className="leaderboard" aria-labelledby={`${id}-scores`}>
-      <header><h2 id={`${id}-scores`} tabIndex={-1}><Trophy size={19} />Leaderboard</h2><span className={game.connected ? 'live-label' : ''}>{game.connected ? 'Live' : 'Offline'}</span></header>
+  </>;
+}
+
+export function RoomPanel({ game, rankingsOpen, onCloseRankings, onReturn }: { game: ReturnType<typeof useGame>; rankingsOpen: boolean; onCloseRankings: () => void; onReturn: () => void }) {
+  const id = useId();
+  const [ranking, setRanking] = useState('points');
+  const [page, setPage] = useState(0);
+  const rankingsDialog = useRef<HTMLDialogElement | null>(null);
+  const room = game.room;
+  const entries = (ranking === 'points' ? room?.pointsLeaderboard : room?.leaderboard?.filter(entry => entry.challengeScore !== null)) ?? [];
+  const pageCount = Math.max(1, Math.ceil(entries.length / 10));
+  const currentPage = Math.min(page, pageCount - 1);
+  const ownIndex = entries.findIndex(entry => entry.id === game.player?.id);
+  useEffect(() => {
+    if (rankingsOpen) {
+      rankingsDialog.current?.showModal();
+      rankingsDialog.current?.querySelector<HTMLElement>('h2')?.focus({ preventScroll: true });
+    }
+  }, [rankingsOpen]);
+  useEffect(() => { if (game.resetVersion) rankingsDialog.current?.close(); }, [game.resetVersion]);
+  const leaderboard = <section className="leaderboard" aria-labelledby={`${id}-scores`}>
+      <header><h2 id={`${id}-scores`} tabIndex={-1}><Trophy size={19} />Leaderboard</h2><span className={game.connected ? 'live-label' : ''}>{game.connected ? 'Live' : 'Offline'}</span>{rankingsOpen && <button className="icon-button" aria-label="Close leaderboard" title="Close leaderboard" onClick={() => rankingsDialog.current?.close()}><X size={19} /></button>}</header>
       <fieldset className="segmented-control"><legend className="visually-hidden">Rank by</legend>{['points', 'efficiency'].map(value => <label key={value}><input type="radio" name={`${id}-ranking`} checked={ranking === value} onChange={() => { setRanking(value); setPage(0); }} /><span>{value === 'points' ? 'Points' : 'Points / cent'}</span></label>)}</fieldset>
       <table><caption className="visually-hidden">Top 50 by {ranking === 'points' ? 'best Tetris score' : 'points per estimated US cent'}</caption><thead><tr><th scope="col">#</th><th scope="col">Player</th><th scope="col">{ranking === 'points' ? 'Points' : 'Pts / cent'}</th></tr></thead><tbody>
         {entries.slice(currentPage * 10, (currentPage + 1) * 10).map((entry, index) => <tr key={entry.id} data-testid="leaderboard-row" data-player-id={entry.id} aria-current={entry.id === game.player?.id ? 'true' : undefined}>
@@ -212,6 +219,18 @@ export function RoomPanel({ game, onEdit, onReturn }: { game: ReturnType<typeof 
       </tbody></table>
       <footer><span>{entries.length} listed / top 50</span><div><button className="icon-button" aria-label="Previous leaderboard page" title="Previous page" disabled={currentPage === 0} onClick={() => setPage(currentPage - 1)}><ChevronLeft size={18} /></button><span data-testid="leaderboard-page">{currentPage + 1}/{pageCount}</span><button className="icon-button" aria-label="Next leaderboard page" title="Next page" disabled={currentPage + 1 >= pageCount} onClick={() => setPage(currentPage + 1)}><ChevronRight size={18} /></button></div></footer>
       {game.joined && <div className="own-rank"><span>Your position <b data-testid="own-rank">{ownIndex >= 0 ? `#${ownIndex + 1}` : ranking === 'points' ? 'Outside top 50' : 'Unranked'}</b></span><button className="icon-button" aria-label="Show my ranking" title="Show my ranking" disabled={ownIndex < 0} onClick={() => setPage(Math.floor(ownIndex / 10))}><LocateFixed size={18} /></button></div>}
-    </section>
+    </section>;
+  return <aside className="room-panel" aria-label="Game room">
+    <header className="room-heading"><div><span>ROOM <b data-testid="room-code">{room?.code ?? '------'}</b></span><small><Users size={14} />{game.connected ? `${room?.online ?? 0}/${room?.capacity ?? 50} online` : 'Reconnecting'}</small></div>{game.joined && <button className="icon-button" aria-label="Back to game" title="Back to game" onClick={onReturn}><ArrowUp size={19} /></button>}</header>
+    <div className="allowance-strip" aria-label="AI allowance balances">
+      {game.joined && <span>Personal <b data-testid="personal-tokens-left">{game.allowance ? reportedTokenBalance(game.allowance).toLocaleString() : '--'}</b> / <b data-testid="ai-token-limit">{game.allowance?.limit.toLocaleString() ?? '--'}</b></span>}<span>Room <b data-testid="room-tokens-left">{room?.allowance ? reportedTokenBalance(room.allowance).toLocaleString() : '--'}</b> tokens left</span><span><b data-testid="room-requests-left">{room?.requestsRemaining?.toLocaleString() ?? '--'}</b> room requests left</span>
+      {game.joined && <span>Available now <b data-testid="available-tokens-now">{game.allowance && room?.allowance ? Math.min(game.allowance.remaining, room.allowance.remaining).toLocaleString() : '--'}</b></span>}
+      {(game.busy || (game.allowance?.reserved ?? 0) > 0) && <span data-testid="allowance-reserved">{game.allowance?.reserved ? `${game.allowance.reserved.toLocaleString()} held for current request` : 'Reservation pending'}</span>}
+      {(game.allowance?.unconfirmed ?? 0) > 0 && <span data-testid="allowance-unconfirmed">{game.allowance!.unconfirmed.toLocaleString()} held / usage unconfirmed</span>}
+    </div>
+    {!game.joined ? game.sessionName ? <div className="returning-player"><h2>{game.sessionName}</h2><button className="primary-button" disabled={!game.connected || game.joining} onClick={() => game.join()}><Play size={18} />{game.joining ? 'Reconnecting...' : 'Rejoin game'}</button></div> : <GameSetup disabled={!game.connected || !room || room.online >= room.capacity} pending={game.joining} onSubmit={game.join} /> : <div className="player-summary"><div><strong data-testid="player-name">{game.player?.name}</strong><p title={game.player?.tokenText}>{game.player?.tokenText || 'Classic pieces'}</p></div></div>}
+    {!game.joined && room && room.online >= room.capacity && <p className="field-error" role="status">Room full. Waiting for a free spot.</p>}
+    {!rankingsOpen && leaderboard}
+    <dialog className="prompt-dialog leaderboard-dialog" ref={rankingsDialog} aria-labelledby={`${id}-scores`} onClose={onCloseRankings}>{rankingsOpen && leaderboard}</dialog>
   </aside>;
 }
