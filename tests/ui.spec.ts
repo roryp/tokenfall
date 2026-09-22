@@ -253,7 +253,6 @@ for (const viewport of [{ width: 1366, height: 768 }, { width: 390, height: 844 
       { button: 'Inspect cached instructions', title: 'Cache activity', close: 'Close prompt', suspends: false },
       { button: 'Inspect last prompt', title: 'Compression before / after', close: 'Close prompt', suspends: true },
       { button: 'AI costs', title: 'AI costs & usage', close: 'Close AI costs', suspends: false },
-      { button: 'Adjust AI allowance', title: 'AI token allowance', close: 'Close allowance', suspends: true },
       { button: 'Show leaderboard', title: 'Leaderboard', close: 'Close leaderboard', suspends: false },
       { button: 'Share game', title: `Join room ${application.room.code}`, close: 'Close join QR code', suspends: false },
       { button: 'Room maintenance', title: 'Room maintenance', close: 'Cancel', suspends: true },
@@ -644,44 +643,6 @@ for (const mode of ['all', 'scores'] as const) {
     assert.deepEqual(setup.errors, []);
   });
 }
-
-test('Save allowance preserves a rejected value and Luna settings before a successful retry', async context => {
-  const setup = await fixture(undefined, true, false, { compression: true, cache: true });
-  context.after(setup.close);
-  const { page, application } = setup;
-  const assist = application.room.assist.bind(application.room);
-  const setAllowance = application.room.setAllowance.bind(application.room);
-  application.room.assist = async () => { throw new RequestError('Test allowance requires attention.', 'budget'); };
-  await page.getByRole('checkbox', { name: 'Ask Luna', exact: true }).check();
-  await page.getByRole('button', { name: 'Retry Luna', exact: true }).waitFor();
-  const run = setup.player().runId;
-  const saved = await page.evaluate(() => sessionStorage.getItem('tetris-luna-options'));
-  await page.getByRole('button', { name: 'Adjust AI allowance', exact: true }).click();
-  const dialog = page.getByRole('dialog', { name: 'AI token allowance', exact: true });
-  const input = dialog.getByRole('spinbutton', { name: 'AI token allowance', exact: true });
-  await input.fill('2000000');
-  application.room.setAllowance = () => { throw new RequestError('Test allowance update rejected.', 'budget'); };
-  await dialog.getByRole('button', { name: 'Save allowance', exact: true }).click();
-  await dialog.getByRole('alert').filter({ hasText: 'Test allowance update rejected.' }).waitFor();
-  assert.equal(await input.inputValue(), '2000000');
-  assert.equal(setup.player().record.token_limit, 1000000);
-  assert.equal(await page.getByRole('checkbox', { name: 'Ask Luna', exact: true }).isChecked(), true);
-  assert.equal(await page.evaluate(() => sessionStorage.getItem('tetris-luna-options')), saved);
-  assert.equal(setup.player().runId, run);
-  assert.equal(setup.calls.length, 0);
-  application.room.setAllowance = setAllowance;
-  application.room.assist = assist;
-  setup.controls.hold = true;
-  await dialog.getByRole('button', { name: 'Save allowance', exact: true }).click();
-  await dialog.waitFor({ state: 'hidden' });
-  await setup.waitForCalls(1);
-  assert.equal(setup.player().record.token_limit, 2000000);
-  assert.equal(setup.player().runId, run);
-  await page.getByRole('button', { name: 'Stop Luna', exact: true }).click();
-  setup.release();
-  await waitRequests(page, 1);
-  assert.deepEqual(setup.errors, []);
-});
 
 test('Admin preview failure and expiry preserve options and require a fresh confirmation', async context => {
   const setup = await fixture(undefined, true, false, { compression: true, cache: true }, true);
@@ -1978,7 +1939,7 @@ test('allowance countdown separates shared room tokens, request slots, and unrep
   const { page, application } = setup;
   const other = application.room.join('Other Budget', application.room.code, undefined, 'other-budget');
   const otherPlayer = application.room.players.get(other.playerId)!;
-  otherPlayer.metrics = { ...emptyMetrics(), requests: 1999, input: 7980000 };
+  otherPlayer.metrics = { ...emptyMetrics(), requests: 1999, input: 49980000 };
   otherPlayer.record.attempts = 1999;
   application.room.disconnect('other-budget');
   await page.waitForFunction(() => document.querySelector('[data-testid="room-requests-left"]')?.textContent === '1');

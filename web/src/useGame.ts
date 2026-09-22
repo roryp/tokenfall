@@ -197,7 +197,7 @@ export function useGame() {
     refresh();
   }
 
-  function join(setup?: { name: string; text?: string; tokenLimit?: number }) {
+  function join(setup?: { name: string; text?: string }) {
     if (!roomRef.current || !socket.current?.connected || active.current || joiningRef.current) return;
     const code = roomRef.current.code;
     const previous = session.current?.room === code ? session.current : null;
@@ -207,7 +207,7 @@ export function useGame() {
     setJoining(true);
     setNotice('');
     const name = previous?.name ?? setup!.name.trim();
-    socket.current.timeout(8000).emit('join', { name, room: code, ...(previous ? { token: previous.token } : { tokenLimit: setup?.tokenLimit, ...(setup?.text !== undefined ? { text: setup.text } : {}) }) }, (error: Error | null, reply: Reply<JoinResult>) => {
+    socket.current.timeout(8000).emit('join', { name, room: code, ...(previous ? { token: previous.token } : { ...(setup?.text !== undefined ? { text: setup.text } : {}) }) }, (error: Error | null, reply: Reply<JoinResult>) => {
       joiningRef.current = false;
       setJoining(false);
       if (error || !reply.ok) {
@@ -355,7 +355,7 @@ export function useGame() {
     });
   }
 
-  async function restart(text?: string, tokenLimit?: number): Promise<boolean> {
+  async function restart(text?: string): Promise<boolean> {
     if (!socket.current?.connected || !active.current || requestPending.current || joiningRef.current) return false;
     const wasInspecting = inspection.current;
     joiningRef.current = true;
@@ -371,33 +371,13 @@ export function useGame() {
           resolve(true);
         };
         if (text === undefined) socket.current!.timeout(8000).emit('restart', receive);
-        else socket.current!.timeout(8000).emit('configure', { text, tokenLimit }, receive);
+        else socket.current!.timeout(8000).emit('configure', { text }, receive);
       });
     } finally {
       joiningRef.current = false;
       setJoining(false);
       if (!wasInspecting) resumeAfterInspection();
     }
-  }
-
-  async function adjustAllowance(tokenLimit: number): Promise<boolean> {
-    if (!socket.current?.connected || !active.current || joiningRef.current) return false;
-    pauseForInspection();
-    joiningRef.current = true;
-    setJoining(true);
-    return new Promise(resolve => {
-      socket.current!.timeout(8000).emit('allowance', { tokenLimit }, (error: Error | null, reply: Reply<PlayerUsage>) => {
-        joiningRef.current = false;
-        setJoining(false);
-        if (error || !reply.ok) { setNotice(!error && !reply.ok ? reply.error : 'Could not update the allowance. Try again.'); resolve(false); return; }
-        setAllowance(reply.data.allowance);
-        setMetrics(reply.data.metrics);
-        setUnmeteredRequests(reply.data.unmeteredRequests);
-        retryAutopilot();
-        setNotice('');
-        resolve(true);
-      });
-    });
   }
 
   const onJoin = useEffectEvent(join);
@@ -480,5 +460,5 @@ export function useGame() {
 
   const rates = room?.pricing.snapshot?.usdPerMillion;
   const cost = rates ? costForUsage(metrics, rates) : null;
-  return { room, connected, joined, joining, player, sessionName, view, metrics, allowance, adjustAllowance, insight, requestHistory, cost, busy, notice, setNotice, options, setOptions, autopilot, autopilotStatus, inspectionPaused, pauseForInspection, resumeAfterInspection, prepareMaintenance, resetVersion, retryAutopilot, toggleAutopilot, requestOptions, unmeteredRequests, join, act, restart };
+  return { room, connected, joined, joining, player, sessionName, view, metrics, allowance, insight, requestHistory, cost, busy, notice, setNotice, options, setOptions, autopilot, autopilotStatus, inspectionPaused, pauseForInspection, resumeAfterInspection, prepareMaintenance, resetVersion, retryAutopilot, toggleAutopilot, requestOptions, unmeteredRequests, join, act, restart };
 }

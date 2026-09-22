@@ -1,10 +1,10 @@
 import { useEffect, useRef, useState } from 'react';
-import { Bot, Brain, Columns2, FileJson2, History, Layers3, Pause, Play, Plug, Quote, ReceiptText, RotateCcw, ScanSearch, SlidersHorizontal, Trophy, Wifi, WifiOff, X } from 'lucide-react';
+import { Bot, Brain, Columns2, FileJson2, History, Layers3, Pause, Play, Plug, Quote, ReceiptText, RotateCcw, ScanSearch, Trophy, Wifi, WifiOff, X } from 'lucide-react';
 import type { LucideIcon } from 'lucide-react';
 import { costForUsage, reportedTokenBalance } from '../../shared/protocol.ts';
 import type { Insight, McpLookaheadResult, TokenRates } from '../../shared/protocol.ts';
 import { GameBoard, GameControls, PiecePreview } from './GameBoard.tsx';
-import { AllowanceEditor, GameSetup, RoomMaintenance, RoomPanel, RoomShare } from './RoomPanel.tsx';
+import { GameSetup, RoomMaintenance, RoomPanel, RoomShare } from './RoomPanel.tsx';
 import { formatMoney } from './format.ts';
 import { useGame } from './useGame.ts';
 import type { RequestRecord } from './useGame.ts';
@@ -110,8 +110,6 @@ export default function App() {
   const promptDialog = useRef<HTMLDialogElement | null>(null);
   const [editingSentence, setEditingSentence] = useState(false);
   const sentenceDialog = useRef<HTMLDialogElement | null>(null);
-  const [editingAllowance, setEditingAllowance] = useState(false);
-  const allowanceDialog = useRef<HTMLDialogElement | null>(null);
   const [inspectedLookup, setInspectedLookup] = useState<RequestRecord | null>(null);
   const [mcpOpen, setMcpOpen] = useState(false);
   const mcpDialog = useRef<HTMLDialogElement | null>(null);
@@ -140,12 +138,11 @@ export default function App() {
   const status = !game.connected ? 'Connecting' : !game.joined ? 'Ready' : game.autopilot ? game.inspectionPaused || game.joining || game.autopilotStatus === 'blocked' ? 'Luna paused' : game.busy ? 'Luna is thinking' : game.autopilotStatus === 'retrying' ? 'Luna retrying' : 'Luna playing' : game.view.status === 'over' ? 'Game over' : game.view.status === 'paused' ? 'Manual paused' : 'Manual play';
   useEffect(() => { if (inspectedPrompt) promptDialog.current?.showModal(); }, [inspectedPrompt]);
   useEffect(() => { if (editingSentence) sentenceDialog.current?.showModal(); }, [editingSentence]);
-  useEffect(() => { if (editingAllowance) allowanceDialog.current?.showModal(); }, [editingAllowance]);
   useEffect(() => { if (mcpOpen) mcpDialog.current?.showModal(); }, [mcpOpen]);
   useEffect(() => { if (costsOpen) costsDialog.current?.showModal(); }, [costsOpen]);
   useEffect(() => {
     if (!game.resetVersion) return;
-    for (const dialog of [promptDialog, sentenceDialog, allowanceDialog, mcpDialog, costsDialog]) dialog.current?.close();
+    for (const dialog of [promptDialog, sentenceDialog, mcpDialog, costsDialog]) dialog.current?.close();
   }, [game.resetVersion]);
 
   function inspect(instructions = false) {
@@ -166,12 +163,6 @@ export default function App() {
     game.pauseForInspection();
     setInspectedLookup(lastLookup ?? null);
     setMcpOpen(true);
-  }
-
-  function showAllowance() {
-    game.pauseForInspection();
-    game.setNotice('');
-    setEditingAllowance(true);
   }
 
   return <main className="room-layout" data-playing={game.joined}>
@@ -195,7 +186,6 @@ export default function App() {
         <button className="information-button" aria-label="Inspect cached instructions" aria-haspopup="dialog" title={game.requestHistory.length ? 'Live cache activity and instruction text' : 'Available after a Luna reply in this tab'} disabled={!game.requestHistory.length} onClick={() => inspect(true)}><History size={18} /><span>Cache activity</span></button>
         <button className="information-button" aria-label="Inspect last prompt" aria-haspopup="dialog" title={latest ? 'Compression before / after' : 'Available after a Luna reply in this tab'} disabled={!latest} onClick={() => inspect()}><Columns2 size={18} /><span><span className="information-full-label">Compression</span><span className="information-short-label">Prompts</span></span></button>
         <button className="information-button" aria-haspopup="dialog" onClick={() => { if (!game.autopilot) game.act('pause'); setCostsOpen(true); }}><ReceiptText size={18} /><span>AI costs</span></button>
-        <button className="information-button" aria-label="Adjust AI allowance" aria-haspopup="dialog" disabled={!game.joined || !game.allowance || !game.connected || game.joining} onClick={showAllowance}><SlidersHorizontal size={18} /><span>AI allowance</span></button>
         <button className="information-button" aria-label="Show leaderboard" aria-haspopup="dialog" onClick={showRankings}><Trophy size={18} /><span><span className="information-full-label">Leaderboard</span><span className="information-short-label">Scores</span></span></button>
         <RoomShare game={game} />
         <button className="information-button" aria-label="Change sentence" aria-haspopup="dialog" disabled={!game.joined || game.busy || game.joining || !game.connected} onClick={() => { game.pauseForInspection(); game.setNotice(''); setEditingSentence(true); }}><Quote size={18} /><span>Change sentence</span></button>
@@ -284,11 +274,6 @@ export default function App() {
         <CacheReceipt insight={latest} rates={rates} pending={game.busy} enabled={game.autopilot && game.options.cache} hasHistory={game.metrics.requests > 0} />
       </div>
     </dialog>
-    <dialog className="prompt-dialog allowance-dialog" ref={allowanceDialog} aria-labelledby="allowance-title" onClose={() => { setEditingAllowance(false); game.resumeAfterInspection(); }}>
-      <header><h2 id="allowance-title">AI token allowance</h2><button className="icon-button" aria-label="Close allowance" title="Close allowance" onClick={() => allowanceDialog.current?.close()}><X size={19} /></button></header>
-      {editingAllowance && game.notice && <p className="field-error" role="alert">{game.notice}</p>}
-      {editingAllowance && game.allowance && <AllowanceEditor allowance={game.allowance} room={game.room} disabled={!game.connected} pending={game.joining} onSave={async limit => { if (await game.adjustAllowance(limit)) allowanceDialog.current?.close(); }} />}
-    </dialog>
     <dialog className="prompt-dialog mcp-dialog" ref={mcpDialog} aria-labelledby="mcp-title" onClose={() => { setMcpOpen(false); setInspectedLookup(null); game.resumeAfterInspection(); }}>
       <header><h2 id="mcp-title">MCP lookup</h2><button className="icon-button" aria-label="Close MCP lookup" title="Close MCP lookup" onClick={() => mcpDialog.current?.close()}><X size={19} /></button></header>
       {lookupRecord?.insight.mcpLookup ? <McpResults record={lookupRecord} rates={rates} /> : <p data-testid="mcp-empty" role="status">{game.requestOptions?.mcp ? 'MCP-enabled request in progress. Result pending.' : 'No MCP results received in this tab.'}</p>}
@@ -296,7 +281,7 @@ export default function App() {
     <dialog className="prompt-dialog sentence-dialog" ref={sentenceDialog} aria-labelledby="sentence-title" onClose={() => { setEditingSentence(false); game.resumeAfterInspection(); }}>
       <header><h2 id="sentence-title">New sentence</h2><button className="icon-button" aria-label="Close sentence editor" title="Close sentence editor" onClick={() => sentenceDialog.current?.close()}><X size={19} /></button></header>
       {editingSentence && game.notice && <p className="field-error" role="alert">{game.notice}</p>}
-      {editingSentence && <GameSetup editing initialText={game.player?.tokenText || undefined} initialTokenLimit={game.allowance?.limit} disabled={!game.connected} pending={game.joining} onSubmit={async setup => { if (await game.restart(setup.text, setup.tokenLimit)) sentenceDialog.current?.close(); }} />}
+      {editingSentence && <GameSetup editing initialText={game.player?.tokenText || undefined} disabled={!game.connected} pending={game.joining} onSubmit={async setup => { if (await game.restart(setup.text)) sentenceDialog.current?.close(); }} />}
     </dialog>
     <dialog className={`prompt-dialog ${inspectInstructions ? 'activity-dialog' : 'compression-dialog'}`} ref={promptDialog} aria-labelledby="prompt-title" onClose={() => { setInspectedPrompt(null); if (!inspectInstructions) game.resumeAfterInspection(); }}>
       <header><h2 id="prompt-title">{inspectInstructions ? 'Cache activity' : 'Compression before / after'}</h2><div className="inspector-actions">{inspectInstructions && game.autopilot && <button className="icon-button" aria-label="Stop Luna in inspector" title="Stop Luna" onClick={() => game.toggleAutopilot(false)}><Pause size={19} /></button>}<button className="icon-button" aria-label="Close prompt" title="Close prompt" onClick={() => promptDialog.current?.close()}><X size={19} /></button></div></header>

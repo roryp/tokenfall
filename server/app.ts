@@ -5,7 +5,6 @@ import express from 'express';
 import { Server } from 'socket.io';
 import { z } from 'zod';
 import { ACTIONS } from '../shared/game.ts';
-import { MAX_TOKEN_ALLOWANCE } from '../shared/protocol.ts';
 import type { ClientEvents, ServerEvents, Reply, RoomResetResult } from '../shared/protocol.ts';
 import { ROOT } from './config.ts';
 import type { AppConfig } from './config.ts';
@@ -15,10 +14,8 @@ import { Room } from './room.ts';
 import { countTokens, tokenChips } from './tokens.ts';
 
 const nameSchema = z.string().trim().min(2).max(16).regex(/^[\p{L}\p{N} _-]+$/u, 'Use letters, numbers, spaces, underscores or hyphens.');
-const tokenLimitSchema = z.number().int().min(1).max(MAX_TOKEN_ALLOWANCE);
-const setupSchema = z.object({ text: z.string().min(1).max(500), tokenLimit: tokenLimitSchema.optional() }).strict();
-const allowanceSchema = z.object({ tokenLimit: tokenLimitSchema }).strict();
-const joinSchema = z.object({ name: nameSchema, room: z.string().length(6), token: z.string().length(64).optional(), text: z.string().min(1).max(500).optional(), classic: z.boolean().optional(), tokenLimit: tokenLimitSchema.optional() }).strict();
+const setupSchema = z.object({ text: z.string().min(1).max(500) }).strict();
+const joinSchema = z.object({ name: nameSchema, room: z.string().length(6), token: z.string().length(64).optional(), text: z.string().min(1).max(500).optional(), classic: z.boolean().optional() }).strict();
 const inputSchema = z.object({
   runId: z.string().uuid(), sequence: z.number().int().positive(), frame: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
   events: z.array(z.object({ frame: z.number().int().nonnegative(), action: z.enum(ACTIONS) }).strict()).max(64),
@@ -134,7 +131,7 @@ export function createApplication(config: AppConfig, gateway: ModelGateway = new
         window.count += 1;
         joinWindows.set(address, window);
         if (window.count > 150) throw new RequestError('Too many join attempts. Try again shortly.', 'rate', 30000);
-        respond({ ok: true, data: room.join(data.name, data.room, data.token, socket.id, data.text, data.classic, data.tokenLimit) });
+        respond({ ok: true, data: room.join(data.name, data.room, data.token, socket.id, data.text, data.classic) });
         io.emit('room', room.view());
       } catch (error) { respond(errorReply(error)); }
     });
@@ -152,13 +149,8 @@ export function createApplication(config: AppConfig, gateway: ModelGateway = new
       if (typeof respond !== 'function') return;
       try {
         const data = setupSchema.parse(payload);
-        respond({ ok: true, data: room.restart(room.playerFor(socket.id), data.text, data.tokenLimit) });
+        respond({ ok: true, data: room.restart(room.playerFor(socket.id), data.text) });
       }
-      catch (error) { respond(errorReply(error)); }
-    });
-    socket.on('allowance', (payload, respond) => {
-      if (typeof respond !== 'function') return;
-      try { respond({ ok: true, data: room.setAllowance(room.playerFor(socket.id), allowanceSchema.parse(payload).tokenLimit) }); }
       catch (error) { respond(errorReply(error)); }
     });
     socket.on('inspect', respond => {

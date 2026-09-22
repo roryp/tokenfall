@@ -2,42 +2,20 @@ import { useEffect, useId, useRef, useState } from 'react';
 import { ArrowUp, Check, ChevronLeft, ChevronRight, Copy, LocateFixed, Play, QrCode, RotateCcw, Settings2, Trash2, Trophy, Users, X } from 'lucide-react';
 import { QRCodeCanvas } from 'qrcode.react';
 import { DEFAULT_TOKEN_TEXT, tokenLabel, tokenShape } from '../../shared/game.ts';
-import { DEFAULT_TOKEN_ALLOWANCE, MAX_TOKEN_ALLOWANCE, reportedTokenBalance } from '../../shared/protocol.ts';
-import type { RoomResetMode, RoomResetPreview, RoomResetResult, RoomView, TokenAllowance, TokenChip } from '../../shared/protocol.ts';
+import { reportedTokenBalance } from '../../shared/protocol.ts';
+import type { RoomResetMode, RoomResetPreview, RoomResetResult, TokenChip } from '../../shared/protocol.ts';
 import { PiecePreview } from './GameBoard.tsx';
 import { formatMoney } from './format.ts';
 import type { useGame } from './useGame.ts';
 
-function AllowanceInput({ value, onChange, disabled }: { value: string; onChange: (value: string) => void; disabled: boolean }) {
-  const id = useId();
-  return <div className="allowance-field"><label htmlFor={id}>AI token allowance</label><input id={id} type="number" inputMode="numeric" min={1} max={MAX_TOKEN_ALLOWANCE} step={1} required value={value} onChange={event => onChange(event.target.value)} disabled={disabled} aria-describedby={`${id}-scope`} /><small id={`${id}-scope`}>Luna + MCP input + reasoning. Up to {MAX_TOKEN_ALLOWANCE.toLocaleString()} tokens.</small></div>;
-}
-
-export function AllowanceEditor({ allowance, room, disabled, pending, onSave }: {
-  allowance: TokenAllowance; room: RoomView | null; disabled: boolean; pending: boolean; onSave: (limit: number) => void;
-}) {
-  const [limit, setLimit] = useState(String(allowance.limit));
-  const value = Number(limit);
-  const committed = allowance.used + allowance.reserved + allowance.unconfirmed;
-  const valid = Number.isSafeInteger(value) && value >= committed && value <= MAX_TOKEN_ALLOWANCE;
-  return <form className="allowance-form" onSubmit={event => { event.preventDefault(); if (valid && !disabled && !pending) onSave(value); }}>
-    <dl className="allowance-breakdown"><div><dt>Your balance after reported usage</dt><dd>{reportedTokenBalance(allowance).toLocaleString()}</dd></div><div><dt>Reported tokens used</dt><dd>{allowance.used.toLocaleString()}</dd></div><div><dt>Held for in-flight request</dt><dd>{allowance.reserved.toLocaleString()}</dd></div><div><dt>Held for unreported usage <small>upper bound</small></dt><dd>{allowance.unconfirmed.toLocaleString()}</dd></div><div><dt>Your available tokens after holds</dt><dd>{allowance.remaining.toLocaleString()}</dd></div><div><dt>Shared room balance</dt><dd>{room?.allowance ? reportedTokenBalance(room.allowance).toLocaleString() : '--'}</dd></div><div><dt>Room available after holds</dt><dd>{room?.allowance?.remaining.toLocaleString() ?? '--'}</dd></div><div><dt>Shared room requests left</dt><dd>{room?.requestsRemaining?.toLocaleString() ?? '--'}</dd></div></dl>
-    <AllowanceInput value={limit} onChange={setLimit} disabled={pending || disabled} />
-    {value < committed && <p className="field-error">At least {committed.toLocaleString()} tokens are already used or held.</p>}
-    <p className="prompt-comparison">One pool for all AI modes. MCP context is included in input; reasoning is included in output. Cached input counts as tokens at its discounted price. Used tokens persist across games. Your limit does not reserve the shared room balance.</p>
-    <button type="submit" className="primary-button" disabled={disabled || pending || !valid}><Check size={18} />{pending ? 'Saving...' : 'Save allowance'}</button>
-  </form>;
-}
-
-export function GameSetup({ initialText = DEFAULT_TOKEN_TEXT, initialTokenLimit = DEFAULT_TOKEN_ALLOWANCE, editing = false, disabled, pending, onSubmit }: {
-  initialText?: string; initialTokenLimit?: number; editing?: boolean; disabled: boolean; pending: boolean;
-  onSubmit: (setup: { name: string; text?: string; tokenLimit: number }) => void;
+export function GameSetup({ initialText = DEFAULT_TOKEN_TEXT, editing = false, disabled, pending, onSubmit }: {
+  initialText?: string; editing?: boolean; disabled: boolean; pending: boolean;
+  onSubmit: (setup: { name: string; text?: string }) => void;
 }) {
   const id = useId();
   const [name, setName] = useState('');
   const [text, setText] = useState(initialText);
   const [mode, setMode] = useState('sentence');
-  const [tokenLimit, setTokenLimit] = useState(String(initialTokenLimit));
   const [preview, setPreview] = useState<{ text: string; count: number; tokens: TokenChip[] } | null>(null);
   const [failure, setFailure] = useState<{ text: string; message: string } | null>(null);
   const [retry, setRetry] = useState(0);
@@ -60,16 +38,14 @@ export function GameSetup({ initialText = DEFAULT_TOKEN_TEXT, initialTokenLimit 
   const error = failure?.text === text ? failure.message : null;
   const validName = editing || /^[\p{L}\p{N} _-]{2,16}$/u.test(name.trim());
   const validText = mode === 'classic' || Boolean(text.trim() && current && current.count > 0 && current.count <= 256 && !error);
-  const validLimit = Number.isSafeInteger(Number(tokenLimit)) && Number(tokenLimit) >= 1 && Number(tokenLimit) <= MAX_TOKEN_ALLOWANCE;
-  return <form className="join-form" aria-label={editing ? 'Change sentence' : 'Join game'} onSubmit={event => { event.preventDefault(); if (!disabled && !pending && validName && validText && validLimit) onSubmit({ name: name.trim(), tokenLimit: Number(tokenLimit), ...(mode === 'sentence' ? { text } : {}) }); }}>
+  return <form className="join-form" aria-label={editing ? 'Change sentence' : 'Join game'} onSubmit={event => { event.preventDefault(); if (!disabled && !pending && validName && validText) onSubmit({ name: name.trim(), ...(mode === 'sentence' ? { text } : {}) }); }}>
     {!editing && <><h2>Join game</h2><label htmlFor={`${id}-name`}>Name</label><input id={`${id}-name`} name="name" autoComplete="nickname" placeholder="Your name" required minLength={2} maxLength={16} value={name} onChange={event => setName(event.target.value)} disabled={pending} aria-describedby={name && !validName ? `${id}-name-error` : undefined} />{name && !validName && <small id={`${id}-name-error`} className="field-error">Use 2-16 letters, numbers, spaces, _ or -.</small>}
       <fieldset className="segmented-control"><legend>Pieces</legend>{['sentence', 'classic'].map(value => <label key={value}><input type="radio" name={`${id}-mode`} value={value} checked={mode === value} onChange={() => setMode(value)} disabled={pending} /><span>{value === 'sentence' ? 'Sentence' : 'Classic'}</span></label>)}</fieldset></>}
     {mode === 'sentence' && <><label htmlFor={`${id}-sentence`}>Your sentence</label><textarea id={`${id}-sentence`} name="sentence" rows={3} maxLength={500} required value={text} onChange={event => setText(event.target.value)} disabled={pending} aria-describedby={`${id}-preview-status`} />
       <div className="token-preview-status" id={`${id}-preview-status`} role="status"><span>{error ?? (!text.trim() ? 'Enter a sentence.' : current ? current.count > 256 ? 'Use at most 256 tokens.' : `${current.count} tokens / o200k_base` : 'Preparing blocks...')}</span><span>{text.length}/500</span>{error && <button type="button" className="icon-button" aria-label="Retry token preview" title="Retry token preview" onClick={() => { setFailure(null); setRetry(value => value + 1); }}><RotateCcw size={17} /></button>}</div>
       {current && current.count <= 256 && <ol className="token-stream" aria-label="Sentence blocks">{current.tokens.map((chip, index) => <li key={index} data-token-id={chip.id} data-piece={tokenShape(chip.id)} title={`Token ${chip.id} / ${tokenShape(chip.id)} piece`}><PiecePreview piece={tokenShape(chip.id)} /><span>{tokenLabel(chip.text)}</span></li>)}</ol>}
     </>}
-    <AllowanceInput value={tokenLimit} onChange={setTokenLimit} disabled={pending} />
-    <button type="submit" className="primary-button" disabled={disabled || pending || !validName || !validText || !validLimit}><Play size={18} />{pending ? editing ? 'Starting...' : 'Joining...' : editing ? 'Start with sentence' : 'Join game'}</button>
+    <button type="submit" className="primary-button" disabled={disabled || pending || !validName || !validText}><Play size={18} />{pending ? editing ? 'Starting...' : 'Joining...' : editing ? 'Start with sentence' : 'Join game'}</button>
   </form>;
 }
 

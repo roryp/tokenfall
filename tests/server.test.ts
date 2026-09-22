@@ -11,7 +11,7 @@ import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js'
 import { io as connect } from 'socket.io-client';
 import { TETROMINOES } from 'miaoda-game-fallblock-core';
 import { boardMetrics, Game, placementsFor } from '../shared/game.ts';
-import { costForUsage, emptyMetrics, reportedTokenBalance, tokenAllowance, tokenCreditsUsed } from '../shared/protocol.ts';
+import { costForUsage, DEFAULT_TOKEN_ALLOWANCE, emptyMetrics, reportedTokenBalance, tokenAllowance, tokenCreditsUsed } from '../shared/protocol.ts';
 import type { Insight, JoinResult, Reply, RoomView, TokenPricing } from '../shared/protocol.ts';
 import { createApplication } from '../server/app.ts';
 import { loadConfig } from '../server/config.ts';
@@ -169,7 +169,6 @@ for (const mode of ['all', 'scores'] as const) test(`in-app room reset ${mode} c
     const operation = room.reset(mode, room.code);
     assert.equal(room.maintenanceStatus.resetting, true);
     assert.throws(() => room.join('Late join', room.code, undefined, 'late'), /reset in progress/);
-    assert.throws(() => room.setAllowance(player, 100000), /reset in progress/);
     await assert.rejects(room.reset(mode, room.code), /reset in progress/);
     const result = await operation;
     assert.equal(result.applied, true);
@@ -312,35 +311,27 @@ test('AI allowance counts output and MCP input once and distinguishes unavailabl
   assert.throws(() => gate.acquire('shared', 4000, 0, ROOM_TOKEN_BUDGET - 1000), error => (error as { code: string }).code === 'room-budget');
 });
 
-test('personal AI allowances persist and can be increased without resetting scores, usage or sentence games', async context => {
+test('personal AI allowances are fixed at 1 million tokens and persist across restarts', async context => {
   context.mock.timers.enable({ apis: ['Date'], now: 20000 });
   const setup = fixture();
   let room = new Room(setup.config, setup.gateway);
   try {
-    const joined = room.join('Budget Setup', room.code, undefined, 'budget', 'A shared token pool.', false, 24000);
+    const joined = room.join('Budget Setup', room.code, undefined, 'budget', 'A shared token pool.');
     const player = room.playerFor('budget');
-    assert.equal(joined.allowance.limit, 24000);
-    assert.equal(joined.allowance.remaining, 24000);
+    assert.equal(joined.allowance.limit, 1000000);
+    assert.equal(joined.allowance.remaining, 1000000);
     player.metrics = { ...emptyMetrics(), input: 20000, output: 1000, cached: 7000, reasoning: 500, requests: 2 };
     player.record.attempts = 2;
     player.record.best_score = 987;
     room.save(player);
-    await assert.rejects(room.assist(player, { compression: true, cache: false }), /3[,\s]000 left/);
-    assert.equal(player.record.attempts, 2);
     const run = player.runId;
-    const adjusted = room.setAllowance(player, 60000);
-    assert.equal(adjusted.allowance.remaining, 39000);
-    assert.equal(player.runId, run);
-    assert.equal(player.record.best_score, 987);
     const reply = await room.assist(player, { compression: true, cache: false });
     assert.equal(reply.allowance.used, 23020);
-    assert.equal(reply.allowance.remaining, 36980);
+    assert.equal(reply.allowance.remaining, 1000000 - 23020);
     assert.equal(reply.allowance.reserved, 0);
     context.mock.timers.tick(2100);
     const restarted = room.restart(player, 'A new sentence.');
     assert.deepEqual(restarted.allowance, reply.allowance);
-    for (const invalid of [0, 15999, 16000.5, 8000001, NaN]) assert.throws(() => room.setAllowance(player, invalid));
-    assert.throws(() => room.setAllowance(player, 16000), /already used or held/);
     room.disconnect('budget');
     room.close();
     room = new Room(setup.config, setup.gateway);
@@ -364,11 +355,11 @@ test('existing databases gain the allowance setting without losing player record
     room.database.exec('ALTER TABLE players DROP COLUMN token_limit');
     room.close();
     room = new Room(setup.config, setup.gateway);
-    const restored = room.join('Legacy Budget', room.code, joined.token, 'resumed', undefined, false, 16000);
+    const restored = room.join('Legacy Budget', room.code, joined.token, 'resumed');
     assert.equal(restored.playerId, joined.playerId);
-    assert.equal(restored.allowance.limit, ROOM_TOKEN_BUDGET);
+    assert.equal(restored.allowance.limit, 1000000);
     assert.equal(restored.allowance.used, 801000);
-    assert.equal(restored.allowance.remaining, ROOM_TOKEN_BUDGET - 801000);
+    assert.equal(restored.allowance.remaining, 1000000 - 801000);
     assert.equal(restored.tokenText, 'Existing sentence.');
     assert.equal(room.view().pointsLeaderboard[0].score, 321);
   } finally { room.close(); rmSync(setup.dataDirectory, { recursive: true, force: true }); }
@@ -381,24 +372,11 @@ test('socket allowance configuration validates the limit and only changes the au
   const address = application.server.address() as { port: number };
   const client = connect(`http://127.0.0.1:${address.port}`, { transports: ['websocket'] });
   try {
-    const notJoined = await client.timeout(5000).emitWithAck('allowance', { tokenLimit: 50000 });
-    assert.equal(notJoined.ok, false);
-    assert.equal(notJoined.code, 'session');
-    for (const tokenLimit of [-1, 0, 16000.5, 8000001, '50000']) {
-      const rejected = await client.timeout(5000).emitWithAck('join', { name: 'Budget Client', room: application.room.code, tokenLimit });
-      assert.equal(rejected.ok, false);
-    }
-    assert.equal(application.room.players.size, 0);
-    const joined = await client.timeout(5000).emitWithAck('join', { name: 'Budget Client', room: application.room.code, text: 'A chosen allowance.', tokenLimit: 50000 });
+    await new Promise<void>(resolve => client.on('connect', resolve));
+    const joined = await client.timeout(5000).emitWithAck('join', { name: 'Budget Client', room: application.room.code, text: 'A fixed allowance.' });
     assert.equal(joined.ok, true);
-    assert.equal(joined.data.allowance.limit, 50000);
-    const invalid = await client.timeout(5000).emitWithAck('allowance', { tokenLimit: 60000, playerId: 'somebody-else' });
-    assert.equal(invalid.ok, false);
-    const changed = await client.timeout(5000).emitWithAck('allowance', { tokenLimit: 60000 });
-    assert.equal(changed.ok, true);
-    assert.equal(changed.data.allowance.remaining, 60000);
-    assert.equal(changed.data.metrics.requests, 0);
-    assert.equal(application.room.players.get(joined.data.playerId)!.runId, joined.data.runId);
+    assert.equal(joined.data.allowance.limit, 1000000);
+    assert.equal(joined.data.allowance.remaining, 1000000);
   } finally { client.disconnect(); await application.close(); rmSync(setup.dataDirectory, { recursive: true, force: true }); }
 });
 
@@ -411,28 +389,28 @@ test('AI allowance reserves in-flight requests and keeps unreported usage distin
     return new Promise<Insight>(resolve => { complete = resolve; });
   } });
   try {
-    room.join('In Flight', room.code, undefined, 'pending', undefined, false, 32000);
+    room.join('In Flight', room.code, undefined, 'pending');
     const player = room.playerFor('pending');
     const pending = room.assist(player, { compression: true, cache: false });
     const held = room.usage(player).allowance;
     assert.ok(held.reserved > 0);
     assert.equal(held.used, 0);
     assert.equal(held.unconfirmed, 0);
-    assert.equal(held.remaining, 32000 - held.reserved);
+    assert.equal(held.remaining, 1000000 - held.reserved);
     assert.equal(room.view().allowance.reserved, held.reserved);
     complete(insightFor(player.game));
     const result = await pending;
     assert.equal(result.allowance.used, 2020);
     assert.equal(result.allowance.reserved, 0);
-    assert.equal(result.allowance.remaining, 29980);
-    room.join('Unknown Usage', room.code, undefined, 'unknown', undefined, false, 32000);
+    assert.equal(result.allowance.remaining, 1000000 - 2020);
+    room.join('Unknown Usage', room.code, undefined, 'unknown');
     fail = true;
     await assert.rejects(room.assist(room.playerFor('unknown'), { compression: true, cache: false }), /usage unavailable/);
     const unknown = room.usage(room.playerFor('unknown')).allowance;
     assert.equal(unknown.used, 0);
     assert.equal(unknown.reserved, 0);
     assert.equal(unknown.unconfirmed, 16000);
-    assert.equal(unknown.remaining, 16000);
+    assert.equal(unknown.remaining, 1000000 - 16000);
     assert.equal(room.view().allowance.unconfirmed, 16000);
   } finally { room.close(); rmSync(setup.dataDirectory, { recursive: true, force: true }); }
 });
@@ -1050,7 +1028,7 @@ test('both game modes continue beyond prototype player limits while retaining sh
       assert.equal(player.record.best_score, 1234);
       assert.equal(result.metrics.input, PLAYER_TOKEN_BUDGET + 12000);
       assert.deepEqual(player.game.tokens, text ? gameTokens(text) : []);
-      assert.equal(room.view().playerTokenBudget, ROOM_TOKEN_BUDGET);
+      assert.equal(room.view().playerTokenBudget, DEFAULT_TOKEN_ALLOWANCE);
       room.disconnect('socket');
       const restored = room.join('Continuous Player', room.code, joined.token, 'restored');
       assert.deepEqual(restored.metrics, result.metrics);
@@ -1153,7 +1131,7 @@ test('standard play permits thirty richer compressed requests after prior spend 
     assert.equal(player.metrics.cached, 0);
     assert.ok(tokenCreditsUsed(player.metrics) > 16000);
     assert.ok(tokenCreditsUsed(player.metrics) < ROOM_TOKEN_BUDGET);
-    assert.equal(room.view().playerTokenBudget, ROOM_TOKEN_BUDGET);
+    assert.equal(room.view().playerTokenBudget, DEFAULT_TOKEN_ALLOWANCE);
     assert.equal(room.view().metrics.input, player.metrics.input);
   } finally { room.close(); rmSync(setup.dataDirectory, { recursive: true, force: true }); }
 });

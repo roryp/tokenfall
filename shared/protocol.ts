@@ -73,7 +73,7 @@ export const emptyMetrics = (): Metrics => ({ requests: 0, input: 0, output: 0, 
 export const tokenCreditsUsed = (usage: Pick<Usage, 'input' | 'output' | 'cached'>) => Math.max(0, usage.input - usage.cached) + usage.output;
 export const MAX_REQUEST_TOKENS = 16000;
 export const DEFAULT_TOKEN_ALLOWANCE = 1000000;
-export const MAX_TOKEN_ALLOWANCE = 8000000;
+export const MAX_TOKEN_ALLOWANCE = 50000000;
 export interface TokenAllowance {
   limit: number;
   used: number;
@@ -212,11 +212,10 @@ export interface ServerEvents {
   roomReset: (reset: { id: string; mode: RoomResetMode }) => void;
 }
 export interface ClientEvents {
-  join: (data: { name: string; room: string; token?: string; text?: string; classic?: boolean; tokenLimit?: number }, reply: (result: Reply<JoinResult>) => void) => void;
+  join: (data: { name: string; room: string; token?: string; text?: string; classic?: boolean }, reply: (result: Reply<JoinResult>) => void) => void;
   inputs: (data: InputBatch, reply: (result: Reply<InputAck>) => void) => void;
   restart: (reply: (result: Reply<JoinResult>) => void) => void;
-  configure: (data: { text: string; tokenLimit?: number }, reply: (result: Reply<JoinResult>) => void) => void;
-  allowance: (data: { tokenLimit: number }, reply: (result: Reply<PlayerUsage>) => void) => void;
+  configure: (data: { text: string }, reply: (result: Reply<JoinResult>) => void) => void;
   inspect: (reply: (result: Reply<PromptPreview>) => void) => void;
   assist: (options: AiOptions, reply: (result: Reply<{ insight: Insight } & PlayerUsage>) => void) => void;
 }
