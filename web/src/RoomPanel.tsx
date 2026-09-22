@@ -2,7 +2,7 @@ import { useEffect, useId, useRef, useState } from 'react';
 import { ArrowUp, Check, ChevronLeft, ChevronRight, Copy, LocateFixed, Play, QrCode, RotateCcw, Settings2, Trash2, Trophy, Users, X } from 'lucide-react';
 import { QRCodeCanvas } from 'qrcode.react';
 import { DEFAULT_TOKEN_TEXT, tokenLabel, tokenShape } from '../../shared/game.ts';
-import { DEFAULT_TOKEN_ALLOWANCE, MAX_REQUEST_TOKENS, MAX_TOKEN_ALLOWANCE, reportedTokenBalance } from '../../shared/protocol.ts';
+import { DEFAULT_TOKEN_ALLOWANCE, MAX_TOKEN_ALLOWANCE, reportedTokenBalance } from '../../shared/protocol.ts';
 import type { RoomResetMode, RoomResetPreview, RoomResetResult, RoomView, TokenAllowance, TokenChip } from '../../shared/protocol.ts';
 import { PiecePreview } from './GameBoard.tsx';
 import { formatMoney } from './format.ts';
@@ -10,7 +10,7 @@ import type { useGame } from './useGame.ts';
 
 function AllowanceInput({ value, onChange, disabled }: { value: string; onChange: (value: string) => void; disabled: boolean }) {
   const id = useId();
-  return <div className="allowance-field"><label htmlFor={id}>AI token allowance</label><input id={id} type="number" inputMode="numeric" min={MAX_REQUEST_TOKENS} max={MAX_TOKEN_ALLOWANCE} step={1} required value={value} onChange={event => onChange(event.target.value)} disabled={disabled} aria-describedby={`${id}-scope`} /><small id={`${id}-scope`}>Luna + MCP input + reasoning. {MAX_REQUEST_TOKENS.toLocaleString()} to {MAX_TOKEN_ALLOWANCE.toLocaleString()} tokens.</small></div>;
+  return <div className="allowance-field"><label htmlFor={id}>AI token allowance</label><input id={id} type="number" inputMode="numeric" min={1} max={MAX_TOKEN_ALLOWANCE} step={1} required value={value} onChange={event => onChange(event.target.value)} disabled={disabled} aria-describedby={`${id}-scope`} /><small id={`${id}-scope`}>Luna + MCP input + reasoning. Up to {MAX_TOKEN_ALLOWANCE.toLocaleString()} tokens.</small></div>;
 }
 
 export function AllowanceEditor({ allowance, room, disabled, pending, onSave }: {
@@ -19,9 +19,9 @@ export function AllowanceEditor({ allowance, room, disabled, pending, onSave }: 
   const [limit, setLimit] = useState(String(allowance.limit));
   const value = Number(limit);
   const committed = allowance.used + allowance.reserved + allowance.unconfirmed;
-  const valid = Number.isSafeInteger(value) && value >= Math.max(MAX_REQUEST_TOKENS, committed) && value <= MAX_TOKEN_ALLOWANCE;
+  const valid = Number.isSafeInteger(value) && value >= committed && value <= MAX_TOKEN_ALLOWANCE;
   return <form className="allowance-form" onSubmit={event => { event.preventDefault(); if (valid && !disabled && !pending) onSave(value); }}>
-    <dl className="allowance-breakdown"><div><dt>Your balance after reported usage</dt><dd>{reportedTokenBalance(allowance).toLocaleString()}</dd></div><div><dt>Reported tokens used</dt><dd>{allowance.used.toLocaleString()}</dd></div><div><dt>Held for in-flight request</dt><dd>{allowance.reserved.toLocaleString()}</dd></div><div><dt>Held for unreported usage <small>upper bound</small></dt><dd>{allowance.unconfirmed.toLocaleString()}</dd></div><div><dt>Your available tokens after holds</dt><dd>{allowance.remaining.toLocaleString()}</dd></div><div><dt>Shared room balance</dt><dd>{room?.allowance ? reportedTokenBalance(room.allowance).toLocaleString() : '--'}</dd></div><div><dt>Room available after holds</dt><dd>{room?.allowance?.remaining.toLocaleString() ?? '--'}</dd></div><div><dt>Shared room requests left</dt><dd>{room?.requestsRemaining?.toLocaleString() ?? '--'}</dd></div><div><dt>Per-request token cap</dt><dd>{MAX_REQUEST_TOKENS.toLocaleString()}</dd></div></dl>
+    <dl className="allowance-breakdown"><div><dt>Your balance after reported usage</dt><dd>{reportedTokenBalance(allowance).toLocaleString()}</dd></div><div><dt>Reported tokens used</dt><dd>{allowance.used.toLocaleString()}</dd></div><div><dt>Held for in-flight request</dt><dd>{allowance.reserved.toLocaleString()}</dd></div><div><dt>Held for unreported usage <small>upper bound</small></dt><dd>{allowance.unconfirmed.toLocaleString()}</dd></div><div><dt>Your available tokens after holds</dt><dd>{allowance.remaining.toLocaleString()}</dd></div><div><dt>Shared room balance</dt><dd>{room?.allowance ? reportedTokenBalance(room.allowance).toLocaleString() : '--'}</dd></div><div><dt>Room available after holds</dt><dd>{room?.allowance?.remaining.toLocaleString() ?? '--'}</dd></div><div><dt>Shared room requests left</dt><dd>{room?.requestsRemaining?.toLocaleString() ?? '--'}</dd></div></dl>
     <AllowanceInput value={limit} onChange={setLimit} disabled={pending || disabled} />
     {value < committed && <p className="field-error">At least {committed.toLocaleString()} tokens are already used or held.</p>}
     <p className="prompt-comparison">One pool for all AI modes. MCP context is included in input; reasoning is included in output. Cached input counts as tokens at its discounted price. Used tokens persist across games. Your limit does not reserve the shared room balance.</p>
@@ -60,7 +60,7 @@ export function GameSetup({ initialText = DEFAULT_TOKEN_TEXT, initialTokenLimit 
   const error = failure?.text === text ? failure.message : null;
   const validName = editing || /^[\p{L}\p{N} _-]{2,16}$/u.test(name.trim());
   const validText = mode === 'classic' || Boolean(text.trim() && current && current.count > 0 && current.count <= 256 && !error);
-  const validLimit = Number.isSafeInteger(Number(tokenLimit)) && Number(tokenLimit) >= MAX_REQUEST_TOKENS && Number(tokenLimit) <= MAX_TOKEN_ALLOWANCE;
+  const validLimit = Number.isSafeInteger(Number(tokenLimit)) && Number(tokenLimit) >= 1 && Number(tokenLimit) <= MAX_TOKEN_ALLOWANCE;
   return <form className="join-form" aria-label={editing ? 'Change sentence' : 'Join game'} onSubmit={event => { event.preventDefault(); if (!disabled && !pending && validName && validText && validLimit) onSubmit({ name: name.trim(), tokenLimit: Number(tokenLimit), ...(mode === 'sentence' ? { text } : {}) }); }}>
     {!editing && <><h2>Join game</h2><label htmlFor={`${id}-name`}>Name</label><input id={`${id}-name`} name="name" autoComplete="nickname" placeholder="Your name" required minLength={2} maxLength={16} value={name} onChange={event => setName(event.target.value)} disabled={pending} aria-describedby={name && !validName ? `${id}-name-error` : undefined} />{name && !validName && <small id={`${id}-name-error`} className="field-error">Use 2-16 letters, numbers, spaces, _ or -.</small>}
       <fieldset className="segmented-control"><legend>Pieces</legend>{['sentence', 'classic'].map(value => <label key={value}><input type="radio" name={`${id}-mode`} value={value} checked={mode === value} onChange={() => setMode(value)} disabled={pending} /><span>{value === 'sentence' ? 'Sentence' : 'Classic'}</span></label>)}</fieldset></>}

@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from 'react';
 import { Bot, Brain, Columns2, FileJson2, History, Layers3, Pause, Play, Plug, Quote, ReceiptText, RotateCcw, ScanSearch, SlidersHorizontal, Trophy, Wifi, WifiOff, X } from 'lucide-react';
 import type { LucideIcon } from 'lucide-react';
-import { costForUsage, MAX_REQUEST_TOKENS, reportedTokenBalance } from '../../shared/protocol.ts';
+import { costForUsage, reportedTokenBalance } from '../../shared/protocol.ts';
 import type { Insight, McpLookaheadResult, TokenRates } from '../../shared/protocol.ts';
 import { GameBoard, GameControls, PiecePreview } from './GameBoard.tsx';
 import { AllowanceEditor, GameSetup, RoomMaintenance, RoomPanel, RoomShare } from './RoomPanel.tsx';
@@ -138,7 +138,6 @@ export default function App() {
   const availableTokens = game.allowance && game.room?.allowance ? Math.min(game.allowance.remaining, game.room.allowance.remaining) : null;
   const pricing = game.room?.pricing.status;
   const status = !game.connected ? 'Connecting' : !game.joined ? 'Ready' : game.autopilot ? game.inspectionPaused || game.joining || game.autopilotStatus === 'blocked' ? 'Luna paused' : game.busy ? 'Luna is thinking' : game.autopilotStatus === 'retrying' ? 'Luna retrying' : 'Luna playing' : game.view.status === 'over' ? 'Game over' : game.view.status === 'paused' ? 'Manual paused' : 'Manual play';
-  const cacheResult = latest ? latest.usage.cached > 0 ? `${number(latest.usage.cached)} cached` : latest.usage.cacheWrites > 0 ? `${number(latest.usage.cacheWrites)} cache write` : latest.cacheEnabled ? 'Cache miss' : 'Cache off' : '';
   useEffect(() => { if (inspectedPrompt) promptDialog.current?.showModal(); }, [inspectedPrompt]);
   useEffect(() => { if (editingSentence) sentenceDialog.current?.showModal(); }, [editingSentence]);
   useEffect(() => { if (editingAllowance) allowanceDialog.current?.showModal(); }, [editingAllowance]);
@@ -210,8 +209,13 @@ export default function App() {
         <strong data-testid="ai-cost" key={`cost-${game.metrics.requests}`}>{formatMoney(game.cost?.total ?? null)}</strong>
         <small>{pricing === 'live' ? 'Live rates' : pricing === 'stale' ? 'Last verified rates' : 'Rates unavailable'}</small>
       </div>
+      <div title="Cost of the last completed Luna request at published USD rates.">
+        <span>LAST CALL</span>
+        <strong data-testid="last-call-cost">{formatMoney(lastCost)}</strong>
+        <small>{latest ? `${number(latest.usage.input)} in / ${number(latest.usage.output)} out` : 'No calls yet'}</small>
+      </div>
       <div className="token-balance" title="Balance after reported usage. Pending holds are shown separately in AI allowance.">
-        <span>AI TOKENS LEFT</span><strong data-testid="ai-tokens-left" className={remainingTokens !== null && remainingTokens < MAX_REQUEST_TOKENS ? 'write-premium' : ''}>{remainingTokens === null ? '--' : number(remainingTokens)}</strong><small><b data-testid="ai-tokens">{number(game.metrics.input + game.metrics.output)}</b> used</small>
+        <span>AI TOKENS LEFT</span><strong data-testid="ai-tokens-left">{remainingTokens === null ? '--' : number(remainingTokens)}</strong><small><b data-testid="ai-tokens">{number(game.metrics.input + game.metrics.output)}</b> used</small>
       </div>
       <div title={`Estimated compression saving: ${formatMoney(compressionSaving)}. Cache-read saving minus cache-write premium: ${formatMoney(cacheSaving)}.`}>
         <span>{savings !== null && savings < 0 ? 'EXTRA WRITE COST' : 'SAVED / EST.'}</span>
@@ -225,8 +229,8 @@ export default function App() {
       <div className="luna-reasoning">
         <Switch label="Reasoning" icon={Brain} checked={game.autopilot && Boolean(game.options.reasoning)} disabled={!game.autopilot} onChange={reasoning => game.setOptions(current => ({ ...current, reasoning }))} detail={!game.autopilot ? 'Luna off' : game.options.reasoning ? 'Low effort next' : 'Off next'} title="Enable low reasoning effort for the next Luna request. Can take longer and use more billed output tokens. Changing this does not start Luna." />
         <dl className="reasoning-usage" aria-label="Reasoning token usage" aria-live="polite" aria-atomic="true" title="Provider-reported reasoning tokens. Already included in output tokens and AI cost; missing counts are not estimated.">
-          <div><dt><span className="reasoning-label-detail">Reported </span>total</dt><dd data-testid="reasoning-tokens">{number(game.metrics.reasoning)}</dd></div>
-          <div><dt>Last<span className="reasoning-label-detail">{latest ? ` reply / ${latest.reasoningEnabled ? 'low' : 'off'}` : ' reply'}</span></dt><dd data-testid="last-reasoning-tokens">{game.busy ? 'Pending' : latest ? latest.usage.reasoning === null ? 'Not reported' : number(latest.usage.reasoning) : '--'}</dd></div>
+          <div><dt>Reasoning tokens (all calls)</dt><dd data-testid="reasoning-tokens">{number(game.metrics.reasoning)}</dd></div>
+          <div><dt>Reasoning tokens (last call{latest ? `, ${latest.reasoningEnabled ? 'low' : 'off'}` : ''})</dt><dd data-testid="last-reasoning-tokens">{latest ? latest.usage.reasoning === null ? 'Not reported' : number(latest.usage.reasoning) : '--'}</dd></div>
         </dl>
       </div>
       <div className="luna-mcp"><Switch label="MCP" icon={Plug} checked={game.autopilot && Boolean(game.options.mcp)} disabled={!game.autopilot} onChange={mcp => game.setOptions(current => ({ ...current, mcp }))} detail={!game.autopilot ? 'Luna off' : game.options.mcp ? '2-piece next' : 'Off next'} title="Simulate the next two placements through the real MCP tool before Luna chooses. Adds analysis input tokens and latency. Does not start Luna." /></div>
@@ -237,10 +241,13 @@ export default function App() {
     <div className="game-status" role="status">
       <span className={game.autopilot ? 'luna-active' : ''} data-testid="game-status"><i className={game.busy ? 'thinking' : ''} />{status}</span>
       <span className="request-status" data-testid="request-status" title={game.requestOptions ? 'Changes to the switches apply to the next request.' : undefined}>
-        {game.requestOptions ? `${game.autopilot ? 'In flight' : 'Finishing stopped request'}: ${game.requestOptions.compression ? 'Packed' : 'Verbose'} / cache ${game.requestOptions.cache ? 'on' : 'off'} / reasoning ${game.requestOptions.reasoning ? 'low' : 'off'} / MCP ${game.requestOptions.mcp ? 'on' : 'off'}` : latest ? `Last reply: ${latest.compression ? 'Packed' : 'Verbose'} / ${cacheResult}${latest.mcpLookup ? ' / MCP used' : ''}` : ''}
+        {game.requestOptions ? `Current request: ${[game.requestOptions.compression ? 'Compression' : 'No compression', game.requestOptions.cache ? 'Cache' : 'No cache', game.requestOptions.reasoning ? 'Reasoning' : 'No reasoning', game.requestOptions.mcp ? 'MCP' : 'No MCP'].join(' · ')}` : latest ? `Last request: ${[latest.compression ? 'Compression' : 'No compression', latest.cacheEnabled ? 'Cache' : 'No cache', latest.reasoningEnabled ? 'Reasoning' : 'No reasoning', latest.mcpLookup ? 'MCP' : 'No MCP'].join(' · ')}` : ''}
       </span>
       <div className="prompt-summary">
-        <div><span data-testid="compression-detail">{latest ? latest.compression ? `Last board: ${number(latest.rawTokens)} -> ${number(latest.packedTokens)} tokens (-${lastReduction}%)` : `Last board: ${number(latest.rawTokens)} tokens, uncompressed` : game.metrics.requests ? 'Prompt available after next reply' : 'No prompt sent yet'}</span><small data-testid="last-request-cost">{latest ? `Last request ${signedMoney(lastCost)} / USD est.` : 'No charge for changing settings'}</small></div>
+        <div>
+          <span data-testid="compression-detail">{latest ? [latest.compression ? `-${lastReduction}% compression` : 'No compression', latest.usage.cached > 0 ? `${number(latest.usage.cached)} cached` : latest.usage.cacheWrites > 0 ? 'Cache write' : latest.cacheEnabled ? 'Cache miss' : 'No cache', `${number(latest.usage.input)} in / ${number(latest.usage.output)} out`].join(' · ') : game.metrics.requests ? 'Waiting for next reply' : 'No calls yet'}</span>
+          <small data-testid="last-request-cost">{latest ? `Last call: ${formatMoney(lastCost)}` : ''}</small>
+        </div>
       </div>
     </div>
 

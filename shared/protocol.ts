@@ -181,7 +181,6 @@ export interface RoomView {
   playerTokenBudget: number;
   allowance: TokenAllowance;
   requestsRemaining: number;
-  requestTokenLimit: number;
   pricing: TokenPricing;
   unmeteredRequests: number;
   aiCooldownMs: number;

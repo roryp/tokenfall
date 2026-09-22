@@ -5,7 +5,7 @@ import express from 'express';
 import { Server } from 'socket.io';
 import { z } from 'zod';
 import { ACTIONS } from '../shared/game.ts';
-import { MAX_REQUEST_TOKENS, MAX_TOKEN_ALLOWANCE } from '../shared/protocol.ts';
+import { MAX_TOKEN_ALLOWANCE } from '../shared/protocol.ts';
 import type { ClientEvents, ServerEvents, Reply, RoomResetResult } from '../shared/protocol.ts';
 import { ROOT } from './config.ts';
 import type { AppConfig } from './config.ts';
@@ -15,7 +15,7 @@ import { Room } from './room.ts';
 import { countTokens, tokenChips } from './tokens.ts';
 
 const nameSchema = z.string().trim().min(2).max(16).regex(/^[\p{L}\p{N} _-]+$/u, 'Use letters, numbers, spaces, underscores or hyphens.');
-const tokenLimitSchema = z.number().int().min(MAX_REQUEST_TOKENS).max(MAX_TOKEN_ALLOWANCE);
+const tokenLimitSchema = z.number().int().min(1).max(MAX_TOKEN_ALLOWANCE);
 const setupSchema = z.object({ text: z.string().min(1).max(500), tokenLimit: tokenLimitSchema.optional() }).strict();
 const allowanceSchema = z.object({ tokenLimit: tokenLimitSchema }).strict();
 const joinSchema = z.object({ name: nameSchema, room: z.string().length(6), token: z.string().length(64).optional(), text: z.string().min(1).max(500).optional(), classic: z.boolean().optional(), tokenLimit: tokenLimitSchema.optional() }).strict();

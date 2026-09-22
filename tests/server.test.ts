@@ -308,7 +308,6 @@ test('AI allowance counts output and MCP input once and distinguishes unavailabl
   assert.equal(tokenAllowance(30000, usage).remaining, 16000);
   assert.equal(tokenAllowance(10000, usage).remaining, 0);
   const gate = new ModelGate();
-  assert.throws(() => gate.acquire('large', 16001, 0, 0), error => (error as { code: string }).code === 'request-size');
   assert.throws(() => gate.acquire('personal', 4000, 18000, 18000, 0, false, 20000), /2[,\s]000 left.*4[,\s]000/);
   assert.throws(() => gate.acquire('shared', 4000, 0, ROOM_TOKEN_BUDGET - 1000), error => (error as { code: string }).code === 'room-budget');
 });
@@ -385,7 +384,7 @@ test('socket allowance configuration validates the limit and only changes the au
     const notJoined = await client.timeout(5000).emitWithAck('allowance', { tokenLimit: 50000 });
     assert.equal(notJoined.ok, false);
     assert.equal(notJoined.code, 'session');
-    for (const tokenLimit of [-1, 15999, 16000.5, 8000001, '50000']) {
+    for (const tokenLimit of [-1, 0, 16000.5, 8000001, '50000']) {
       const rejected = await client.timeout(5000).emitWithAck('join', { name: 'Budget Client', room: application.room.code, tokenLimit });
       assert.equal(rejected.ok, false);
     }
@@ -1064,8 +1063,6 @@ test('both game modes continue beyond prototype player limits while retaining sh
       player.record.attempts = ROOM_REQUEST_LIMIT;
       room.save(player);
       await assert.rejects(room.assist(player, { compression: true, cache: false, autopilot: true }), /room AI request allowance/);
-      const gate = new ModelGate();
-      assert.throws(() => gate.acquire('large', 16001, 0, 0, 0, true, ROOM_TOKEN_BUDGET), error => (error as { code: string }).code === 'request-size');
     } finally { room.close(); rmSync(setup.dataDirectory, { recursive: true, force: true }); }
   }
 });

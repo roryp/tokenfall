@@ -210,7 +210,7 @@ export class Room {
   }
 
   validateAllowance(tokenLimit: number, committed = 0) {
-    if (!Number.isSafeInteger(tokenLimit) || tokenLimit < MAX_REQUEST_TOKENS || tokenLimit > ROOM_TOKEN_BUDGET) throw new RequestError(`Choose an AI allowance from ${MAX_REQUEST_TOKENS.toLocaleString()} to ${ROOM_TOKEN_BUDGET.toLocaleString()} tokens.`, 'validation');
+    if (!Number.isSafeInteger(tokenLimit) || tokenLimit < 1 || tokenLimit > ROOM_TOKEN_BUDGET) throw new RequestError(`Choose an AI allowance from 1 to ${ROOM_TOKEN_BUDGET.toLocaleString()} tokens.`, 'validation');
     if (tokenLimit < committed) throw new RequestError(`The allowance cannot be below ${committed.toLocaleString()} tokens already used or held.`, 'budget');
   }
 
@@ -381,7 +381,7 @@ export class Room {
       code: this.code, online: this.online, capacity: 50, leaderboard, pointsLeaderboard, metrics: totals.metrics,
       joinUrl: this.publicUrl(), model: this.config.deployment, prefixTokens: PREFIX_TOKENS,
       tokenBudget: ROOM_TOKEN_BUDGET, playerTokenBudget: ROOM_TOKEN_BUDGET,
-      allowance: this.roomAllowance(totals), requestsRemaining: Math.max(0, ROOM_REQUEST_LIMIT - totals.attempts), requestTokenLimit: MAX_REQUEST_TOKENS,
+      allowance: this.roomAllowance(totals), requestsRemaining: Math.max(0, ROOM_REQUEST_LIMIT - totals.attempts),
       pricing: this.pricing, unmeteredRequests: Math.max(0, totals.attempts - totals.metrics.requests),
       aiCooldownMs: AI_COOLDOWN_MS, autopilotCooldownMs: AUTOPILOT_COOLDOWN_MS,
       ...(this.config.localMaintenance ? { maintenance: this.maintenanceStatus } : {}),

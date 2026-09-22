@@ -5,7 +5,7 @@ import { AzureCliCredential, getBearerTokenProvider, ManagedIdentityCredential }
 import { z } from 'zod';
 import { placementsFor } from '../shared/game.ts';
 import type { Game } from '../shared/game.ts';
-import { MAX_REQUEST_TOKENS, MAX_TOKEN_ALLOWANCE } from '../shared/protocol.ts';
+import { MAX_TOKEN_ALLOWANCE } from '../shared/protocol.ts';
 import type { AiOptions, Insight } from '../shared/protocol.ts';
 import type { AppConfig } from './config.ts';
 import { buildPrompts, countTokens, normalizeUsage, tokenChips } from './tokens.ts';
@@ -52,7 +52,6 @@ export class ModelGate {
     this.requestTimes = this.requestTimes.filter(entry => now - entry.time < 60000);
     const scheduledTokens = this.requestTimes.reduce((sum, entry) => sum + entry.tokens, 0);
     if (this.inFlight >= 4 || this.requestTimes.length >= 90 || scheduledTokens + reservation > 400000) throw new RequestError('The room is busy. Keep playing and try again shortly.', 'busy', 3000);
-    if (reservation > MAX_REQUEST_TOKENS) throw new RequestError(`This request needs ${reservation.toLocaleString()} reserved tokens, above the ${MAX_REQUEST_TOKENS.toLocaleString()} per-request cap. Turn on Compression or turn off MCP or Reasoning. A larger personal allowance will not change this cap.`, 'request-size');
     if (playerSpent + reservation > playerBudget) throw new RequestError(`Not enough token credits in your AI allowance: ${Math.max(0, playerBudget - playerSpent).toLocaleString()} left; this request needs ${reservation.toLocaleString()}. Adjust your allowance or lower the request size.`, 'budget');
     if (roomSpent + this.reserved + reservation > ROOM_TOKEN_BUDGET) throw new RequestError(`The shared room model token limit is reached: ${Math.max(0, ROOM_TOKEN_BUDGET - roomSpent - this.reserved).toLocaleString()} tokens available; ${reservation.toLocaleString()} needed. Manual play is still available.`, 'room-budget');
     this.inFlight += 1;

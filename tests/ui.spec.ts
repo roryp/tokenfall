@@ -2329,45 +2329,28 @@ for (const scenario of [
     setup.controls.firstPlacement = true;
     const run = setup.player().runId;
     await page.getByRole('checkbox', { name: 'Ask Luna', exact: true }).check();
-    await page.waitForFunction(() => document.querySelector('.game-canvas')?.getAttribute('data-status') === 'over' || document.querySelector('[data-testid="game-status"]')?.textContent === 'Luna paused', null, { timeout: 55000 });
-    let beforeRecovery = Infinity;
-    if (setup.player().game.status !== 'over') {
-      assert.match(await page.locator('.notice').innerText(), /per-request cap/);
-      assert.equal(await page.getByRole('checkbox', { name: 'Ask Luna', exact: true }).isChecked(), true);
-      assert.equal(await page.locator('.luna-controls input:enabled').count(), 5);
-      beforeRecovery = setup.calls.length;
-      assert.equal(setup.player().metrics.requests, beforeRecovery);
-      assert.equal(setup.application.room.usage(setup.player()).unmeteredRequests, 0);
-      await page.getByRole('checkbox', { name: 'Compression', exact: true }).check();
-      await page.getByRole('checkbox', { name: 'Reasoning', exact: true }).uncheck();
-      await page.getByRole('checkbox', { name: 'MCP', exact: true }).uncheck();
-      await page.getByRole('heading', { name: 'Game over', exact: true }).waitFor({ timeout: 30000 });
-    }
+    await page.getByRole('heading', { name: 'Game over', exact: true }).waitFor({ timeout: 55000 });
     await setup.waitForGame(game => game.status === 'over');
     const requests = setup.calls.length;
     const metrics = setup.player().metrics;
-    context.diagnostic(`${scenario.name}: ${requests} placements; ${beforeRecovery === Infinity ? 'no request-cap interruption' : `request-cap recovery after ${beforeRecovery} requests`}`);
+    context.diagnostic(`${scenario.name}: ${requests} placements`);
     assert.ok(requests >= 5);
     assert.equal(setup.player().runId, run);
     assert.equal(setup.player().record.token_limit, 1000000);
     assert.equal(setup.player().game.pieces, requests);
     assert.equal(metrics.requests, requests);
-    for (const [index, call] of setup.calls.entries()) {
-      const expected = index < beforeRecovery ? options : { compression: true, cache: options.cache, reasoning: Boolean(call.options.reasoning), mcp: Boolean(call.options.mcp) };
-      assert.ok(!expected.reasoning || options.reasoning);
-      assert.ok(!expected.mcp || options.mcp);
-      assert.deepEqual(call.options, { ...expected, autopilot: true });
-      assert.equal(call.usage.reasoning, expected.reasoning ? 256 : 0);
-      assert.equal(call.prompt, expected.compression ? call.packed : call.verbose);
-      assert.equal(call.mcpLookup?.transport, expected.mcp ? 'stdio' : undefined);
-      assert.equal(call.mcpLookup?.tool, expected.mcp ? 'analyze_future_moves' : undefined);
+    for (const call of setup.calls) {
+      assert.deepEqual(call.options, { ...options, autopilot: true });
+      assert.equal(call.usage.reasoning, options.reasoning ? 256 : 0);
+      assert.equal(call.prompt, options.compression ? call.packed : call.verbose);
+      assert.equal(call.mcpLookup?.transport, options.mcp ? 'stdio' : undefined);
+      assert.equal(call.mcpLookup?.tool, options.mcp ? 'analyze_future_moves' : undefined);
     }
-    if (beforeRecovery !== Infinity) assert.deepEqual(setup.calls.at(-1)!.options, { compression: true, cache: options.cache, reasoning: false, mcp: false, autopilot: true });
     assert.equal(metrics.reasoning, setup.calls.reduce((total, call) => total + call.usage.reasoning!, 0));
     assert.equal(metrics.cacheHits, options.cache ? requests - 1 : 0);
     assert.equal(metrics.cacheMisses, options.cache ? 1 : 0);
     assert.equal(metrics.cacheBypassed, options.cache ? 0 : requests);
-    assert.equal(metrics.compressionSaved > 0, options.compression || beforeRecovery !== Infinity);
+    assert.equal(metrics.compressionSaved > 0, options.compression);
     const cost = costForUsage(metrics, setup.application.room.pricing.snapshot!.usdPerMillion).total;
     assert.ok(Math.abs(numeric(await page.getByTestId('ai-cost').innerText()) - cost) < 1e-8);
     const score = numeric(await page.getByTestId('game-score').innerText());
@@ -2458,7 +2441,7 @@ test('Luna snapshots live settings, prices actual usage, and cannot apply a move
   assert.deepEqual(setup.calls[1].options, { compression: true, cache: true, reasoning: false, mcp: false, autopilot: true });
   assert.equal(setup.calls[1].usage.cached, 0);
   assert.ok(setup.calls[1].usage.cacheWrites > 0);
-  assert.match(await page.getByTestId('compression-detail').innerText(), /uncompressed/);
+  assert.match(await page.getByTestId('compression-detail').innerText(), /No compression/);
   assert.equal(await page.getByTestId('cache-totals').innerText(), '0 hits / 0 misses');
   assert.equal(await page.getByTestId('cache-result-label').innerText(), 'Cache was off');
   setup.release();
@@ -2511,7 +2494,7 @@ test('Luna snapshots live settings, prices actual usage, and cannot apply a move
   assert.equal(await page.getByTestId('cache-result-label').innerText(), 'Cache hit');
   assert.equal(numeric(await page.getByTestId('compression-adjustment').textContent()), compressionDelta);
   assert.equal(numeric(await page.getByTestId('cache-adjustment').textContent()), cacheDelta);
-  assert.match(await page.getByTestId('compression-detail').innerText(), /tokens \(-\d+%\)/);
+  assert.match(await page.getByTestId('compression-detail').innerText(), /-\d+% compression/);
   await page.getByRole('button', { name: 'Close AI costs', exact: true }).click();
   await page.getByRole('button', { name: 'Inspect last prompt', exact: true }).click();
   await page.getByRole('dialog', { name: 'Compression before / after' }).waitFor();
