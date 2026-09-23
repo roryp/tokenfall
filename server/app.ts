@@ -21,6 +21,19 @@ const inputSchema = z.object({
   events: z.array(z.object({ frame: z.number().int().nonnegative(), action: z.enum(ACTIONS) }).strict()).max(64),
 }).strict();
 const aiSchema = z.object({ cache: z.boolean(), compression: z.boolean(), reasoning: z.boolean().optional(), mcp: z.boolean().optional(), autopilot: z.boolean().optional() }).strict();
+export const SOCKET_EVENT_BURST = 120;
+export const SOCKET_EVENTS_PER_SECOND = 60;
+
+const loopback = (address: string) => address === '::1' || /^(::ffff:)?127\./.test(address);
+// Mirrors Express `trust proxy`: 0 trusts loopback proxies only; N trusts exactly N hops such as the Container Apps ingress.
+export const trustedProxy = (hops = 0) => (address: string, index: number) => hops > 0 ? index < hops : loopback(address);
+export function clientAddress(remoteAddress: string | undefined, forwardedFor: string | string[] | undefined, trust: (address: string, index: number) => boolean) {
+  const forwarded = (Array.isArray(forwardedFor) ? forwardedFor.join(',') : forwardedFor ?? '').split(',').map(value => value.trim()).filter(Boolean);
+  const chain = [remoteAddress ?? 'unknown', ...forwarded.reverse()];
+  let index = 0;
+  while (index < chain.length - 1 && trust(chain[index], index)) index += 1;
+  return chain[index];
+}
 
 export function errorReply(error: unknown): Reply<never> {
   if (error instanceof RequestError) return { ok: false, error: error.message, code: error.code, retryAfterMs: error.retryAfterMs };
@@ -34,8 +47,9 @@ export function createApplication(config: AppConfig, gateway: ModelGateway = new
   const app = express();
   const server = createServer(app);
   const room = new Room(config, gateway);
+  const trust = trustedProxy(config.trustProxyHops);
   app.disable('x-powered-by');
-  app.set('trust proxy', 'loopback');
+  app.set('trust proxy', trust);
   app.use((_request, response, next) => {
     response.setHeader('X-Content-Type-Options', 'nosniff');
     response.setHeader('Referrer-Policy', 'no-referrer');
@@ -119,6 +133,24 @@ export function createApplication(config: AppConfig, gateway: ModelGateway = new
   });
   const joinWindows = new Map<string, { started: number; count: number }>();
   io.on('connection', socket => {
+    let eventAllowance = SOCKET_EVENT_BURST;
+    let eventCheckedAt = Date.now();
+    let deniedEvents = 0;
+    socket.use((event, next) => {
+      const now = Date.now();
+      eventAllowance = Math.min(SOCKET_EVENT_BURST, eventAllowance + (now - eventCheckedAt) * SOCKET_EVENTS_PER_SECOND / 1000);
+      eventCheckedAt = now;
+      if (eventAllowance >= 1) {
+        eventAllowance -= 1;
+        if (eventAllowance >= SOCKET_EVENT_BURST / 2) deniedEvents = 0;
+        next();
+        return;
+      }
+      deniedEvents += 1;
+      if (deniedEvents > SOCKET_EVENT_BURST * 5) { socket.disconnect(true); return; }
+      const respond = event.at(-1);
+      if (typeof respond === 'function') respond({ ok: false, error: 'Too many requests. Slow down and try again.', code: 'rate', retryAfterMs: 1000 });
+    });
     socket.emit('room', room.view());
     socket.on('join', (payload, respond) => {
       if (typeof respond !== 'function') return;
@@ -126,7 +158,7 @@ export function createApplication(config: AppConfig, gateway: ModelGateway = new
         const data = joinSchema.parse(payload);
         const now = Date.now();
         for (const [key, window] of joinWindows) if (now - window.started >= 60000) joinWindows.delete(key);
-        const address = socket.handshake.address;
+        const address = clientAddress(socket.handshake.address, socket.handshake.headers['x-forwarded-for'], trust);
         const window = joinWindows.get(address) ?? { started: now, count: 0 };
         window.count += 1;
         joinWindows.set(address, window);
@@ -173,7 +205,7 @@ export function createApplication(config: AppConfig, gateway: ModelGateway = new
         if (player) socket.emit('usage', room.usage(player));
       }
     });
-    socket.on('disconnect', () => { room.disconnect(socket.id); io.emit('room', room.view()); });
+    socket.on('disconnect', () => { if (room.disconnect(socket.id)) io.emit('room', room.view()); });
   });
   const broadcast = setInterval(() => {
     io.emit('room', room.view());

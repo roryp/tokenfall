@@ -188,6 +188,7 @@ resource app 'Microsoft.App/containerApps@2026-01-01' = {
             { name: 'AZURE_CLIENT_ID', value: identity.properties.clientId }
             { name: 'AZURE_LOCATION', value: location }
             { name: 'PUBLIC_BASE_URL', value: publicUrl }
+            { name: 'TRUST_PROXY_HOPS', value: '1' }
           ]
           volumeMounts: [
             { volumeName: 'state', mountPath: '/data' }

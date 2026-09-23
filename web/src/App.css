@@ -25,7 +25,7 @@ html:has(dialog:modal) { overflow: hidden; }
 .connection.connected { color: var(--cp-success); }
 .icon-button { display: inline-flex; align-items: center; justify-content: center; width: 44px; height: 44px; padding: 0; flex-shrink: 0; background: var(--cp-transparent); color: var(--cp-text-muted); border-radius: 4px; }
 .icon-button:hover:not(:disabled) { background: var(--cp-surface-soft); color: var(--cp-accent); }
-.cost-ticker { display: grid; grid-template-columns: 1.3fr 0.85fr 1.15fr; gap: 14px; border-top: 2px solid var(--cp-accent); border-bottom: 1px solid var(--cp-border); padding: 10px 0; flex-shrink: 0; }
+.cost-ticker { display: grid; grid-template-columns: 1.3fr 0.9fr 1.15fr 1fr; gap: 14px; border-top: 2px solid var(--cp-accent); border-bottom: 1px solid var(--cp-border); padding: 10px 0; flex-shrink: 0; }
 .cost-ticker > div { min-width: 0; display: flex; flex-direction: column; gap: 4px; }
 .cost-ticker > div + div { border-left: 1px solid var(--cp-border); padding-left: 14px; }
 .cost-ticker span { font: 9px var(--cp-mono); color: var(--cp-text-muted); }
@@ -117,6 +117,11 @@ html:has(dialog:modal) { overflow: hidden; }
 .reasoning-usage > div { min-width: 0; }
 .reasoning-usage dt { font-size: 10px; color: var(--cp-text-muted); line-height: 1.4; }
 .reasoning-usage dd { margin: 3px 0 0; font: 650 13px/1.4 var(--cp-mono); overflow-wrap: anywhere; font-variant-numeric: tabular-nums; }
+.reasoning-label-short { display: none; }
+@media (max-width: 899px) {
+  .reasoning-label-detail { display: none; }
+  .reasoning-label-short { display: inline; }
+}
 .game-switch { position: relative; display: flex; align-items: center; gap: 7px; min-width: 0; min-height: 44px; cursor: pointer; font-size: 13px; font-weight: 650; }
 .game-switch > svg { color: var(--cp-text-muted); }
 .game-switch > span { flex: 1; }
@@ -360,9 +365,7 @@ html:has(dialog:modal) { overflow: hidden; }
   .information-links:has([aria-label="Room maintenance"]) > .information-button { padding: 8px; gap: 6px; }
   .game-stage { grid-column: 1; grid-row: 2 / 6; }
   .cost-ticker { grid-column: 2; grid-row: 3; grid-template-columns: 1fr 1fr; row-gap: 18px; padding: 14px 0; }
-  .cost-ticker .total-cost { grid-column: 1 / -1; }
   .cost-ticker .total-cost strong { font-size: 30px; }
-  .cost-ticker > div:nth-child(2) { border: 0; padding-left: 0; }
   .cost-ticker > .token-balance { border: 0; padding-left: 0; }
   .cost-ticker strong { font-size: 20px; }
   .cost-adjustments { grid-template-columns: 1fr; row-gap: 12px; }
@@ -397,6 +400,7 @@ html:has(dialog:modal) { overflow: hidden; }
   .cost-ticker strong { font-size: 15px; }
   .cost-ticker small { font-size: 8px; }
   .cost-ticker > .token-balance { padding-left: 8px; gap: 2px; }
+  .cost-ticker > .last-call { display: none; }
   .token-balance > span > svg { display: none; }
   .cost-adjustments { column-gap: 12px; padding-top: 6px; }
   .cost-adjustments dt { font-size: 9px; }
@@ -419,7 +423,6 @@ html:has(dialog:modal) { overflow: hidden; }
   .luna-reasoning { grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); column-gap: 12px; }
   .reasoning-usage dt { font-size: 10px; }
   .reasoning-usage dd { font-size: 11px; }
-  .reasoning-label-detail { display: none; }
   .game-switch { gap: 5px; font-size: 12px; }
   .game-switch small { font-size: 10px; }
   .game-switch > svg { display: none; }
@@ -462,6 +465,7 @@ html:has(dialog:modal) { overflow: hidden; }
 }
 @media (max-width: 480px) and (max-height: 760px) {
   .tetris-app { --game-stage-min: 321px; gap: 2px; min-height: max(680px, 100svh); }
+  .game-status { row-gap: 0; line-height: 1.1; }
   .board-column { width: min(100%, max(80px, calc((100cqh - 112px) / 2))); }
   .cost-ticker { gap: 2px 6px; padding: 4px 0; }
   .cost-ticker > div { gap: 2px; }

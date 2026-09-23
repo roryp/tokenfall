@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
@@ -13,9 +13,9 @@ import { TETROMINOES } from 'miaoda-game-fallblock-core';
 import { boardMetrics, Game, placementsFor } from '../shared/game.ts';
 import { costForUsage, DEFAULT_TOKEN_ALLOWANCE, emptyMetrics, reportedTokenBalance, tokenAllowance, tokenCreditsUsed } from '../shared/protocol.ts';
 import type { Insight, JoinResult, Reply, RoomView, TokenPricing } from '../shared/protocol.ts';
-import { createApplication } from '../server/app.ts';
+import { clientAddress, createApplication, SOCKET_EVENT_BURST, trustedProxy } from '../server/app.ts';
 import { loadConfig } from '../server/config.ts';
-import { AI_COOLDOWN_MS, AUTOPILOT_COOLDOWN_MS, LunaGateway, MAX_OUTPUT_TOKENS, MAX_REASONING_COMPLETION_TOKENS, ModelGate, PLAYER_REQUEST_LIMIT, PLAYER_TOKEN_BUDGET, POLICY, PREFIX_TOKENS, ROOM_REQUEST_LIMIT, ROOM_TOKEN_BUDGET } from '../server/model.ts';
+import { AI_COOLDOWN_MS, AUTOPILOT_COOLDOWN_MS, EVALUATION_INTERVAL_MS, LunaGateway, MAX_OUTPUT_TOKENS, MAX_REASONING_COMPLETION_TOKENS, ModelGate, PLAYER_REQUEST_LIMIT, PLAYER_TOKEN_BUDGET, POLICY, PREFIX_TOKENS, ROOM_EVALUATIONS_PER_SECOND, ROOM_REQUEST_LIMIT, ROOM_TOKEN_BUDGET } from '../server/model.ts';
 import type { ModelGateway } from '../server/model.ts';
 import { Room } from '../server/room.ts';
 import { buildPrompts, countTokens, gameTokens } from '../server/tokens.ts';
@@ -851,6 +851,9 @@ test('container settings enable external binding and managed identity without ch
   assert.equal(cloud.managedIdentityClientId, 'managed-identity');
   assert.equal(cloud.dataDirectory, path.resolve(os.tmpdir()));
   assert.equal(cloud.sqliteJournalMode, 'DELETE');
+  assert.equal(local.trustProxyHops, 0);
+  assert.equal(loadConfig({ ...settings, TRUST_PROXY_HOPS: '1' }).trustProxyHops, 1);
+  assert.throws(() => loadConfig({ ...settings, TRUST_PROXY_HOPS: 'all' }));
   assert.throws(() => loadConfig({ ...settings, SQLITE_JOURNAL_MODE: 'invalid' }));
   assert.throws(() => loadConfig({ ...settings, HOST: 'invalid' }));
 });
@@ -1010,6 +1013,53 @@ test('fast autopilot remains single-flight, paced, and bound by the same budgets
   assert.throws(() => gate.acquire('pilot', 3000, PLAYER_TOKEN_BUDGET, 0, 2000, true), /credits/);
 });
 
+test('admission rejects busy, paced and room-saturated requests before any prompt work', () => {
+  const gate = new ModelGate();
+  gate.admit('pilot', 0, true);
+  const release = gate.acquire('pilot', 3000, 0, 0, 0, true);
+  assert.throws(() => gate.admit('pilot', 10, true), { code: 'busy' });
+  release();
+  assert.throws(() => gate.admit('pilot', AUTOPILOT_COOLDOWN_MS - 1, true), { code: 'cooldown' });
+  gate.admit('pilot', AUTOPILOT_COOLDOWN_MS, true);
+  assert.throws(() => gate.admit('pilot', AUTOPILOT_COOLDOWN_MS + EVALUATION_INTERVAL_MS - 1, true), { code: 'cooldown' });
+  assert.doesNotThrow(() => gate.admit('pilot', AUTOPILOT_COOLDOWN_MS + EVALUATION_INTERVAL_MS, true));
+  const room = new ModelGate();
+  for (let index = 0; index < ROOM_EVALUATIONS_PER_SECOND; index += 1) room.admit(`player-${index}`, 0);
+  assert.throws(() => room.admit('overflow', 0), { code: 'busy' });
+  assert.throws(() => room.evaluate(999), { code: 'busy' });
+  assert.doesNotThrow(() => room.admit('overflow', 1000));
+});
+
+test('an assist flood is rejected before room totals or prompts are computed', async context => {
+  context.mock.timers.enable({ apis: ['Date'], now: 20000 });
+  const setup = fixture();
+  let finish!: () => void;
+  const room = new Room(setup.config, { complete: game => new Promise<Insight>(resolve => { finish = () => resolve(insightFor(game)); }) });
+  try {
+    room.join('Flooder', room.code, undefined, 'flood');
+    const player = room.playerFor('flood');
+    let evaluations = 0;
+    const totals = room.totals.bind(room);
+    room.totals = () => { evaluations += 1; return totals(); };
+    const options = { compression: true, cache: false, autopilot: true };
+    const pending = room.assist(player, options);
+    assert.equal(evaluations, 1);
+    const busy = await Promise.allSettled(Array.from({ length: 200 }, () => room.assist(player, options)));
+    assert.ok(busy.every(result => result.status === 'rejected' && result.reason.code === 'busy'));
+    finish();
+    await pending;
+    const cooling = await Promise.allSettled(Array.from({ length: 200 }, () => room.assist(player, options)));
+    assert.ok(cooling.every(result => result.status === 'rejected' && result.reason.code === 'cooldown'));
+    player.metrics = { ...player.metrics, input: DEFAULT_TOKEN_ALLOWANCE };
+    context.mock.timers.tick(AUTOPILOT_COOLDOWN_MS);
+    await assert.rejects(room.assist(player, options), { code: 'budget' });
+    assert.equal(evaluations, 2);
+    const paced = await Promise.allSettled(Array.from({ length: 200 }, () => room.assist(player, options)));
+    assert.ok(paced.every(result => result.status === 'rejected' && result.reason.code === 'cooldown'));
+    assert.equal(evaluations, 2);
+  } finally { room.close(); rmSync(setup.dataDirectory, { recursive: true, force: true }); }
+});
+
 test('both game modes continue beyond prototype player limits while retaining shared room guards', async context => {
   context.mock.timers.enable({ apis: ['Date'], now: 20000 });
   for (const text of [undefined, 'Hello world! Tokens make my blocks.']) {
@@ -1040,6 +1090,8 @@ test('both game modes continue beyond prototype player limits while retaining sh
       await assert.rejects(room.assist(player, { compression: true, cache: false, autopilot: true }), /room model token limit/);
       player.record.attempts = ROOM_REQUEST_LIMIT;
       room.save(player);
+      await assert.rejects(room.assist(player, { compression: true, cache: false, autopilot: true }), { code: 'cooldown' });
+      context.mock.timers.tick(EVALUATION_INTERVAL_MS);
       await assert.rejects(room.assist(player, { compression: true, cache: false, autopilot: true }), /room AI request allowance/);
     } finally { room.close(); rmSync(setup.dataDirectory, { recursive: true, force: true }); }
   }
@@ -1247,6 +1299,31 @@ test('missing rates, zero spend, and missing provider usage cannot produce a cos
   } finally { room.close(); rmSync(setup.dataDirectory, { recursive: true, force: true }); }
 });
 
+test('an in-flight request keeps a ranked player on the efficiency leaderboard until its usage arrives', async () => {
+  const setup = fixture();
+  let finish!: () => void;
+  const room = new Room(setup.config, { complete: game => new Promise<Insight>(resolve => { finish = () => resolve(insightFor(game)); }) });
+  try {
+    room.pricing = setup.pricing;
+    room.join('Ranked Pilot', room.code, undefined, 'socket');
+    const player = room.playerFor('socket');
+    player.record.best_score = 1000;
+    player.record.attempts = 1;
+    player.metrics = { ...emptyMetrics(), requests: 1, input: 2000, output: 20, cached: 1500 };
+    room.save(player);
+    const ranked = room.view().leaderboard[0].challengeScore!;
+    assert.ok(ranked > 0);
+    const pending = room.assist(player, { compression: true, cache: true });
+    assert.equal(player.record.attempts, 2);
+    assert.equal(room.view().leaderboard[0].unmeteredRequests, 0);
+    assert.equal(room.view().leaderboard[0].challengeScore, ranked);
+    assert.equal(room.view().unmeteredRequests, 0);
+    finish();
+    await pending;
+    assert.ok(room.view().leaderboard[0].challengeScore! < ranked);
+  } finally { room.close(); rmSync(setup.dataDirectory, { recursive: true, force: true }); }
+});
+
 test('a game can continue past the old hour cap while rejecting oversized synchronization jumps', () => {
   const setup = fixture();
   const room = new Room(setup.config, setup.gateway);
@@ -1298,6 +1375,134 @@ test('fifty players can join, one connection cannot claim multiple seats, and di
     room.disconnect('socket-0');
     room.join('New Player', room.code, undefined, 'socket-51');
     assert.equal(room.online, 50);
+  } finally { room.close(); rmSync(setup.dataDirectory, { recursive: true, force: true }); }
+});
+
+test('a player name identifies one player across sessions, ignoring case and spacing', () => {
+  const setup = fixture();
+  const room = new Room(setup.config, setup.gateway);
+  const sentence = 'Hello world! Tokens make my blocks.';
+  try {
+    const first = room.join('Rory  P', room.code, undefined, 'tab-1', sentence);
+    const player = room.playerFor('tab-1');
+    player.record.best_score = 4321;
+    player.record.attempts = 1;
+    player.metrics = { ...emptyMetrics(), requests: 1, input: 3000, output: 30 };
+    room.save(player);
+    assert.throws(() => room.join('rory p', room.code, undefined, 'tab-2', sentence), { code: 'session-active' });
+    room.disconnect('tab-1');
+    const resumed = room.join('RORY P', room.code, undefined, 'tab-2', sentence);
+    assert.equal(resumed.playerId, first.playerId);
+    assert.equal(resumed.name, 'Rory  P');
+    assert.equal(resumed.runId, first.runId);
+    assert.notEqual(resumed.token, first.token);
+    assert.equal(resumed.metrics.input, 3000);
+    assert.equal(room.records().length, 1);
+    room.disconnect('tab-2');
+    assert.throws(() => room.join('Rory  P', room.code, first.token, 'tab-3'), { code: 'session' });
+    const classic = room.join('rory p', room.code, undefined, 'tab-3');
+    assert.equal(classic.playerId, first.playerId);
+    assert.notEqual(classic.runId, first.runId);
+    assert.equal(classic.tokenText, '');
+    assert.deepEqual(room.view().pointsLeaderboard.map(entry => [entry.name, entry.score]), [['Rory  P', 4321]]);
+    room.disconnect('tab-3');
+    assert.equal(room.join('Someone else', room.code, classic.token, 'tab-4').runId, classic.runId);
+  } finally { room.close(); rmSync(setup.dataDirectory, { recursive: true, force: true }); }
+});
+
+test('existing rooms merge repeated names into their best player after a verified backup', () => {
+  const setup = fixture();
+  let room = new Room(setup.config, setup.gateway);
+  try {
+    const best = room.join('Rory', room.code, undefined, 'a');
+    const bestPlayer = room.playerFor('a');
+    bestPlayer.record.best_score = 900;
+    bestPlayer.record.attempts = 2;
+    bestPlayer.metrics = { ...emptyMetrics(), requests: 2, input: 5000, output: 50, cacheHits: 1 };
+    room.save(bestPlayer);
+    const second = room.join('Second', room.code, undefined, 'b');
+    const secondPlayer = room.playerFor('b');
+    secondPlayer.record.best_score = 100;
+    secondPlayer.record.attempts = 3;
+    secondPlayer.metrics = { ...emptyMetrics(), requests: 2, input: 7000, output: 70 };
+    room.save(secondPlayer);
+    room.join('Third', room.code, undefined, 'c');
+    room.join('Someone Else', room.code, undefined, 'd');
+    const totals = room.totals();
+    room.database.exec("DROP INDEX players_name_key; ALTER TABLE players DROP COLUMN name_key; UPDATE players SET name = 'rory' WHERE name = 'Second'; UPDATE players SET name = 'RORY' WHERE name = 'Third'");
+    room.close();
+    room = new Room(setup.config, setup.gateway);
+    const records = room.records();
+    assert.deepEqual(records.map(record => record.name), ['Rory', 'Someone Else']);
+    assert.equal(records[0].id, best.playerId);
+    assert.equal(records[0].best_score, 900);
+    assert.equal(records[0].attempts, 5);
+    assert.deepEqual(JSON.parse(records[0].metrics), { ...emptyMetrics(), requests: 4, input: 12000, output: 120, cacheHits: 1 });
+    assert.equal(records[0].token_limit, 3 * DEFAULT_TOKEN_ALLOWANCE);
+    assert.deepEqual(room.totals(), totals);
+    const backups = readdirSync(path.join(setup.dataDirectory, 'backups'));
+    assert.equal(backups.length, 1);
+    const backup = new DatabaseSync(path.join(setup.dataDirectory, 'backups', backups[0]), { readOnly: true });
+    try { assert.deepEqual(backup.prepare('SELECT name FROM players ORDER BY best_score DESC, name').all().map(row => row.name), ['Rory', 'rory', 'RORY', 'Someone Else']); }
+    finally { backup.close(); }
+    assert.equal(room.join('rOrY', room.code, undefined, 'e').playerId, best.playerId);
+    assert.throws(() => room.join('Second', room.code, second.token, 'f'), { code: 'session' });
+    room.close();
+    room = new Room(setup.config, setup.gateway);
+    assert.equal(readdirSync(path.join(setup.dataDirectory, 'backups')).length, 1);
+    assert.throws(() => room.database.prepare("INSERT INTO players (id, token_hash, name, name_key, metrics, updated) VALUES ('x', 'y', 'RORY', 'rory', '{}', 0)").run(), /UNIQUE/);
+  } finally { room.close(); rmSync(setup.dataDirectory, { recursive: true, force: true }); }
+});
+
+test('rows written without a name key by an older revision are repaired and merged on the next start', () => {
+  const setup = fixture();
+  let room = new Room(setup.config, setup.gateway);
+  try {
+    const kept = room.join('Rory', room.code, undefined, 'a');
+    const player = room.playerFor('a');
+    player.record.best_score = 500;
+    player.record.attempts = 1;
+    player.metrics = { ...emptyMetrics(), requests: 1, input: 4000, output: 40 };
+    room.save(player);
+    const legacy = room.database.prepare(`INSERT INTO players (id, token_hash, name, best_score, best_lines, best_level, metrics, attempts, updated, token_text, token_limit)
+      VALUES (?, ?, ?, ?, 0, 1, ?, ?, 0, '', 1000000)`);
+    legacy.run('old-duplicate', 'old-duplicate-token', 'rory', 50, JSON.stringify({ ...emptyMetrics(), requests: 2, input: 6000, output: 60 }), 2);
+    legacy.run('old-newcomer', 'old-newcomer-token', 'Old Newcomer', 0, JSON.stringify(emptyMetrics()), 0);
+    assert.equal(room.database.prepare("SELECT COUNT(*) AS count FROM players WHERE name_key = ''").get()!.count, 2);
+    const totals = room.totals();
+    room.close();
+    room = new Room(setup.config, setup.gateway);
+    assert.deepEqual(room.records().map(record => [record.name, record.name_key]), [['Rory', 'rory'], ['Old Newcomer', 'old newcomer']]);
+    assert.equal(room.records()[0].id, kept.playerId);
+    assert.equal(room.records()[0].attempts, 3);
+    assert.deepEqual(room.totals(), totals);
+    assert.equal(readdirSync(path.join(setup.dataDirectory, 'backups')).length, 1);
+    assert.equal(room.join('old newcomer', room.code, undefined, 'b').playerId, 'old-newcomer');
+  } finally { room.close(); rmSync(setup.dataDirectory, { recursive: true, force: true }); }
+});
+
+test('the registration cap recycles idle players without AI usage or a top-50 score', () => {
+  const setup = fixture();
+  const room = new Room(setup.config, setup.gateway);
+  try {
+    for (let index = 0; index < 500; index += 1) {
+      room.join(`Player ${index}`, room.code, undefined, `socket-${index}`);
+      const player = room.playerFor(`socket-${index}`);
+      if (index < 50) player.record.best_score = 1000 - index;
+      if (index === 50) player.record.attempts = 1;
+      room.save(player);
+      room.disconnect(`socket-${index}`);
+    }
+    for (const [id, player] of room.players) if (player.record.name !== 'Player 499') room.players.delete(id);
+    room.join('Newcomer', room.code, undefined, 'newcomer');
+    const names = new Set(room.records().map(record => record.name));
+    assert.equal(names.size, 500);
+    assert.ok(names.has('Newcomer'));
+    for (const kept of ['Player 0', 'Player 49', 'Player 50', 'Player 499']) assert.ok(names.has(kept), kept);
+    room.disconnect('newcomer');
+    room.database.exec('UPDATE players SET attempts = 1');
+    room.players.clear();
+    assert.throws(() => room.join('Latecomer', room.code, undefined, 'latecomer'), /registration limit/);
   } finally { room.close(); rmSync(setup.dataDirectory, { recursive: true, force: true }); }
 });
 
@@ -1389,6 +1594,48 @@ test('live sockets broadcast verified scores to a spectator and reject score inj
     const health = await fetch(`${url}/api/health`).then(response => response.json()) as { reasoning: string };
     assert.equal(health.reasoning, 'none');
   } finally { player.disconnect(); spectator.disconnect(); await application.close(); rmSync(setup.dataDirectory, { recursive: true, force: true }); }
+});
+
+test('a socket that floods events is throttled and then disconnected', async () => {
+  const setup = fixture();
+  const application = createApplication(setup.config, setup.gateway);
+  await new Promise<void>(resolve => application.server.listen(0, '127.0.0.1', resolve));
+  const address = application.server.address() as { port: number };
+  const client = connect(`http://127.0.0.1:${address.port}`, { transports: ['websocket'], forceNew: true, reconnection: false });
+  try {
+    await new Promise<void>((resolve, reject) => { client.once('connect', resolve); client.once('connect_error', reject); });
+    const replies: Reply<unknown>[] = [];
+    const disconnected = new Promise<string>(resolve => client.once('disconnect', resolve));
+    for (let index = 0; index < SOCKET_EVENT_BURST * 8; index += 1) client.emit('inspect', (reply: Reply<unknown>) => replies.push(reply));
+    assert.equal(await disconnected, 'io server disconnect');
+    assert.ok(replies.some(reply => !reply.ok && reply.code === 'rate'));
+    assert.ok(replies.filter(reply => !reply.ok && reply.code === 'session').length < SOCKET_EVENT_BURST * 2);
+  } finally { client.disconnect(); await application.close(); rmSync(setup.dataDirectory, { recursive: true, force: true }); }
+});
+
+test('rate limits key on the forwarded client address only through trusted proxies', async () => {
+  assert.equal(clientAddress('127.0.0.1', '203.0.113.5', trustedProxy()), '203.0.113.5');
+  assert.equal(clientAddress('10.0.0.4', '203.0.113.5', trustedProxy()), '10.0.0.4');
+  assert.equal(clientAddress('100.100.0.2', 'spoofed, 198.51.100.7', trustedProxy(1)), '198.51.100.7');
+  assert.equal(clientAddress('100.100.0.2', undefined, trustedProxy(1)), '100.100.0.2');
+  const setup = fixture();
+  const application = createApplication({ ...setup.config, trustProxyHops: 1 }, setup.gateway);
+  await new Promise<void>(resolve => application.server.listen(0, '127.0.0.1', resolve));
+  const address = application.server.address() as { port: number };
+  const url = `http://127.0.0.1:${address.port}`;
+  const socketFor = (client: string) => connect(url, { transports: ['websocket'], forceNew: true, extraHeaders: { 'X-Forwarded-For': client } });
+  const clients = [socketFor('198.51.100.1'), socketFor('198.51.100.1'), socketFor('198.51.100.2')];
+  try {
+    await Promise.all(clients.map(client => new Promise<void>((resolve, reject) => { client.once('connect', resolve); client.once('connect_error', reject); })));
+    const attempts = await Promise.all(Array.from({ length: 151 }, (_, index) => clients[index % 2].timeout(5000).emitWithAck('join', { name: 'Blocked Name', room: 'WRONG0' }))) as Reply<unknown>[];
+    assert.equal(attempts.filter(reply => !reply.ok && reply.code === 'rate').length, 1);
+    const other = await clients[2].timeout(5000).emitWithAck('join', { name: 'Other Address', room: application.room.code }) as Reply<JoinResult>;
+    assert.equal(other.ok, true);
+    const tokenize = (client: string) => fetch(`${url}/api/tokenize`, { method: 'POST', headers: { 'Content-Type': 'application/json', 'X-Forwarded-For': client }, body: JSON.stringify({ text: 'hi' }) });
+    for (let request = 0; request < 300; request += 1) assert.equal((await tokenize('198.51.100.1')).status, 200);
+    assert.equal((await tokenize('198.51.100.1')).status, 429);
+    assert.equal((await tokenize('198.51.100.2')).status, 200);
+  } finally { clients.forEach(client => client.disconnect()); await application.close(); rmSync(setup.dataDirectory, { recursive: true, force: true }); }
 });
 
 test('fifty simultaneous sockets can join, play and receive the complete live leaderboard', async () => {

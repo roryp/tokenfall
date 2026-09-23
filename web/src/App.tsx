@@ -199,12 +199,12 @@ export default function App() {
         <strong data-testid="ai-cost" key={`cost-${game.metrics.requests}`}>{formatMoney(game.cost?.total ?? null)}</strong>
         <small>{pricing === 'live' ? 'Live rates' : pricing === 'stale' ? 'Last verified rates' : 'Rates unavailable'}</small>
       </div>
-      <div title="Cost of the last completed Luna request at published USD rates.">
+      <div className="last-call" title="Cost of the last completed Luna request at published USD rates.">
         <span>LAST CALL</span>
         <strong data-testid="last-call-cost">{formatMoney(lastCost)}</strong>
         <small>{latest ? `${number(latest.usage.input)} in / ${number(latest.usage.output)} out` : 'No calls yet'}</small>
       </div>
-      <div className="token-balance" title="Balance after reported usage. Pending holds are shown separately in AI allowance.">
+      <div className="token-balance" title="Balance after reported usage. Pending holds are shown separately in the room panel.">
         <span>AI TOKENS LEFT</span><strong data-testid="ai-tokens-left">{remainingTokens === null ? '--' : number(remainingTokens)}</strong><small><b data-testid="ai-tokens">{number(game.metrics.input + game.metrics.output)}</b> used</small>
       </div>
       <div title={`Estimated compression saving: ${formatMoney(compressionSaving)}. Cache-read saving minus cache-write premium: ${formatMoney(cacheSaving)}.`}>
@@ -219,8 +219,8 @@ export default function App() {
       <div className="luna-reasoning">
         <Switch label="Reasoning" icon={Brain} checked={game.autopilot && Boolean(game.options.reasoning)} disabled={!game.autopilot} onChange={reasoning => game.setOptions(current => ({ ...current, reasoning }))} detail={!game.autopilot ? 'Luna off' : game.options.reasoning ? 'Low effort next' : 'Off next'} title="Enable low reasoning effort for the next Luna request. Can take longer and use more billed output tokens. Changing this does not start Luna." />
         <dl className="reasoning-usage" aria-label="Reasoning token usage" aria-live="polite" aria-atomic="true" title="Provider-reported reasoning tokens. Already included in output tokens and AI cost; missing counts are not estimated.">
-          <div><dt>Reasoning tokens (all calls)</dt><dd data-testid="reasoning-tokens">{number(game.metrics.reasoning)}</dd></div>
-          <div><dt>Reasoning tokens (last call{latest ? `, ${latest.reasoningEnabled ? 'low' : 'off'}` : ''})</dt><dd data-testid="last-reasoning-tokens">{latest ? latest.usage.reasoning === null ? 'Not reported' : number(latest.usage.reasoning) : '--'}</dd></div>
+          <div><dt><span className="reasoning-label-detail">Reasoning tokens (all calls)</span><span className="reasoning-label-short">All calls</span></dt><dd data-testid="reasoning-tokens">{number(game.metrics.reasoning)}</dd></div>
+          <div><dt><span className="reasoning-label-detail">Reasoning tokens (last call{latest ? `, ${latest.reasoningEnabled ? 'low' : 'off'}` : ''})</span><span className="reasoning-label-short">Last call</span></dt><dd data-testid="last-reasoning-tokens">{latest ? latest.usage.reasoning === null ? 'Not reported' : number(latest.usage.reasoning) : '--'}</dd></div>
         </dl>
       </div>
       <div className="luna-mcp"><Switch label="MCP" icon={Plug} checked={game.autopilot && Boolean(game.options.mcp)} disabled={!game.autopilot} onChange={mcp => game.setOptions(current => ({ ...current, mcp }))} detail={!game.autopilot ? 'Luna off' : game.options.mcp ? '2-piece next' : 'Off next'} title="Simulate the next two placements through the real MCP tool before Luna chooses. Adds analysis input tokens and latency. Does not start Luna." /></div>
@@ -231,7 +231,7 @@ export default function App() {
     <div className="game-status" role="status">
       <span className={game.autopilot ? 'luna-active' : ''} data-testid="game-status"><i className={game.busy ? 'thinking' : ''} />{status}</span>
       <span className="request-status" data-testid="request-status" title={game.requestOptions ? 'Changes to the switches apply to the next request.' : undefined}>
-        {game.requestOptions ? `Current request: ${[game.requestOptions.compression ? 'Compression' : 'No compression', game.requestOptions.cache ? 'Cache' : 'No cache', game.requestOptions.reasoning ? 'Reasoning' : 'No reasoning', game.requestOptions.mcp ? 'MCP' : 'No MCP'].join(' · ')}` : latest ? `Last request: ${[latest.compression ? 'Compression' : 'No compression', latest.cacheEnabled ? 'Cache' : 'No cache', latest.reasoningEnabled ? 'Reasoning' : 'No reasoning', latest.mcpLookup ? 'MCP' : 'No MCP'].join(' · ')}` : ''}
+        {game.requestOptions ? `${game.autopilot ? 'Current request' : 'Finishing stopped request'}: ${[game.requestOptions.compression ? 'Compression' : 'No compression', game.requestOptions.cache ? 'Cache' : 'No cache', game.requestOptions.reasoning ? 'Reasoning' : 'No reasoning', game.requestOptions.mcp ? 'MCP' : 'No MCP'].join(' · ')}` : latest ? `Last request: ${[latest.compression ? 'Compression' : 'No compression', latest.cacheEnabled ? 'Cache' : 'No cache', latest.reasoningEnabled ? 'Reasoning' : 'No reasoning', latest.mcpLookup ? 'MCP' : 'No MCP'].join(' · ')}` : ''}
       </span>
       <div className="prompt-summary">
         <div>

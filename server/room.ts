@@ -1,9 +1,9 @@
 import { createHash, randomBytes, randomUUID } from 'node:crypto';
-import { existsSync, mkdirSync, readFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, readFileSync } from 'node:fs';
 import path from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { Game, FPS, placementsFor } from '../shared/game.ts';
-import { costForUsage, DEFAULT_TOKEN_ALLOWANCE, emptyMetrics, MAX_REQUEST_TOKENS, pointsPerCent, tokenAllowance } from '../shared/protocol.ts';
+import { costForUsage, DEFAULT_TOKEN_ALLOWANCE, emptyMetrics, MAX_REQUEST_TOKENS, MAX_TOKEN_ALLOWANCE, pointsPerCent, tokenAllowance } from '../shared/protocol.ts';
 import type { AiOptions, InputAck, InputBatch, JoinResult, LeaderboardEntry, Metrics, PlayerUsage, PromptPreview, RoomResetMode, RoomResetPreview, RoomView, TokenPricing } from '../shared/protocol.ts';
 import type { AppConfig } from './config.ts';
 import { AI_COOLDOWN_MS, AUTOPILOT_COOLDOWN_MS, MAX_OUTPUT_TOKENS, maxCompletionTokens, ModelGate, PREFIX_TOKENS, ROOM_REQUEST_LIMIT, ROOM_TOKEN_BUDGET, RequestError } from './model.ts';
@@ -16,6 +16,7 @@ interface PlayerRecord {
   id: string;
   token_hash: string;
   name: string;
+  name_key: string;
   best_score: number;
   best_lines: number;
   best_level: number;
@@ -25,6 +26,10 @@ interface PlayerRecord {
   token_text: string;
   token_limit: number;
 }
+
+// Names identify players, so matching ignores case, Unicode width variants and repeated spaces.
+export const nameKey = (name: string) => name.normalize('NFKC').trim().replace(/\s+/gu, ' ').toLowerCase();
+const fingerprint = (value: unknown) => createHash('sha256').update(JSON.stringify(value)).digest('hex');
 export interface Player {
   record: PlayerRecord;
   metrics: Metrics;
@@ -70,9 +75,72 @@ export class Room {
     `);
     if (!this.database.prepare('PRAGMA table_info(players)').all().some(column => column.name === 'token_text')) this.database.exec("ALTER TABLE players ADD COLUMN token_text TEXT NOT NULL DEFAULT ''");
     if (!this.database.prepare('PRAGMA table_info(players)').all().some(column => column.name === 'token_limit')) this.database.exec('ALTER TABLE players ADD COLUMN token_limit INTEGER NOT NULL DEFAULT 1000000');
+    this.migratePlayerNames();
     const saved = this.database.prepare("SELECT value FROM settings WHERE key = 'room'").get() as { value: string } | undefined;
     this.code = saved?.value ?? randomBytes(3).toString('hex').toUpperCase();
     if (!saved) this.database.prepare("INSERT INTO settings (key, value) VALUES ('room', ?)").run(this.code);
+  }
+
+  // Older rooms (or an older revision still writing during a rollout) allow repeated names and rows without a name key.
+  // Each startup assigns missing keys and merges repeated names into their best-scoring player so a name maps to one player.
+  private migratePlayerNames() {
+    const indexed = this.database.prepare("SELECT 1 FROM sqlite_master WHERE type = 'index' AND name = 'players_name_key'").get();
+    if (indexed && !this.database.prepare("SELECT 1 FROM players WHERE name_key = '' LIMIT 1").get()) return;
+    const groupRows = () => {
+      const groups = new Map<string, PlayerRecord[]>();
+      for (const row of this.database.prepare('SELECT * FROM players ORDER BY best_score DESC, best_lines DESC, updated ASC, id ASC').all() as unknown as PlayerRecord[]) {
+        const key = nameKey(row.name);
+        groups.set(key, [...(groups.get(key) ?? []), row]);
+      }
+      return groups;
+    };
+    const repeated = (groups: Map<string, PlayerRecord[]>) => [...groups.values()].some(group => group.length > 1);
+    const backedUp = repeated(groupRows());
+    if (backedUp) this.backupDatabase('name-merge');
+    this.database.exec('BEGIN IMMEDIATE');
+    try {
+      if (!this.database.prepare('PRAGMA table_info(players)').all().some(column => column.name === 'name_key')) this.database.exec("ALTER TABLE players ADD COLUMN name_key TEXT NOT NULL DEFAULT ''");
+      const groups = groupRows();
+      if (repeated(groups) && !backedUp) throw new Error('Player names changed while starting. Restart to back up and merge repeated names.');
+      const rename = this.database.prepare('UPDATE players SET name_key = ? WHERE id = ?');
+      const merge = this.database.prepare('UPDATE players SET name_key = ?, metrics = ?, attempts = ?, token_limit = ? WHERE id = ?');
+      const remove = this.database.prepare('DELETE FROM players WHERE id = ?');
+      for (const [key, [primary, ...duplicates]] of groups) {
+        if (!duplicates.length) { rename.run(key, primary.id); continue; }
+        const group = [primary, ...duplicates];
+        const metrics = emptyMetrics();
+        for (const row of group) {
+          const saved = { ...emptyMetrics(), ...JSON.parse(row.metrics) } as Metrics;
+          for (const field of Object.keys(metrics) as (keyof Metrics)[]) metrics[field] += saved[field];
+        }
+        const attempts = group.reduce((sum, row) => sum + row.attempts, 0);
+        const tokenLimit = Math.min(MAX_TOKEN_ALLOWANCE, group.reduce((sum, row) => sum + row.token_limit, 0));
+        for (const duplicate of duplicates) remove.run(duplicate.id);
+        merge.run(key, JSON.stringify(metrics), attempts, tokenLimit, primary.id);
+      }
+      // Partial so inserts from an older revision (which leave the key empty) keep working until the next startup repairs them.
+      this.database.exec("CREATE UNIQUE INDEX IF NOT EXISTS players_name_key ON players (name_key) WHERE name_key <> ''");
+      this.database.exec('COMMIT');
+    } catch (error) {
+      this.database.exec('ROLLBACK');
+      throw error;
+    }
+  }
+
+  private backupDatabase(label: string) {
+    const directory = path.join(this.config.dataDirectory, 'backups');
+    mkdirSync(directory, { recursive: true, mode: 0o700 });
+    const backupPath = path.join(directory, `before-${label}-${Date.now()}-${randomUUID()}.sqlite`);
+    const players = this.database.prepare('SELECT * FROM players ORDER BY id').all();
+    const settings = this.database.prepare('SELECT * FROM settings ORDER BY key').all();
+    this.database.prepare('VACUUM INTO ?').run(backupPath);
+    chmodSync(backupPath, 0o600);
+    const copy = new DatabaseSync(backupPath, { readOnly: true });
+    try {
+      if (copy.prepare('PRAGMA integrity_check').all().map(row => row.integrity_check).join() !== 'ok') throw new Error('The database backup failed its integrity check.');
+      if (fingerprint(copy.prepare('SELECT * FROM players ORDER BY id').all()) !== fingerprint(players) || fingerprint(copy.prepare('SELECT * FROM settings ORDER BY key').all()) !== fingerprint(settings)) throw new Error('The database backup does not match the source.');
+    } finally { copy.close(); }
+    return backupPath;
   }
 
   get online() { return [...this.players.values()].filter(player => player.socketId !== null).length; }
@@ -135,11 +203,11 @@ export class Room {
     this.assertAvailable(player);
     player.record.metrics = JSON.stringify(player.metrics);
     const record = player.record;
-    this.database.prepare(`INSERT INTO players (id, token_hash, name, best_score, best_lines, best_level, metrics, attempts, updated, token_text, token_limit)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-      ON CONFLICT(id) DO UPDATE SET name=excluded.name, best_score=excluded.best_score, best_lines=excluded.best_lines,
+    this.database.prepare(`INSERT INTO players (id, token_hash, name, name_key, best_score, best_lines, best_level, metrics, attempts, updated, token_text, token_limit)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(id) DO UPDATE SET token_hash=excluded.token_hash, name=excluded.name, name_key=excluded.name_key, best_score=excluded.best_score, best_lines=excluded.best_lines,
       best_level=excluded.best_level, metrics=excluded.metrics, attempts=excluded.attempts, updated=excluded.updated, token_text=excluded.token_text, token_limit=excluded.token_limit`)
-      .run(record.id, record.token_hash, record.name, record.best_score, record.best_lines, record.best_level, record.metrics, record.attempts, record.updated, record.token_text, record.token_limit);
+      .run(record.id, record.token_hash, record.name, record.name_key, record.best_score, record.best_lines, record.best_level, record.metrics, record.attempts, record.updated, record.token_text, record.token_limit);
   }
 
   totals() {
@@ -162,39 +230,60 @@ export class Room {
     this.assertAvailable();
     if (code !== this.code) throw new RequestError('That room code is not active.', 'room');
     if (classic && text !== undefined) throw new RequestError('Classic games do not use token text.', 'validation');
+    if (text !== undefined && text.length === 0) throw new RequestError('Enter some text to make your token blocks.', 'token-setup');
     const now = Date.now();
     for (const [id, player] of this.players) if (!player.socketId && now - player.lastSeen > 15 * 60000) this.players.delete(id);
+    // A saved session resumes its player; otherwise the name selects (or creates) the player and issues a new session.
     const sessionToken = token ?? randomBytes(32).toString('hex');
     const tokenHash = createHash('sha256').update(sessionToken).digest('hex');
+    const key = nameKey(name);
     const boundPlayer = [...this.players.values()].find(candidate => candidate.socketId === socketId);
-    if (boundPlayer && boundPlayer.record.token_hash !== tokenHash) throw new RequestError('This connection has already joined the room.', 'session-active');
-    let record = this.database.prepare('SELECT * FROM players WHERE token_hash = ?').get(tokenHash) as unknown as PlayerRecord | undefined;
+    if (boundPlayer && (token ? boundPlayer.record.token_hash !== tokenHash : boundPlayer.record.name_key !== key)) throw new RequestError('This connection has already joined the room.', 'session-active');
+    let record = (token
+      ? this.database.prepare('SELECT * FROM players WHERE token_hash = ?').get(tokenHash)
+      : this.database.prepare("SELECT * FROM players WHERE name_key = ? AND name_key <> ''").get(key)) as unknown as PlayerRecord | undefined;
     if (token && !record) throw new RequestError('Your previous session expired. Join again.', 'session');
     let player = record ? this.players.get(record.id) : undefined;
-    if (player?.socketId && player.socketId !== socketId) throw new RequestError('This player is already open in another tab.', 'session-active');
+    if (player?.socketId && player.socketId !== socketId) throw new RequestError('This player is already playing in another tab.', 'session-active');
     if (!player?.socketId && this.online >= 50) throw new RequestError('The room has 50 players. A spot opens when someone leaves.', 'full');
+    const tokenText = token ? (classic ? '' : undefined) : text ?? '';
+    const currentText = player?.record.token_text ?? record?.token_text;
+    const game = tokenText !== undefined && (!player || tokenText !== currentText) ? this.gameFor(tokenText) : undefined;
     if (!record) {
-      if (this.records().length >= 500) throw new RequestError('This workshop has reached its registration limit.', 'full');
-      if (text !== undefined && text.length === 0) throw new RequestError('Enter some text to make your token blocks.', 'token-setup');
-      record = { id: randomUUID(), token_hash: tokenHash, name, best_score: 0, best_lines: 0, best_level: 1, metrics: JSON.stringify(emptyMetrics()), attempts: 0, updated: now, token_text: text ?? '', token_limit: DEFAULT_TOKEN_ALLOWANCE };
+      if (this.registrationCount() >= 500 && !this.reclaimRegistration()) throw new RequestError('This workshop has reached its registration limit.', 'full');
+      record = { id: randomUUID(), token_hash: tokenHash, name, name_key: key, best_score: 0, best_lines: 0, best_level: 1, metrics: JSON.stringify(emptyMetrics()), attempts: 0, updated: now, token_text: tokenText ?? '', token_limit: DEFAULT_TOKEN_ALLOWANCE };
     }
     if (!player) {
-      player = { record, metrics: { ...emptyMetrics(), ...JSON.parse(record.metrics) }, game: this.gameFor(record.token_text), runId: randomUUID(), started: now, sequence: 0, socketId: null, lastSeen: now, inputWindow: now, inputCount: 0 };
+      player = { record, metrics: { ...emptyMetrics(), ...JSON.parse(record.metrics) }, game: game ?? this.gameFor(record.token_text), runId: randomUUID(), started: now, sequence: 0, socketId: null, lastSeen: now, inputWindow: now, inputCount: 0 };
       this.players.set(record.id, player);
-    }
-    if (classic && player.record.token_text) {
-      player.game = this.gameFor('');
-      player.record.token_text = '';
+    } else if (game) {
+      player.game = game;
       player.runId = randomUUID();
       player.started = now;
       player.sequence = 0;
       player.inputWindow = now;
       player.inputCount = 0;
     }
+    if (tokenText !== undefined) player.record.token_text = tokenText;
+    player.record.token_hash = tokenHash;
     player.socketId = socketId;
     player.lastSeen = now;
     this.save(player);
     return this.joinResult(player, sessionToken);
+  }
+
+  private registrationCount() { return Number(this.database.prepare('SELECT COUNT(*) AS count FROM players').get()!.count); }
+
+  // At the registration cap, recycle the oldest offline player that never used AI and is outside the top 50, so the room cannot be filled permanently.
+  private reclaimRegistration() {
+    const candidates = this.database.prepare(`SELECT id FROM players
+      WHERE attempts = 0 AND COALESCE(json_extract(metrics, '$.requests'), 0) = 0 AND COALESCE(json_extract(metrics, '$.input'), 0) = 0 AND COALESCE(json_extract(metrics, '$.output'), 0) = 0
+      AND id NOT IN (SELECT id FROM players ORDER BY best_score DESC, best_lines DESC, updated ASC LIMIT 50)
+      ORDER BY best_score ASC, updated ASC`).all() as { id: string }[];
+    const candidate = candidates.find(({ id }) => !this.players.has(id));
+    if (!candidate) return false;
+    this.database.prepare('DELETE FROM players WHERE id = ?').run(candidate.id);
+    return true;
   }
 
   joinResult(player: Player, token = ''): JoinResult {
@@ -221,11 +310,12 @@ export class Room {
 
   disconnect(socketId: string) {
     const player = [...this.players.values()].find(candidate => candidate.socketId === socketId);
-    if (!player) return;
+    if (!player) return false;
     if (player.game.status === 'playing') player.game.act('pause');
     player.socketId = null;
     player.lastSeen = Date.now();
     if (!this.resetting) this.save(player);
+    return true;
   }
 
   inputs(player: Player, batch: InputBatch, now = Date.now()): InputAck {
@@ -280,6 +370,7 @@ export class Room {
 
   inspect(player: Player, now = Date.now()): PromptPreview {
     if (now - (this.previewTimes.get(player.record.id) ?? -Infinity) < 1000) throw new RequestError('Preview is cooling down. Try again in a moment.', 'cooldown', 1000);
+    this.gate.evaluate(now);
     this.previewTimes.set(player.record.id, now);
     const prompts = buildPrompts(player.game, placementsFor(player.game));
     const overhead = PREFIX_TOKENS + MAX_OUTPUT_TOKENS + 1024;
@@ -293,13 +384,15 @@ export class Room {
   async assist(player: Player, options: AiOptions) {
     this.assertAvailable(player);
     if (player.game.status === 'over') throw new RequestError('Start a new game before asking Luna.', 'game-over');
+    const now = Date.now();
+    this.gate.admit(player.record.id, now, options.autopilot);
     const totals = this.totals();
     if (totals.attempts >= ROOM_REQUEST_LIMIT) throw new RequestError(`The room AI request allowance is used: 0 of ${ROOM_REQUEST_LIMIT.toLocaleString()} requests left. Manual play is still available.`, 'room-requests');
     const prompts = buildPrompts(player.game, placementsFor(player.game));
     const reservation = PREFIX_TOKENS + (options.compression ? prompts.packedTokens : prompts.rawTokens) + maxCompletionTokens(options) + 1024 + (options.mcp ? MAX_MCP_CONTEXT_TOKENS : 0);
     const allowance = this.usage(player).allowance;
     const roomAllowance = this.roomAllowance(totals);
-    const release = this.gate.acquire(player.record.id, reservation, allowance.used + allowance.unconfirmed, roomAllowance.used + roomAllowance.unconfirmed, Date.now(), options.autopilot, allowance.limit);
+    const release = this.gate.acquire(player.record.id, reservation, allowance.used + allowance.unconfirmed, roomAllowance.used + roomAllowance.unconfirmed, now, options.autopilot, allowance.limit);
     const runId = player.runId;
     this.pendingTokens.set(player.record.id, reservation);
     player.record.attempts += 1;
@@ -347,7 +440,8 @@ export class Room {
     const totals = this.totals();
     const entries: LeaderboardEntry[] = this.records().map(record => {
       const metrics: Metrics = { ...emptyMetrics(), ...JSON.parse(record.metrics) };
-      const unmeteredRequests = Math.max(0, record.attempts - metrics.requests);
+      // An in-flight request has not reported usage yet; only completed requests without usage leave spend incomplete.
+      const unmeteredRequests = Math.max(0, record.attempts - metrics.requests - Number(this.pendingTokens.has(record.id)));
       const costUsd = rates ? costForUsage(metrics, rates).total : null;
       return {
         id: record.id, name: record.name, score: record.best_score, costUsd, unmeteredRequests,
@@ -362,7 +456,7 @@ export class Room {
       joinUrl: this.publicUrl(), model: this.config.deployment, prefixTokens: PREFIX_TOKENS,
       tokenBudget: ROOM_TOKEN_BUDGET, playerTokenBudget: DEFAULT_TOKEN_ALLOWANCE,
       allowance: this.roomAllowance(totals), requestsRemaining: Math.max(0, ROOM_REQUEST_LIMIT - totals.attempts),
-      pricing: this.pricing, unmeteredRequests: Math.max(0, totals.attempts - totals.metrics.requests),
+      pricing: this.pricing, unmeteredRequests: Math.max(0, totals.attempts - totals.metrics.requests - this.pendingTokens.size),
       aiCooldownMs: AI_COOLDOWN_MS, autopilotCooldownMs: AUTOPILOT_COOLDOWN_MS,
       ...(this.config.localMaintenance ? { maintenance: this.maintenanceStatus } : {}),
     };

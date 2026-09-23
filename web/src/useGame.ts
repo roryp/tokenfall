@@ -248,6 +248,8 @@ export function useGame() {
       socket.current!.timeout(5000).emit('inputs', batch, (error: Error | null, reply: Reply<InputAck>) => {
         if (runId.current !== batch.runId) { resolve(false); return; }
         sending.current = null;
+        // A room reset briefly rejects inputs; keep the batch for the next flush instead of reconnecting past the reset notice.
+        if (!error && !reply.ok && reply.code === 'maintenance') { resolve(false); return; }
         if (error || !reply.ok) { resync(!error && !reply.ok ? reply.error : 'Reconnecting to your game.'); resolve(false); return; }
         sentEvents.current += batch.events.length;
         sequence.current = reply.data.sequence;

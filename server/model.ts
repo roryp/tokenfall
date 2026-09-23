@@ -23,6 +23,8 @@ export const PLAYER_REQUEST_LIMIT = 40;
 export const ROOM_REQUEST_LIMIT = 2000;
 export const AI_COOLDOWN_MS = 8000;
 export const AUTOPILOT_COOLDOWN_MS = 1000;
+export const EVALUATION_INTERVAL_MS = 1000;
+export const ROOM_EVALUATIONS_PER_SECOND = 8;
 
 export interface ModelGateway {
   complete(game: Game, options: AiOptions, cacheBucket: string): Promise<Insight>;
@@ -42,8 +44,30 @@ export class ModelGate {
   inFlight = 0;
   reserved = 0;
   private lastRequest = new Map<string, number>();
+  private lastEvaluation = new Map<string, number>();
   private activePlayers = new Set<string>();
   private requestTimes: { time: number; tokens: number }[] = [];
+  private evaluationTimes: number[] = [];
+
+  // Rejects with in-memory checks before a caller spends CPU on prompt building.
+  admit(playerId: string, now = Date.now(), autopilot = false) {
+    if (this.activePlayers.has(playerId)) throw new RequestError('Luna is already choosing your move.', 'busy', 1000);
+    const remaining = (autopilot ? AUTOPILOT_COOLDOWN_MS : AI_COOLDOWN_MS) - (now - (this.lastRequest.get(playerId) ?? -Infinity));
+    if (remaining > 0) throw new RequestError('Luna is cooling down.', 'cooldown', remaining);
+    const pacing = EVALUATION_INTERVAL_MS - (now - (this.lastEvaluation.get(playerId) ?? -Infinity));
+    if (pacing > 0) throw new RequestError('Luna is cooling down.', 'cooldown', pacing);
+    this.requestTimes = this.requestTimes.filter(entry => now - entry.time < 60000);
+    if (this.inFlight >= 4 || this.requestTimes.length >= 90) throw new RequestError('The room is busy. Keep playing and try again shortly.', 'busy', 3000);
+    this.evaluate(now);
+    if (this.lastEvaluation.size > 1000) for (const [id, time] of this.lastEvaluation) if (now - time >= EVALUATION_INTERVAL_MS) this.lastEvaluation.delete(id);
+    this.lastEvaluation.set(playerId, now);
+  }
+
+  evaluate(now = Date.now()) {
+    this.evaluationTimes = this.evaluationTimes.filter(time => now - time < 1000);
+    if (this.evaluationTimes.length >= ROOM_EVALUATIONS_PER_SECOND) throw new RequestError('The room is busy. Keep playing and try again shortly.', 'busy', 1000);
+    this.evaluationTimes.push(now);
+  }
 
   acquire(playerId: string, reservation: number, playerSpent: number, roomSpent: number, now = Date.now(), autopilot = false, playerBudget = PLAYER_TOKEN_BUDGET) {
     if (this.activePlayers.has(playerId)) throw new RequestError('Luna is already choosing your move.', 'busy', 1000);
