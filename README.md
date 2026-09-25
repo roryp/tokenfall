@@ -4,13 +4,13 @@
 
 A familiar falling-block game with an AI twist: turn a sentence into your piece queue, hand the controls to GPT-5.6 Luna, and watch the token costs as it plays. Everyone gets their own board; the room shares live leaderboards.
 
-**[Play now](https://azappctfcqc35fwl26.calmsea-c2502d80.eastus2.azurecontainerapps.io/)** | [Game rules](#game-rules) | [Screen guide](#your-screen-decoded) | [Luna controls](#let-luna-play) | [Build and host](#for-builders-and-hosts)
+**[Play now at https://aka.ms/tokenfall](https://aka.ms/tokenfall)** | [Game rules](#game-rules) | [Screen guide](#your-screen-decoded) | [Luna controls](#let-luna-play) | [Build and host](#for-builders-and-hosts)
 
 Here for the conference? Open the link on a laptop or phone and jump in. **Manual play and sentence previews make no model calls.** Turning on **Ask Luna** starts paid Azure AI requests.
 
 ## Play in 30 seconds
 
-1. **Open [the game](https://azappctfcqc35fwl26.calmsea-c2502d80.eastus2.azurecontainerapps.io/).** No installation needed.
+1. **Open [https://aka.ms/tokenfall](https://aka.ms/tokenfall).** No installation needed.
 2. **Choose a distinctive name** using 2-16 letters, numbers, spaces, underscores, or hyphens.
 3. **Pick your pieces:** keep **Sentence** to play your words, or choose **Classic** for a shuffled queue.
 4. **Click Join game.** Move, rotate, and drop pieces to fill horizontal rows. Leave **Ask Luna** off to play yourself.
