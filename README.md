@@ -1,6 +1,6 @@
 # Tetris With Luna
 
-**Stack blocks. Clear lines. Make every token count.**
+For a presentation overview, see the [workshop slides](Slides.pdf).
 
 A familiar falling-block game with an AI twist: turn a sentence into your piece queue, hand the controls to GPT-5.6 Luna, and watch the token costs as it plays. Everyone gets their own board; the room shares live leaderboards.
 
