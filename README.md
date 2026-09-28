@@ -2,17 +2,6 @@
 
 For a presentation overview, see the [workshop slides](Slides.pdf).
 
-### Scoring quick reference
-
-| Rows cleared | Name | Base points (level 1) |
-| :---: | --- | ---: |
-| 1 | Single | 100 |
-| 2 | Double | 300 |
-| 3 | Triple | 500 |
-| 4 | Tetris | 800 |
-
-Multiply by the current level. Soft drops add **1 pt/row**, hard drops **2 pt/row** (not level-scaled). T-spins, combos, back-to-back difficult clears, and perfect clears add further bonuses — see [full details](#how-points-work).
-
 # Introduction 
 
 A familiar falling-block game with an AI twist: turn a sentence into your piece queue, hand the controls to GPT-5.6 Luna, and watch the token costs as it plays. Everyone gets their own board; the room shares live leaderboards.
