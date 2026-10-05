@@ -14,9 +14,9 @@ Here for the conference? Open the link on a laptop or phone and jump in. **Manua
 
 1. **Open [https://aka.ms/tokenfall](https://aka.ms/tokenfall).** No installation needed.
 
-   [![Tetris front end after real Luna-assisted play, with numbered red rectangles and explanatory arrows highlighting the playfield, Hold, Next, controls, tools, actual AI costs, token allowance, and leaderboard.](docs/images/screen-guide.png)](docs/images/screen-guide.png)
+   [![Real Tetris game with large, numbered labels for the board, pieces, controls, AI costs, room, and rankings.](docs/images/screen-guide.png)](docs/images/screen-guide.png)
 
-   *After joining: a real Luna-assisted run with **183,386 AI tokens used** and **$0.03009738 estimated AI cost**. Red rectangles and arrowed callouts explain the front end; numbers match the [screen guide](#your-screen-decoded). Click the image for full size.*
+   *Real Luna-assisted game; **$0.03009738 estimated AI cost**. Numbers match the [screen guide](#your-screen-decoded). Click to enlarge.*
 
 2. **Choose a distinctive name** using 2-16 letters, numbers, spaces, underscores, or hyphens.
 3. **Pick your pieces:** keep **Sentence** to play your words, or choose **Classic** for a shuffled queue.
@@ -125,9 +125,9 @@ MCP results, Compression, and Change sentence suspend an enabled Luna session wh
 
 All four options below default off. They are **shown off and disabled whenever Ask Luna is off**; saved preferences return when you explicitly turn it back on. Changes affect the **next request**, not one already in flight.
 
-[![Close-up of the AI cost ticker and Luna controls from a real game. Red rectangles and arrows explain total and last-call costs, estimated savings, remaining tokens, the distinction from game scoring, and Ask Luna, MCP, Reasoning, Cache, and Compression.](docs/images/ai-costs-luna-controls.png)](docs/images/ai-costs-luna-controls.png)
+[![AI cost ticker and Luna controls with short red-arrow labels: total spent, last AI call, money saved, tokens left, AI plays, look ahead, think more, reuse instructions, and smaller prompts.](docs/images/ai-costs-luna-controls.png)](docs/images/ai-costs-luna-controls.png)
 
-*Close-up of the same real run: **$0.03009738 total AI cost**, **$0.00150786 last-call cost**, and **$0.01761882 estimated savings**. Costs are estimates, not game points. Luna is stopped, so its four options are shown off and disabled. Click the image for full size.*
+*Same real game, with Luna off. Costs are estimates, not game points. Click to enlarge.*
 
 | Option | What changes | What to watch |
 | --- | --- | --- |
