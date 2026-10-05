@@ -59,6 +59,10 @@ Touch controls sit below the board. Hold is available once per piece. The ghost 
 
 Options default off, are disabled while Luna is off, and affect the next request. Saved choices return when Luna is enabled again.
 
+[![Cost vs speed per Luna move: Compression and Cache cost about a quarter less than Plain at about 2 seconds; Reasoning and MCP cost about 15% more and take 3.5 and 4.2 seconds.](docs/images/luna-cost-vs-speed.png)](docs/images/luna-cost-vs-speed.png)
+
+Measured from 50 [Foundry traces](#tracing) in October 2026, with each option answering the same 10 board positions at Azure retail prices. All Cache moves were cache hits.
+
 To resume manual play, turn off **Ask Luna** or click **Stop Luna**, then **Play**. An in-flight request may still be charged, but its late move is discarded.
 
 New players receive **1,000,000 AI tokens** across all their games. Reported input and output, including cached input, consume the allowance; restarting does not refill it. The room also has shared limits and supports 50 online players. Manual play remains available when AI limits are reached.
