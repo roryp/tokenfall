@@ -4,6 +4,8 @@ param principalId string
 param openAIAccountName string
 param openAIEndpoint string
 param openAIDeployment string
+param logAnalyticsWorkspaceName string
+param appInsightsName string
 param image string = ''
 
 var resourceToken = uniqueString(subscription().id, resourceGroup().id, location, environmentName)
@@ -66,14 +68,21 @@ resource inferenceRole 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
   }
 }
 
-resource logs 'Microsoft.OperationalInsights/workspaces@2026-03-01' = {
-  name: 'azlog${resourceToken}'
-  location: location
-  tags: tags
+resource logs 'Microsoft.OperationalInsights/workspaces@2026-03-01' existing = {
+  name: logAnalyticsWorkspaceName
+}
+
+resource appInsights 'Microsoft.Insights/components@2020-02-02' existing = {
+  name: appInsightsName
+}
+
+resource tracePublisher 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
+  name: guid(appInsights.id, identity.id, 'monitoring-metrics-publisher')
+  scope: appInsights
   properties: {
-    sku: { name: 'PerGB2018' }
-    retentionInDays: 30
-    workspaceCapping: { dailyQuotaGb: 1 }
+    principalId: identity.properties.principalId
+    principalType: 'ServicePrincipal'
+    roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', '3913510d-42f4-4e42-8a64-420c390055eb')
   }
 }
 
@@ -189,6 +198,7 @@ resource app 'Microsoft.App/containerApps@2026-01-01' = {
             { name: 'AZURE_LOCATION', value: location }
             { name: 'PUBLIC_BASE_URL', value: publicUrl }
             { name: 'TRUST_PROXY_HOPS', value: '1' }
+            { name: 'APPLICATIONINSIGHTS_CONNECTION_STRING', value: appInsights.properties.ConnectionString }
           ]
           volumeMounts: [
             { volumeName: 'state', mountPath: '/data' }
@@ -226,7 +236,7 @@ resource app 'Microsoft.App/containerApps@2026-01-01' = {
       ]
     }
   }
-  dependsOn: [registryPull, inferenceRole]
+  dependsOn: [registryPull, inferenceRole, tracePublisher]
 }
 
 output appName string = app.name
@@ -235,5 +245,4 @@ output registryName string = registry.name
 output registryEndpoint string = registry.properties.loginServer
 output environmentId string = environment.id
 output environmentName string = environment.name
-output logAnalyticsWorkspaceName string = logs.name
 output storageAccountName string = storage.name

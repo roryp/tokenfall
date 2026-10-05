@@ -1,15 +1,18 @@
 import { randomUUID } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import OpenAI from 'openai';
-import { AzureCliCredential, getBearerTokenProvider, ManagedIdentityCredential } from '@azure/identity';
+import { getBearerTokenProvider } from '@azure/identity';
 import { z } from 'zod';
 import { placementsFor } from '../shared/game.ts';
 import type { Game } from '../shared/game.ts';
 import { MAX_TOKEN_ALLOWANCE } from '../shared/protocol.ts';
 import type { AiOptions, Insight } from '../shared/protocol.ts';
+import { azureCredential } from './config.ts';
 import type { AppConfig } from './config.ts';
 import { buildPrompts, countTokens, normalizeUsage, tokenChips } from './tokens.ts';
 import { lookaheadSnapshot, lookupFutureMoves, MAX_MCP_CONTEXT_TOKENS, McpLookupError, mcpPromptContext } from './mcp.ts';
+import { MCP_LOOKAHEAD_TOOL_NAME } from './mcp-server.ts';
+import { recordChatResponse, traceChat, traceTool } from './tracing.ts';
 
 export const POLICY = readFileSync(new URL('./policy.md', import.meta.url), 'utf8');
 export const PREFIX_TOKENS = countTokens(POLICY);
@@ -102,12 +105,9 @@ export class LunaGateway implements ModelGateway {
 
   constructor(config: AppConfig) {
     if (PREFIX_TOKENS < 1024) throw new Error('The reusable model policy is too short for prompt caching.');
-    const credential = config.managedIdentityClientId
-      ? new ManagedIdentityCredential({ clientId: config.managedIdentityClientId })
-      : new AzureCliCredential({ tenantId: config.tenantId });
     this.client = new OpenAI({
       baseURL: `${config.endpoint.replace(/\/$/, '')}/openai/v1/`,
-      apiKey: getBearerTokenProvider(credential, 'https://cognitiveservices.azure.com/.default'),
+      apiKey: getBearerTokenProvider(azureCredential(config), 'https://cognitiveservices.azure.com/.default'),
       maxRetries: 0,
       timeout: 20000,
     });
@@ -120,7 +120,11 @@ export class LunaGateway implements ModelGateway {
     const placements = placementsFor(game);
     if (!placements.length) throw new RequestError('Start a new game before requesting a move.');
     let prompts = buildPrompts(game, placements);
-    const mcpLookup = options.mcp ? await lookupFutureMoves(lookaheadSnapshot(game)) : undefined;
+    const mcpLookup = options.mcp ? await traceTool(MCP_LOOKAHEAD_TOOL_NAME, async span => {
+      const lookup = await lookupFutureMoves(lookaheadSnapshot(game));
+      span.setAttribute('tokenfall.mcp.result_tokens', lookup.resultTokens);
+      return lookup;
+    }) : undefined;
     const originalTokens = options.compression ? prompts.packedTokens : prompts.rawTokens;
     if (mcpLookup) {
       const context = mcpPromptContext(mcpLookup);
@@ -158,9 +162,13 @@ export class LunaGateway implements ModelGateway {
         },
       },
     };
-    const result = await this.client.chat.completions.create(request, { timeout: options.reasoning ? 60000 : 20000 });
+    const { result, usage } = await traceChat(this.deployment, maxCompletionTokens(options), this.client.baseURL, async span => {
+      const result = await this.client.chat.completions.create(request, { timeout: options.reasoning ? 60000 : 20000 });
+      const usage = normalizeUsage(result.usage);
+      recordChatResponse(span, result, usage);
+      return { result, usage };
+    });
     const latencyMs = Math.round(performance.now() - started);
-    const usage = normalizeUsage(result.usage);
     const outputText = result.choices[0]?.message.content ?? '';
     let selection: z.infer<typeof moveSchema> | null = null;
     try { selection = moveSchema.parse(JSON.parse(outputText)); } catch { selection = null; }

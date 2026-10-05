@@ -87,6 +87,8 @@ Open http://127.0.0.1:3100. Set `AZURE_LOCATION` to your resource's region for p
 
 Configuration precedence is process variables, root dotenv file, then selected `azd` environment. See [configuration](server/config.ts). `npm run dev` watches the backend; rebuild frontend changes with `npm --prefix web run build`.
 
+When `APPLICATIONINSIGHTS_CONNECTION_STRING` is set (provisioning stores it in the `azd` environment), the local server exports [Luna traces](#tracing) with your Azure CLI identity. Set it to an empty value in the root dotenv file to keep local runs out of the shared traces.
+
 SQLite persists scores, sentences, allowances, and usage under `DATA_DIRECTORY`. Boards are lost on server restart. A second server needs a different `PORT` and `DATA_DIRECTORY`; keep databases and backups private.
 
 For network sharing, set `HOST=0.0.0.0` and an audience-reachable `PUBLIC_BASE_URL`. A saved `DATA_DIRECTORY/public-url.json` overrides that URL; update it or stop the old tunnel helper and remove it. Check **Share game** before distributing the link.
@@ -112,6 +114,39 @@ Rules and replay validation: [game engine](shared/game.ts). AI prompts and valid
 For rollback, stop the new revision and wait for zero replicas before activating the previous one. Keep one running replica, one active revision, and no traffic splitting outside maintenance.
 
 Do not run `azd init` over the configured environment. Preview infrastructure changes with `azd provision --preview` before provisioning; app-only deployment does not update container settings. The hosting template sets `TRUST_PROXY_HOPS=1` for ingress-forwarded client addresses; leave it unset locally. Preserve Azure Files `nobrl` mounting and SQLite `DELETE` journaling/full synchronization.
+
+## Tracing
+
+[![Luna traces in Microsoft Foundry: the linked tokenfall-luna agent with one trace per move and its tokens, and one trace's agent, tool, and model spans with the token waterfall and provider-reported usage.](docs/images/foundry-luna-traces.png)](docs/images/foundry-luna-traces.png)
+
+How a Luna move reaches Foundry:
+
+1. The [tracing module](server/tracing.ts) wraps each admitted Luna request in an `invoke_agent Luna` span. The MCP lookahead and the model call are child spans, so one move is one trace.
+2. Spans follow the [OpenTelemetry GenAI conventions](https://opentelemetry.io/docs/specs/semconv/gen-ai/). Every span carries `gen_ai.agent.id` `tokenfall-luna` and the game run as `gen_ai.conversation.id`. The `chat` span records the usage the model returned.
+3. Azure Monitor exports the spans with the app's managed identity to Application Insights, which is connected to the `tokenfall` Foundry project.
+4. Foundry matches the spans to the linked `tokenfall-luna` agent and lists them under **Build › Agents › tokenfall-luna › Traces**.
+
+| Span | Records |
+| --- | --- |
+| `invoke_agent Luna` | Options, reserved tokens, move status, and provider-reported usage |
+| `execute_tool analyze_future_moves` | MCP lookahead time and result tokens, when MCP is on |
+| `chat gpt-5.6-luna` | Response ID, finish reason, and input, output, cache-read, cache-write, and reasoning tokens |
+
+Select a trace to see its spans. Set **Display mode** to **Tokens** for the token waterfall, and select the `chat` span for the input, output, cache, and reasoning tokens. Moves in one game share the conversation ID. Traces arrive within 2-5 minutes and follow the Log Analytics workspace's 30-day retention.
+
+Link Luna once per project in [Microsoft Foundry](https://ai.azure.com): **Build › Agents › New agent › Link external agent**, with the agent name and OTel agent ID `tokenfall-luna`. [External agents](https://learn.microsoft.com/azure/foundry/agents/how-to/register-external-agent) are in preview. Without the link, traces still reach Application Insights but do not appear under **Agents**.
+
+The [model template](infra/model.bicep) upgrades the Azure OpenAI resource in place to a Microsoft Foundry resource with the same name, endpoint, and deployment, and adds the `tokenfall` project. The [monitoring template](infra/monitoring.bicep) connects an Entra-only Application Insights resource to that project. The app, the project, and the deploying user receive `Monitoring Metrics Publisher`; the user also receives `Log Analytics Reader` and `Foundry User`.
+
+To total usage in Application Insights:
+
+```kusto
+dependencies
+| where customDimensions["gen_ai.operation.name"] == "chat"
+| summarize calls = count(), input = sum(toint(customDimensions["gen_ai.usage.input_tokens"])), output = sum(toint(customDimensions["gen_ai.usage.output_tokens"])) by bin(timestamp, 1h)
+```
+
+Traces record token counts, not prompts or replies. Requests rejected before reaching Luna, such as cooldowns or exhausted budgets, are not traced. HTTP auto-instrumentation is off so health probes and Socket.IO polling do not bury the GenAI spans; occasional managed identity token requests still appear as separate traces.
 
 ## Reset room data
 

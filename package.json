@@ -19,7 +19,9 @@
   },
   "dependencies": {
     "@azure/identity": "4.13.2",
+    "@azure/monitor-opentelemetry": "1.20.0",
     "@modelcontextprotocol/sdk": "1.30.0",
+    "@opentelemetry/api": "1.9.1",
     "dotenv": "17.4.2",
     "express": "5.2.1",
     "js-tiktoken": "1.0.21",
@@ -32,6 +34,7 @@
     "zod": "4.5.4"
   },
   "devDependencies": {
+    "@opentelemetry/sdk-trace-node": "2.11.0",
     "@types/express": "5.0.6",
     "@types/node": "26.4.1",
     "@types/seedrandom": "3.0.8",

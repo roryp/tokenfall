@@ -1,6 +1,8 @@
 import { existsSync, readFileSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { AzureCliCredential, ManagedIdentityCredential } from '@azure/identity';
+import type { TokenCredential } from '@azure/identity';
 import { parse } from 'dotenv';
 
 export const ROOT = fileURLToPath(new URL('../', import.meta.url));
@@ -17,6 +19,13 @@ export interface AppConfig {
   sqliteJournalMode?: 'WAL' | 'DELETE';
   localMaintenance?: boolean;
   trustProxyHops?: number;
+  appInsightsConnectionString?: string;
+}
+
+export function azureCredential(config: Pick<AppConfig, 'managedIdentityClientId' | 'tenantId'>): TokenCredential {
+  return config.managedIdentityClientId
+    ? new ManagedIdentityCredential({ clientId: config.managedIdentityClientId })
+    : new AzureCliCredential({ tenantId: config.tenantId });
 }
 
 export function loadConfig(environment: NodeJS.ProcessEnv = process.env): AppConfig {
@@ -49,5 +58,6 @@ export function loadConfig(environment: NodeJS.ProcessEnv = process.env): AppCon
     tenantId: values.AZURE_TENANT_ID, dataDirectory: path.resolve(values.DATA_DIRECTORY ?? path.join(ROOT, 'data')), publicUrl: values.PUBLIC_BASE_URL,
     pricingRegion: values.AZURE_LOCATION,
     managedIdentityClientId: values.AZURE_CLIENT_ID, sqliteJournalMode, localMaintenance, trustProxyHops,
+    appInsightsConnectionString: values.APPLICATIONINSIGHTS_CONNECTION_STRING || undefined,
   };
 }

@@ -10,6 +10,7 @@ import { AI_COOLDOWN_MS, AUTOPILOT_COOLDOWN_MS, MAX_OUTPUT_TOKENS, maxCompletion
 import type { ModelGateway } from './model.ts';
 import { addUsage, buildPrompts, gameTokens } from './tokens.ts';
 import { MAX_MCP_CONTEXT_TOKENS, McpLookupError } from './mcp.ts';
+import { recordLunaResult, traceLunaRequest } from './tracing.ts';
 import { resetRoom } from '../scripts/reset-room.ts';
 
 interface PlayerRecord {
@@ -396,25 +397,28 @@ export class Room {
     const runId = player.runId;
     this.pendingTokens.set(player.record.id, reservation);
     player.record.attempts += 1;
-    try {
-      this.save(player);
-      const bucket = parseInt(player.record.id.slice(0, 2), 16) % 8;
-      const insight = await this.gateway.complete(player.game, options, `${this.code}:${bucket}`);
-      player.metrics = addUsage(player.metrics, insight.usage, insight.savedTokens, options.cache);
-      const current = player.game.view();
-      if (insight.status === 'ready' && (runId !== player.runId || insight.pieceId !== current.pieceId || current.status === 'over')) insight.status = 'stale';
-      this.save(player);
-      this.pendingTokens.delete(player.record.id);
-      release();
-      return { insight, ...this.usage(player) };
-    } catch (error) {
-      if (error instanceof McpLookupError) {
-        player.record.attempts -= 1;
+    return traceLunaRequest(runId, this.config.deployment, options, reservation, async span => {
+      try {
         this.save(player);
-        throw new RequestError(error.message, error.reason === 'context' ? 'mcp-context' : 'mcp');
-      }
-      throw error;
-    } finally { this.pendingTokens.delete(player.record.id); release(); }
+        const bucket = parseInt(player.record.id.slice(0, 2), 16) % 8;
+        const insight = await this.gateway.complete(player.game, options, `${this.code}:${bucket}`);
+        player.metrics = addUsage(player.metrics, insight.usage, insight.savedTokens, options.cache);
+        const current = player.game.view();
+        if (insight.status === 'ready' && (runId !== player.runId || insight.pieceId !== current.pieceId || current.status === 'over')) insight.status = 'stale';
+        recordLunaResult(span, insight);
+        this.save(player);
+        this.pendingTokens.delete(player.record.id);
+        release();
+        return { insight, ...this.usage(player) };
+      } catch (error) {
+        if (error instanceof McpLookupError) {
+          player.record.attempts -= 1;
+          this.save(player);
+          throw new RequestError(error.message, error.reason === 'context' ? 'mcp-context' : 'mcp');
+        }
+        throw error;
+      } finally { this.pendingTokens.delete(player.record.id); release(); }
+    });
   }
 
   publicUrl() {
