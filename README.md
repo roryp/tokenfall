@@ -63,6 +63,10 @@ Options default off, are disabled while Luna is off, and affect the next request
 
 Measured from 50 [Foundry traces](#tracing) in October 2026, with each option answering the same 10 board positions at Azure retail prices. All Cache moves were cache hits.
 
+[![Where MCP's $2.18 per 1,000 moves goes: game state $1.42, instructions $0.45, MCP lookahead $0.27, and Luna's reply $0.04. The MCP tool adds 2.1 seconds per move.](docs/images/luna-mcp-cost-breakdown.png)](docs/images/luna-mcp-cost-breakdown.png)
+
+MCP adds 1,362 lookahead tokens per move (+14% cost) and 2.1 s of tool time.
+
 To resume manual play, turn off **Ask Luna** or click **Stop Luna**, then **Play**. An in-flight request may still be charged, but its late move is discarded.
 
 New players receive **1,000,000 AI tokens** across all their games. Reported input and output, including cached input, consume the allowance; restarting does not refill it. The room also has shared limits and supports 50 online players. Manual play remains available when AI limits are reached.
