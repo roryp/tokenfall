@@ -13,6 +13,11 @@ Here for the conference? Open the link on a laptop or phone and jump in. **Manua
 ## Play in 30 seconds
 
 1. **Open [https://aka.ms/tokenfall](https://aka.ms/tokenfall).** No installation needed.
+
+   [![Tetris front end after real Luna-assisted play, with numbered red rectangles and explanatory arrows highlighting the playfield, Hold, Next, controls, tools, actual AI costs, token allowance, and leaderboard.](docs/images/screen-guide.png)](docs/images/screen-guide.png)
+
+   *After joining: a real Luna-assisted run with **183,386 AI tokens used** and **$0.03009738 estimated AI cost**. Red rectangles and arrowed callouts explain the front end; numbers match the [screen guide](#your-screen-decoded). Click the image for full size.*
+
 2. **Choose a distinctive name** using 2-16 letters, numbers, spaces, underscores, or hyphens.
 3. **Pick your pieces:** keep **Sentence** to play your words, or choose **Classic** for a shuffled queue.
 4. **Click Join game.** Move, rotate, and drop pieces to fill horizontal rows. Leave **Ask Luna** off to play yourself.
@@ -83,9 +88,7 @@ Both lists show the top 50, ten players per page. Everyone in the room competes 
 
 ## Your screen, decoded
 
-[![Tetris in Sentence mode with twelve numbered red rectangles marking the session controls, score, Hold, playfield, Next, game controls, tools, costs, Luna switches, status, room details, and leaderboard. The guide below explains each area.](docs/images/screen-guide.png)](docs/images/screen-guide.png)
-
-*Desktop example with Luna off and no AI tokens spent. Click the image for full size. Red numbers match the guide below; on smaller screens, the room panel moves below the game.*
+The numbered callouts in the [annotated screenshot above](docs/images/screen-guide.png) match the guide below. On smaller screens, the room panel moves below the game.
 
 | # | Area | What it does and how to use it |
 | --- | --- | --- |
@@ -121,6 +124,10 @@ MCP results, Compression, and Change sentence suspend an enabled Luna session wh
 **Ask Luna is a player, not a hint button.** Switch it on and Luna keeps choosing moves until you stop it, the game ends, or a limit/error pauses it. The board pauses while each paid request is pending, then executes the validated move. Luna can use Hold, but it can also lose. No invisible rescue bot steps in.
 
 All four options below default off. They are **shown off and disabled whenever Ask Luna is off**; saved preferences return when you explicitly turn it back on. Changes affect the **next request**, not one already in flight.
+
+[![Close-up of the AI cost ticker and Luna controls from a real game. Red rectangles and arrows explain total and last-call costs, estimated savings, remaining tokens, the distinction from game scoring, and Ask Luna, MCP, Reasoning, Cache, and Compression.](docs/images/ai-costs-luna-controls.png)](docs/images/ai-costs-luna-controls.png)
+
+*Close-up of the same real run: **$0.03009738 total AI cost**, **$0.00150786 last-call cost**, and **$0.01761882 estimated savings**. Costs are estimates, not game points. Luna is stopped, so its four options are shown off and disabled. Click the image for full size.*
 
 | Option | What changes | What to watch |
 | --- | --- | --- |
