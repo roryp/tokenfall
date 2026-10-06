@@ -7,7 +7,8 @@ param location string = 'eastus2'
 @minLength(1)
 param principalId string
 @minValue(1)
-param modelCapacity int = 500
+@description('Luna GlobalStandard capacity: thousands of tokens per minute, which also sets requests per minute.')
+param modelCapacity int = 1013
 param webImage string = ''
 
 resource resourceGroup 'Microsoft.Resources/resourceGroups@2024-03-01' = {
