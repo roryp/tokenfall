@@ -63,9 +63,9 @@ Touch controls sit below the board. Hold is available once per piece. The ghost 
 
 Options default off, are disabled while Luna is off, and affect the next request. Saved choices return when Luna is enabled again.
 
-[![Cost vs speed per Luna move: Compression and Cache cost about a quarter less than Plain at about 2 seconds; Reasoning and MCP cost about 15% more and take 3.5 and 4.2 seconds.](docs/images/luna-cost-vs-speed.png)](docs/images/luna-cost-vs-speed.png)
+[![Annotated cost vs speed per Luna move: one move costs about $0.002. Compression and Cache cost about a quarter less than Plain at the same speed; Reasoning and MCP cost about 15% more and are about twice as slow.](docs/images/luna-cost-vs-speed-explained.png)](docs/images/luna-cost-vs-speed-explained.png)
 
-Measured from 50 [Foundry traces](#tracing) in October 2026, with each option answering the same 10 board positions at Azure retail prices. All Cache moves were cache hits.
+Measured from 50 [Foundry traces](#tracing) in October 2026, with each option answering the same 10 board positions at Azure retail prices. All Cache moves were cache hits. Times vary with model load.
 
 [![Where MCP's $2.18 per 1,000 moves goes: game state $1.42, instructions $0.45, MCP lookahead $0.27, and Luna's reply $0.04. The MCP tool adds 2.1 seconds per move.](docs/images/luna-mcp-cost-breakdown.png)](docs/images/luna-mcp-cost-breakdown.png)
 
