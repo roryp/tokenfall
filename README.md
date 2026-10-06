@@ -73,7 +73,11 @@ MCP adds 1,362 lookahead tokens per move (+14% cost) and 2.1 s of tool time.
 
 To resume manual play, turn off **Ask Luna** or click **Stop Luna**, then **Play**. An in-flight request may still be charged, but its late move is discarded.
 
-New players receive **1,000,000 AI tokens** across all their games. Reported input and output, including cached input, consume the allowance; restarting does not refill it. The room also has shared limits and supports 50 online players. Manual play remains available when AI limits are reached.
+New players receive **1,000,000 AI tokens** across all their games. Reported input and output, including cached input, consume the allowance; restarting does not refill it. The room also has shared limits and supports 50 online players. Room Luna throughput follows the model deployment's capacity: the server admits up to 80% of the tokens per minute Azure reports in its rate-limit headers, with at most 4 MCP lookups at a time. Manual play remains available when AI limits are reached.
+
+[![How many Luna players at once: each Luna player uses about 298K tokens per minute and players add up. 6,950K tokens per minute of Azure capacity fits about 23 players, about 17 after the game's 28% safety margin, while the game server's 8 Luna calls per second fit about 15.](docs/images/luna-capacity-scaling.png)](docs/images/luna-capacity-scaling.png)
+
+Measured with 1-4 bot players (Plain moves, 40 seconds each) in October 2026. To size capacity for an audience, allow about 415K tokens per minute per simultaneous Luna player: about 300K used plus the 28% safety margin (20% spare and the extra each move reserves). The game server also caps a room at 8 Luna calls per second, about 15 players.
 
 **AI tokens left** is the smaller personal/room balance; **Available now** also subtracts pending holds. Costs and savings are estimates, not invoices. Cache can lower price, not allowance consumption. **Information & tools** contains the prompt, cache, MCP, and cost inspectors.
 

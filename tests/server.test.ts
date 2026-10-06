@@ -15,7 +15,7 @@ import { costForUsage, DEFAULT_TOKEN_ALLOWANCE, emptyMetrics, reportedTokenBalan
 import type { Insight, JoinResult, Reply, RoomView, TokenPricing } from '../shared/protocol.ts';
 import { clientAddress, createApplication, SOCKET_EVENT_BURST, trustedProxy } from '../server/app.ts';
 import { loadConfig } from '../server/config.ts';
-import { AI_COOLDOWN_MS, AUTOPILOT_COOLDOWN_MS, EVALUATION_INTERVAL_MS, LunaGateway, MAX_OUTPUT_TOKENS, MAX_REASONING_COMPLETION_TOKENS, ModelGate, PLAYER_REQUEST_LIMIT, PLAYER_TOKEN_BUDGET, POLICY, PREFIX_TOKENS, ROOM_EVALUATIONS_PER_SECOND, ROOM_REQUEST_LIMIT, ROOM_TOKEN_BUDGET } from '../server/model.ts';
+import { AI_COOLDOWN_MS, AUTOPILOT_COOLDOWN_MS, BASE_ROOM_LIMITS, deploymentLimits, EVALUATION_INTERVAL_MS, LunaGateway, MAX_MCP_IN_FLIGHT, MAX_OUTPUT_TOKENS, MAX_REASONING_COMPLETION_TOKENS, ModelGate, PLAYER_REQUEST_LIMIT, PLAYER_TOKEN_BUDGET, POLICY, PREFIX_TOKENS, ROOM_EVALUATIONS_PER_SECOND, ROOM_REQUEST_LIMIT, ROOM_TOKEN_BUDGET, roomLimits } from '../server/model.ts';
 import type { ModelGateway } from '../server/model.ts';
 import { Room } from '../server/room.ts';
 import { buildPrompts, countTokens, gameTokens } from '../server/tokens.ts';
@@ -1511,6 +1511,43 @@ test('verbose prompts cannot exceed the rolling token-throughput allowance', () 
   for (let index = 0; index < 25; index += 1) gate.acquire(`player-${index}`, 16000, 0, 0, 0)();
   assert.throws(() => gate.acquire('overflow', 1000, 0, 0, 1));
   assert.doesNotThrow(() => gate.acquire('later', 1000, 0, 0, 60001)());
+});
+
+test('room throughput follows the deployment limits Azure reports', async context => {
+  const reported = new Headers({ 'x-ratelimit-limit-tokens': '6950000', 'x-ratelimit-limit-requests': '6950' });
+  assert.deepEqual(deploymentLimits(reported), { tokensPerMinute: 6950000, requestsPerMinute: 6950 });
+  assert.equal(deploymentLimits(new Headers()), null);
+  assert.equal(deploymentLimits(new Headers({ 'x-ratelimit-limit-tokens': '0', 'x-ratelimit-limit-requests': '10' })), null);
+  assert.deepEqual(roomLimits({ tokensPerMinute: 500000, requestsPerMinute: 500 }), BASE_ROOM_LIMITS);
+  assert.deepEqual(roomLimits({ tokensPerMinute: 6950000, requestsPerMinute: 6950 }), { tokensPerMinute: 5560000, requestsPerMinute: 1251, inFlight: 56 });
+  assert.deepEqual(roomLimits({ tokensPerMinute: 100000, requestsPerMinute: 100 }), { tokensPerMinute: 80000, requestsPerMinute: 18, inFlight: 1 });
+
+  const setup = fixture();
+  const gateway = new LunaGateway(setup.config);
+  context.mock.method(globalThis, 'fetch', async () => new Response('{}', { status: 429, headers: reported }));
+  await gateway['client']['fetch']('https://example.invalid/', {});
+  assert.deepEqual(gateway.limits, { tokensPerMinute: 6950000, requestsPerMinute: 6950 });
+  const room = new Room(setup.config, { complete: async (game: Game) => insightFor(game), limits: gateway.limits });
+  try {
+    room.join('Scaler', room.code, undefined, 'scale');
+    assert.deepEqual(room.gate.limits, BASE_ROOM_LIMITS);
+    await room.assist(room.playerFor('scale'), { compression: false, cache: false, autopilot: true });
+    assert.deepEqual(room.gate.limits, { tokensPerMinute: 5560000, requestsPerMinute: 1251, inFlight: 56 });
+  } finally { room.close(); rmSync(setup.dataDirectory, { recursive: true, force: true }); }
+});
+
+test('scaled room limits admit more concurrent Luna calls while MCP lookups stay capped', () => {
+  const gate = new ModelGate();
+  assert.equal(gate.setDeploymentLimits({ tokensPerMinute: 6950000, requestsPerMinute: 6950 }), true);
+  assert.equal(gate.setDeploymentLimits({ tokensPerMinute: 6950000, requestsPerMinute: 6950 }), false);
+  const lookups = Array.from({ length: MAX_MCP_IN_FLIGHT }, (_, index) => gate.acquire(`mcp-${index}`, 16000, 0, 0, 0, false, PLAYER_TOKEN_BUDGET, true));
+  assert.throws(() => gate.acquire('mcp-extra', 16000, 0, 0, 0, false, PLAYER_TOKEN_BUDGET, true), { code: 'busy' });
+  const plain = Array.from({ length: gate.limits.inFlight - MAX_MCP_IN_FLIGHT }, (_, index) => gate.acquire(`plain-${index}`, 16000, 0, 0, 0));
+  assert.throws(() => gate.acquire('overflow', 16000, 0, 0, 0), { code: 'busy' });
+  [...lookups, ...plain].forEach(release => release());
+  assert.equal(gate.inFlight, 0);
+  assert.equal(gate.mcpInFlight, 0);
+  assert.doesNotThrow(() => gate.acquire('more', 16000, 0, 0, 1)());
 });
 
 test('stale model responses are billed but cannot become current-piece suggestions', async () => {

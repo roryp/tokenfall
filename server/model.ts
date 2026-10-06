@@ -28,9 +28,36 @@ export const AI_COOLDOWN_MS = 8000;
 export const AUTOPILOT_COOLDOWN_MS = 1000;
 export const EVALUATION_INTERVAL_MS = 1000;
 export const ROOM_EVALUATIONS_PER_SECOND = 8;
+// Room limits for a 500K tokens-per-minute deployment; they scale with the deployment limits Azure reports.
+const BASE_DEPLOYMENT_TOKENS_PER_MINUTE = 500000;
+export const BASE_ROOM_LIMITS: RoomLimits = { tokensPerMinute: 400000, requestsPerMinute: 90, inFlight: 4 };
+// Each MCP lookup starts a Node process on the game server, so lookups stay capped whatever the model capacity.
+export const MAX_MCP_IN_FLIGHT = 4;
+
+export interface DeploymentLimits { tokensPerMinute: number; requestsPerMinute: number }
+export interface RoomLimits { tokensPerMinute: number; requestsPerMinute: number; inFlight: number }
+
+// Azure OpenAI reports the deployment's rate limits on every response.
+export function deploymentLimits(headers: Headers): DeploymentLimits | null {
+  const tokensPerMinute = Number(headers.get('x-ratelimit-limit-tokens'));
+  const requestsPerMinute = Number(headers.get('x-ratelimit-limit-requests'));
+  return Number.isFinite(tokensPerMinute) && tokensPerMinute > 0 && Number.isFinite(requestsPerMinute) && requestsPerMinute > 0 ? { tokensPerMinute, requestsPerMinute } : null;
+}
+
+// The room keeps 20% of the deployment's tokens per minute in reserve so Luna stays below the provider limit.
+export function roomLimits({ tokensPerMinute, requestsPerMinute }: DeploymentLimits): RoomLimits {
+  const scaled = (base: number) => base * tokensPerMinute / BASE_DEPLOYMENT_TOKENS_PER_MINUTE;
+  return {
+    tokensPerMinute: Math.floor(scaled(BASE_ROOM_LIMITS.tokensPerMinute)),
+    requestsPerMinute: Math.max(1, Math.floor(Math.min(scaled(BASE_ROOM_LIMITS.requestsPerMinute), requestsPerMinute * 0.8))),
+    inFlight: Math.max(1, Math.round(scaled(BASE_ROOM_LIMITS.inFlight))),
+  };
+}
 
 export interface ModelGateway {
   complete(game: Game, options: AiOptions, cacheBucket: string): Promise<Insight>;
+  // The deployment's latest reported rate limits, when the provider sends them.
+  readonly limits?: DeploymentLimits | null;
 }
 
 export class RequestError extends Error {
@@ -45,12 +72,22 @@ export class RequestError extends Error {
 
 export class ModelGate {
   inFlight = 0;
+  mcpInFlight = 0;
   reserved = 0;
+  limits: RoomLimits = { ...BASE_ROOM_LIMITS };
   private lastRequest = new Map<string, number>();
   private lastEvaluation = new Map<string, number>();
   private activePlayers = new Set<string>();
   private requestTimes: { time: number; tokens: number }[] = [];
   private evaluationTimes: number[] = [];
+
+  // Returns true when the room limits changed.
+  setDeploymentLimits(deployment: DeploymentLimits) {
+    const next = roomLimits(deployment);
+    const changed = next.tokensPerMinute !== this.limits.tokensPerMinute || next.requestsPerMinute !== this.limits.requestsPerMinute || next.inFlight !== this.limits.inFlight;
+    this.limits = next;
+    return changed;
+  }
 
   // Rejects with in-memory checks before a caller spends CPU on prompt building.
   admit(playerId: string, now = Date.now(), autopilot = false) {
@@ -60,7 +97,7 @@ export class ModelGate {
     const pacing = EVALUATION_INTERVAL_MS - (now - (this.lastEvaluation.get(playerId) ?? -Infinity));
     if (pacing > 0) throw new RequestError('Luna is cooling down.', 'cooldown', pacing);
     this.requestTimes = this.requestTimes.filter(entry => now - entry.time < 60000);
-    if (this.inFlight >= 4 || this.requestTimes.length >= 90) throw new RequestError('The room is busy. Keep playing and try again shortly.', 'busy', 3000);
+    if (this.inFlight >= this.limits.inFlight || this.requestTimes.length >= this.limits.requestsPerMinute) throw new RequestError('The room is busy. Keep playing and try again shortly.', 'busy', 3000);
     this.evaluate(now);
     if (this.lastEvaluation.size > 1000) for (const [id, time] of this.lastEvaluation) if (now - time >= EVALUATION_INTERVAL_MS) this.lastEvaluation.delete(id);
     this.lastEvaluation.set(playerId, now);
@@ -72,16 +109,17 @@ export class ModelGate {
     this.evaluationTimes.push(now);
   }
 
-  acquire(playerId: string, reservation: number, playerSpent: number, roomSpent: number, now = Date.now(), autopilot = false, playerBudget = PLAYER_TOKEN_BUDGET) {
+  acquire(playerId: string, reservation: number, playerSpent: number, roomSpent: number, now = Date.now(), autopilot = false, playerBudget = PLAYER_TOKEN_BUDGET, mcp = false) {
     if (this.activePlayers.has(playerId)) throw new RequestError('Luna is already choosing your move.', 'busy', 1000);
     const remaining = (autopilot ? AUTOPILOT_COOLDOWN_MS : AI_COOLDOWN_MS) - (now - (this.lastRequest.get(playerId) ?? -Infinity));
     if (remaining > 0) throw new RequestError('Luna is cooling down.', 'cooldown', remaining);
     this.requestTimes = this.requestTimes.filter(entry => now - entry.time < 60000);
     const scheduledTokens = this.requestTimes.reduce((sum, entry) => sum + entry.tokens, 0);
-    if (this.inFlight >= 4 || this.requestTimes.length >= 90 || scheduledTokens + reservation > 400000) throw new RequestError('The room is busy. Keep playing and try again shortly.', 'busy', 3000);
+    if (this.inFlight >= this.limits.inFlight || (mcp && this.mcpInFlight >= MAX_MCP_IN_FLIGHT) || this.requestTimes.length >= this.limits.requestsPerMinute || scheduledTokens + reservation > this.limits.tokensPerMinute) throw new RequestError('The room is busy. Keep playing and try again shortly.', 'busy', 3000);
     if (playerSpent + reservation > playerBudget) throw new RequestError(`Not enough token credits in your AI allowance: ${Math.max(0, playerBudget - playerSpent).toLocaleString()} left; this request needs ${reservation.toLocaleString()}.`, 'budget');
     if (roomSpent + this.reserved + reservation > ROOM_TOKEN_BUDGET) throw new RequestError(`The shared room model token limit is reached: ${Math.max(0, ROOM_TOKEN_BUDGET - roomSpent - this.reserved).toLocaleString()} tokens available; ${reservation.toLocaleString()} needed. Manual play is still available.`, 'room-budget');
     this.inFlight += 1;
+    if (mcp) this.mcpInFlight += 1;
     this.reserved += reservation;
     this.activePlayers.add(playerId);
     this.lastRequest.set(playerId, now);
@@ -91,6 +129,7 @@ export class ModelGate {
       if (released) return;
       released = true;
       this.inFlight -= 1;
+      if (mcp) this.mcpInFlight -= 1;
       this.reserved -= reservation;
       this.activePlayers.delete(playerId);
     };
@@ -102,6 +141,7 @@ const moveSchema = z.object({ placementId: z.string().max(20), tip: z.string().m
 export class LunaGateway implements ModelGateway {
   private client: OpenAI;
   private deployment: string;
+  limits: DeploymentLimits | null = null;
 
   constructor(config: AppConfig) {
     if (PREFIX_TOKENS < 1024) throw new Error('The reusable model policy is too short for prompt caching.');
@@ -110,6 +150,11 @@ export class LunaGateway implements ModelGateway {
       apiKey: getBearerTokenProvider(azureCredential(config), 'https://cognitiveservices.azure.com/.default'),
       maxRetries: 0,
       timeout: 20000,
+      fetch: async (url, init) => {
+        const response = await fetch(url, init);
+        this.limits = deploymentLimits(response.headers) ?? this.limits;
+        return response;
+      },
     });
     this.deployment = config.deployment;
   }

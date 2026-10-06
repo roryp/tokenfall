@@ -393,7 +393,7 @@ export class Room {
     const reservation = PREFIX_TOKENS + (options.compression ? prompts.packedTokens : prompts.rawTokens) + maxCompletionTokens(options) + 1024 + (options.mcp ? MAX_MCP_CONTEXT_TOKENS : 0);
     const allowance = this.usage(player).allowance;
     const roomAllowance = this.roomAllowance(totals);
-    const release = this.gate.acquire(player.record.id, reservation, allowance.used + allowance.unconfirmed, roomAllowance.used + roomAllowance.unconfirmed, now, options.autopilot, allowance.limit);
+    const release = this.gate.acquire(player.record.id, reservation, allowance.used + allowance.unconfirmed, roomAllowance.used + roomAllowance.unconfirmed, now, options.autopilot, allowance.limit, Boolean(options.mcp));
     const runId = player.runId;
     this.pendingTokens.set(player.record.id, reservation);
     player.record.attempts += 1;
@@ -417,8 +417,16 @@ export class Room {
           throw new RequestError(error.message, error.reason === 'context' ? 'mcp-context' : 'mcp');
         }
         throw error;
-      } finally { this.pendingTokens.delete(player.record.id); release(); }
+      } finally { this.pendingTokens.delete(player.record.id); release(); this.followDeploymentLimits(); }
     });
+  }
+
+  // Sizes the room's Luna throughput from the deployment limits the provider last reported.
+  followDeploymentLimits() {
+    const limits = this.gateway.limits;
+    if (!limits || !this.gate.setDeploymentLimits(limits)) return;
+    const room = this.gate.limits;
+    console.log(`Luna room limits: ${room.tokensPerMinute.toLocaleString()} tokens/min, ${room.requestsPerMinute.toLocaleString()} requests/min, ${room.inFlight} in flight (deployment ${limits.tokensPerMinute.toLocaleString()} tokens/min)`);
   }
 
   publicUrl() {
