@@ -10,7 +10,11 @@ Tetris with sentence-generated pieces, optional GPT-5.6 Luna play, and shared le
 2. Choose **Sentence** for a repeating token-derived queue or **Classic** for shuffled seven-piece bags.
 3. Click **Join game**. Fill horizontal rows to clear them; the run ends when a piece cannot spawn or locks entirely above the board.
 
-[![Game screen with labeled board, controls, AI costs, room, and rankings.](docs/images/screen-guide.png)](docs/images/screen-guide.png)
+[![Game screen with labeled score and points, board, controls, AI costs, room, and rankings.](docs/images/screen-guide.png)](docs/images/screen-guide.png)
+
+After each piece locks, the score shows the points it added and how: line clears (× level from level 2), back-to-back, combos, perfect clears, and 2 points per hard-drop row or 1 per soft-drop row.
+
+<img src="docs/images/score-points.png" alt="Score panel: total score 1,200, then +134 for the last move, from a Single (100) and a hard drop of 17 rows × 2." width="560">
 
 **New game** resets the board, score, lines, and level, but keeps your best score and AI usage. Luna starts off.
 

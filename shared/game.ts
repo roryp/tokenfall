@@ -35,18 +35,40 @@ export interface ClearEvent {
   frame: number;
   rows: number[];
 }
+// One scored step of a move, e.g. { label: 'Single', detail: '100 × level 2', points: 200 }.
+export interface ScorePart { label: string; detail: string; points: number }
+// Points added since the previous piece locked; parts always sum to points.
+export interface MoveScore { id: number; frame: number; points: number; parts: ScorePart[] }
+
+const rowCount = (rows: number) => `${rows} ${rows === 1 ? 'row' : 'rows'}`;
+
+function clearName(lines: number, spin: Spin) {
+  const size = ['', 'single', 'double', 'triple', 'Tetris'][lines] ?? '';
+  if (spin === 'none') return size.charAt(0).toUpperCase() + size.slice(1);
+  return [spin === 'full' ? 'T-spin' : 'T-spin mini', size].filter(Boolean).join(' ');
+}
 
 export function scoreClear(lines: number, spin: Spin, level: number, previousCombo: number, previousBackToBack: boolean, perfect: boolean) {
   const difficult = lines === 4 || (spin !== 'none' && lines > 0);
   const combo = lines > 0 ? previousCombo + 1 : -1;
   const bases = spin === 'full' ? [400, 800, 1200, 1600] : spin === 'mini' ? [100, 200, 400] : [0, 100, 300, 500, 800];
-  let points = (bases[lines] ?? 0) * level;
+  const base = (bases[lines] ?? 0) * level;
+  let points = base;
   if (difficult && previousBackToBack) points *= 1.5;
-  points += Math.max(0, combo) * 50 * level;
-  if (perfect && lines > 0) points += (lines === 4 && previousBackToBack ? 3200 : [0, 800, 1200, 1800, 2000][lines]) * level;
+  const comboPoints = Math.max(0, combo) * 50 * level;
+  points += comboPoints;
+  const perfectBase = perfect && lines > 0 ? (lines === 4 && previousBackToBack ? 3200 : [0, 800, 1200, 1800, 2000][lines]) : 0;
+  points += perfectBase * level;
   const backToBack = lines === 0 ? previousBackToBack : difficult;
   const label = perfect && lines > 0 ? 'PERFECT CLEAR' : spin === 'full' ? 'T-SPIN' : spin === 'mini' ? 'T-SPIN MINI' : ['', 'SINGLE', 'DOUBLE', 'TRIPLE', 'TETRIS'][lines];
-  return { points, combo, backToBack, label };
+  const parts: ScorePart[] = [];
+  // The level multiplier is only shown when it changes the result.
+  const times = (value: number) => level > 1 ? `${value} × level ${level}` : `${value}`;
+  if (base > 0) parts.push({ label: clearName(lines, spin), detail: times(bases[lines]), points: base });
+  if (base > 0 && difficult && previousBackToBack) parts.push({ label: 'Back-to-back', detail: `50% of ${base}`, points: base / 2 });
+  if (comboPoints > 0) parts.push({ label: `Combo ${combo}`, detail: `${combo} × ${times(50)}`, points: comboPoints });
+  if (perfectBase > 0) parts.push({ label: 'Perfect clear', detail: times(perfectBase), points: perfectBase * level });
+  return { points, combo, backToBack, label, parts };
 }
 
 export class Game {
@@ -75,6 +97,10 @@ export class Game {
   gravity = 0;
   lastRotation: number | null = null;
   lastClear: ClearEvent | null = null;
+  lastMove: MoveScore | null = null;
+  moves = 0;
+  softDropRows = 0;
+  hardDropRows = 0;
   events: InputEvent[] = [];
 
   constructor(seed: string, tokens: PieceToken[] = []) {
@@ -119,6 +145,7 @@ export class Game {
       const landed = ghostPiece(this.well, this.active);
       const distance = landed.y - this.active.y;
       this.score += distance * 2;
+      this.hardDropRows += distance;
       if (distance > 0) this.lastRotation = null;
       this.active = landed;
       this.finishPiece();
@@ -134,7 +161,7 @@ export class Game {
       this.lastRotation = kicks.findIndex(([horizontal, vertical]) => moved.x - this.active.x === horizontal && moved.y - this.active.y === vertical);
     } else {
       this.lastRotation = null;
-      if (action === 'softDrop') this.score += 1;
+      if (action === 'softDrop') { this.score += 1; this.softDropRows += 1; }
     }
     this.active = moved;
     if (action !== 'softDrop') this.lock.onManipulate();
@@ -157,22 +184,34 @@ export class Game {
     return (fronts.every(index => corners[index]) || this.lastRotation === 4) ? 'full' : 'mini';
   }
 
+  // Records what the piece that just locked added to the score, including drop points earned before a hold.
+  recordMove(clear: ScorePart[]) {
+    const parts = [...clear];
+    if (this.hardDropRows > 0) parts.push({ label: 'Hard drop', detail: `${rowCount(this.hardDropRows)} × 2`, points: this.hardDropRows * 2 });
+    if (this.softDropRows > 0) parts.push({ label: 'Soft drop', detail: `${rowCount(this.softDropRows)} × 1`, points: this.softDropRows });
+    this.moves += 1;
+    this.lastMove = { id: this.moves, frame: this.frame, points: parts.reduce((sum, part) => sum + part.points, 0), parts };
+    this.hardDropRows = 0;
+    this.softDropRows = 0;
+  }
+
   finishPiece() {
-    if (!canPlace(this.well, this.active)) { this.status = 'over'; return; }
+    if (!canPlace(this.well, this.active)) { this.status = 'over'; this.recordMove([]); return; }
     const spin = this.detectSpin();
     const cells = pieceCells(this.active);
     lockPiece(this.well, this.active);
     if (this.tokens.length) for (const cell of cells) this.tokenWell.set(cell.x, cell.y, this.activeTokenIndex);
     this.pieces += 1;
-    if (cells.every(cell => cell.y < HIDDEN_ROWS)) { this.status = 'over'; return; }
+    if (cells.every(cell => cell.y < HIDDEN_ROWS)) { this.status = 'over'; this.recordMove([]); return; }
     const rows = fullRows(this.well);
     clearRows(this.well, rows);
     clearRows(this.tokenWell, rows);
-    const result = scoreClear(rows.length, rows.length === 3 && spin === 'mini' ? 'full' : spin, this.level, this.combo, this.backToBack, this.well.toArray().every(cell => cell === null));
+    const { parts, ...result } = scoreClear(rows.length, rows.length === 3 && spin === 'mini' ? 'full' : spin, this.level, this.combo, this.backToBack, this.well.toArray().every(cell => cell === null));
     this.score += result.points;
     this.combo = result.combo;
     this.backToBack = result.backToBack;
     if (result.points > 0) this.lastClear = { ...result, lines: rows.length, frame: this.frame, rows };
+    this.recordMove(parts);
     this.lines += rows.length;
     this.level = 1 + Math.floor(this.lines / 10);
     this.active = this.takePiece();
@@ -224,7 +263,7 @@ export class Game {
       nextTokens: this.queue.peek().map((_piece, index) => this.tokenAt(this.tokensTaken + index)),
       piece: this.piece, pieceId: this.pieceId, hold: this.hold, canHold: !this.usedHold,
       next: this.queue.peek(), score: this.score, lines: this.lines, level: this.level,
-      pieces: this.pieces, status: this.status, frame: this.frame, lastClear: this.lastClear,
+      pieces: this.pieces, status: this.status, frame: this.frame, lastClear: this.lastClear, lastMove: this.lastMove,
       lockRemaining: this.lock.snapshot.remainingFrames,
     };
   }

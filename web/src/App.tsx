@@ -3,6 +3,7 @@ import { Bot, Brain, Columns2, FileJson2, History, Layers3, Pause, Play, Plug, Q
 import type { LucideIcon } from 'lucide-react';
 import { costForUsage, reportedTokenBalance } from '../../shared/protocol.ts';
 import type { Insight, McpLookaheadResult, TokenRates } from '../../shared/protocol.ts';
+import type { MoveScore } from '../../shared/game.ts';
 import { GameBoard, GameControls, PiecePreview } from './GameBoard.tsx';
 import { GameSetup, RoomMaintenance, RoomPanel, RoomShare } from './RoomPanel.tsx';
 import { formatMoney } from './format.ts';
@@ -14,6 +15,13 @@ const number = (value: number) => value.toLocaleString();
 const signedMoney = (value: number | null) => value === null ? '--' : `${value < 0 ? '-' : value > 0 ? '+' : ''}${formatMoney(Math.abs(value))}`;
 const cacheLabel = (insight: Insight) => insight.usage.cached > 0 ? 'Hit' : insight.usage.cacheWrites > 0 ? 'Miss / written' : insight.cacheEnabled ? 'Miss' : 'Off';
 const cacheEffect = (insight: Insight, rates: TokenRates | undefined) => rates ? (insight.usage.cached * (rates.cachedInput - rates.input) + insight.usage.cacheWrites * (rates.cacheWrite - rates.input)) / 1000000 : null;
+
+function ScoreGain({ move }: { move: MoveScore }) {
+  return <div className="score-gain" data-testid="score-gain" title={move.parts.map(part => `${part.label}: ${part.detail} = ${number(part.points)}`).join('\n')}>
+    <b>+{number(move.points)}</b>
+    <ul>{move.parts.map(part => <li key={part.label}><span>{part.label}</span> {part.detail}</li>)}</ul>
+  </div>;
+}
 
 function CacheActivity({ records, selected, rates, pending, unknown, onSelect }: {
   records: RequestRecord[]; selected: Insight; rates: TokenRates | undefined;
@@ -243,7 +251,7 @@ export default function App() {
 
     <section className="game-stage" aria-label="Tetris game">
       <div className="scoreboard">
-        <div className="main-score"><span>SCORE</span><strong data-testid="game-score">{number(game.view.score)}</strong></div>
+        <div className="main-score"><span>SCORE</span><div className="score-row"><strong data-testid="game-score">{number(game.view.score)}</strong>{game.joined && game.view.lastMove && game.view.lastMove.points > 0 && <ScoreGain key={game.view.lastMove.id} move={game.view.lastMove} />}</div></div>
         <div><span>LINES</span><strong data-testid="game-lines">{number(game.view.lines)}</strong></div>
         <div><span>LEVEL</span><strong data-testid="game-level">{number(game.view.level)}</strong></div>
       </div>

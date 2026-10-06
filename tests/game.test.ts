@@ -1,5 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import seedrandom from 'seedrandom';
 import { canPlace, ghostPiece, rotateWithKicks, kicksFor, spawnTetromino } from 'miaoda-game-fallblock-core';
 import { Game, HEIGHT, WIDTH, placementsFor, refreshPlacement, scoreClear, tokenLabel, tokenShape } from '../shared/game.ts';
 import type { Cell } from '../shared/game.ts';
@@ -133,6 +134,77 @@ test('four full rows clear rigidly and score a Tetris plus perfect clear and dro
   assert.equal(game.lines, 4);
   assert.equal(game.score, 800 + 2000 + distance * 2);
   assert.ok(game.well.toArray().every(cell => cell === null));
+  assert.deepEqual(game.lastMove, {
+    id: 1, frame: 0, points: game.score,
+    parts: [
+      { label: 'Tetris', detail: '800', points: 800 },
+      { label: 'Perfect clear', detail: '2000', points: 2000 },
+      { label: 'Hard drop', detail: `${distance} rows × 2`, points: distance * 2 },
+    ],
+  });
+});
+
+test('score parts always add up to the clear points', () => {
+  for (const spin of ['none', 'mini', 'full'] as const) {
+    for (let lines = 0; lines <= (spin === 'none' ? 4 : spin === 'mini' ? 2 : 3); lines += 1) {
+      for (const [level, combo, backToBack, perfect] of [[1, -1, false, false], [3, 2, true, false], [2, 0, true, true], [5, 4, false, true]] as const) {
+        const result = scoreClear(lines, spin, level, combo, backToBack, perfect);
+        assert.equal(result.parts.reduce((sum, part) => sum + part.points, 0), result.points, `${spin} ${lines} lines at level ${level}`);
+      }
+    }
+  }
+  assert.deepEqual(scoreClear(4, 'none', 2, 1, true, false).parts, [
+    { label: 'Tetris', detail: '800 × level 2', points: 1600 },
+    { label: 'Back-to-back', detail: '50% of 1600', points: 800 },
+    { label: 'Combo 2', detail: '2 × 50 × level 2', points: 200 },
+  ]);
+  assert.deepEqual(scoreClear(2, 'full', 1, -1, false, false).parts, [{ label: 'T-spin double', detail: '1200', points: 1200 }]);
+  assert.deepEqual(scoreClear(0, 'mini', 1, -1, false, false).parts, [{ label: 'T-spin mini', detail: '100', points: 100 }]);
+  assert.deepEqual(scoreClear(1, 'none', 1, 2, false, false).parts, [{ label: 'Single', detail: '100', points: 100 }, { label: 'Combo 3', detail: '3 × 50', points: 150 }]);
+});
+
+test('each locked piece reports exactly the points it added, including drops before a hold', () => {
+  const game = new Game('move-score');
+  game.act('softDrop');
+  game.act('softDrop');
+  game.act('hold');
+  game.act('softDrop');
+  const before = game.score;
+  game.act('hardDrop');
+  assert.equal(game.lastMove!.points, game.score);
+  assert.deepEqual(game.lastMove!.parts.map(part => part.label), ['Hard drop', 'Soft drop']);
+  assert.equal(game.lastMove!.parts[1].detail, '3 rows × 1');
+  assert.equal(game.score - before, game.lastMove!.parts[0].points);
+
+  const played = new Game('move-score-play');
+  const random = seedrandom('move-score-play');
+  let scoreAtLock = 0;
+  let moves = 0;
+  let clears = 0;
+  const check = () => {
+    if (played.moves === moves) return;
+    assert.equal(played.moves, moves + 1);
+    assert.equal(played.lastMove!.points, played.score - scoreAtLock);
+    assert.equal(played.lastMove!.parts.reduce((sum, part) => sum + part.points, 0), played.lastMove!.points);
+    if (played.lastMove!.parts.some(part => !part.label.endsWith('drop'))) clears += 1;
+    scoreAtLock = played.score;
+    moves = played.moves;
+  };
+  while (played.moves < 120 && played.status !== 'over') {
+    const choices = placementsFor(played).filter(placement => !placement.gameOver);
+    if (!choices.length) break;
+    const value = (placement: typeof choices[number]) => placement.clearedLines * 8 - placement.holes * 7 - placement.aggregateHeight * 0.5 - placement.bumpiness * 0.3;
+    const best = choices.reduce((winner, placement) => value(placement) > value(winner) ? placement : winner);
+    for (const action of best.path.slice(0, -1)) { played.act(action); check(); }
+    const finish = random();
+    if (finish < 0.5) played.act('hardDrop');
+    else if (finish < 0.8) { for (let row = 0; row < 3 && played.act('softDrop'); row += 1) check(); played.act('hardDrop'); }
+    else for (let frame = 0; frame < 3000 && played.moves === moves; frame += 1) played.advanceTo(played.frame + 1);
+    check();
+  }
+  assert.equal(played.moves, 120);
+  assert.ok(clears > 10, `${clears} scoring clears`);
+  assert.deepEqual(Game.restore(played.replay()).view(), played.view());
 });
 
 test('normal clears, spins, combos and back-to-back use guideline score values', () => {

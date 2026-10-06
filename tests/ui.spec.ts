@@ -1360,6 +1360,9 @@ test('classic Tetris joins by name with standard pieces, live rankings, and free
   await page.getByRole('button', { name: 'Pause game', exact: true }).click();
   await setup.waitForGame(game => game.status === 'paused' && game.pieces === 1);
   assert.ok(numeric(await page.getByTestId('game-score').textContent()) > 0);
+  const score = numeric(await page.getByTestId('game-score').textContent());
+  assert.equal(await page.getByTestId('score-gain').locator('b').innerText(), `+${score}`);
+  assert.equal(await page.getByTestId('score-gain').locator('li').innerText(), `Hard drop ${score / 2} rows × 2`);
   assert.equal(numeric(await page.getByTestId('ai-cost').textContent()), 0);
   assert.equal(numeric(await page.getByTestId('ai-tokens').textContent()), 0);
   assert.equal(setup.calls.length, 0);
