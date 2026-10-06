@@ -39,7 +39,8 @@ function inSpan<T>(name: string, kind: SpanKind, attributes: Attributes, run: (s
 
 export function traceLunaRequest<T>(conversationId: string, model: string, options: AiOptions, reservation: number, run: (span: Span) => Promise<T>) {
   const agent = { 'gen_ai.agent.name': LUNA_AGENT.name, 'gen_ai.agent.id': LUNA_AGENT.id, 'gen_ai.conversation.id': conversationId };
-  return context.with(context.active().setValue(agentAttributes, agent), () => inSpan(`invoke_agent ${LUNA_AGENT.name}`, SpanKind.SERVER, {
+  // INTERNAL (an in-process agent, per the GenAI conventions) lands in the dependencies table that the Application Insights agent views read.
+  return context.with(context.active().setValue(agentAttributes, agent), () => inSpan(`invoke_agent ${LUNA_AGENT.name}`, SpanKind.INTERNAL, {
     'gen_ai.operation.name': 'invoke_agent',
     'gen_ai.provider.name': PROVIDER,
     'gen_ai.request.model': model,

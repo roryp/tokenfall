@@ -41,7 +41,7 @@ test('Luna requests export Foundry GenAI spans with provider token usage', async
     const tool = spans.find(span => span.name === 'execute_tool analyze_future_moves')!;
     const chat = spans.find(span => span.name === 'chat test-only')!;
     assert.equal(spans.length, 3);
-    assert.deepEqual([agent.kind, tool.kind, chat.kind], [SpanKind.SERVER, SpanKind.INTERNAL, SpanKind.CLIENT]);
+    assert.deepEqual([agent.kind, tool.kind, chat.kind], [SpanKind.INTERNAL, SpanKind.INTERNAL, SpanKind.CLIENT]);
     for (const child of [tool, chat]) {
       assert.equal(child.spanContext().traceId, agent.spanContext().traceId);
       assert.equal(child.parentSpanContext?.spanId, agent.spanContext().spanId);
