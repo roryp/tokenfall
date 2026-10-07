@@ -83,13 +83,13 @@ Options default off, are disabled while Luna is off, and affect the next request
 
 ### Cost and speed
 
-[![Annotated cost vs speed per Luna move: one move costs about $0.002. Compression and Cache cost about a quarter less than Plain at the same speed; Reasoning and MCP cost about 15% more and are about twice as slow.](docs/images/luna-cost-vs-speed-explained.png)](docs/images/luna-cost-vs-speed-explained.png)
+[![Annotated cost vs speed per Luna move on the 2 CPU game server: one move costs about $0.002. Compression costs about a quarter less than Plain and Cache about an eighth less, at about the same speed; Reasoning and MCP cost about 14% more and are 2.3 and 1.5 times slower.](docs/images/luna-cost-vs-speed-explained.png)](docs/images/luna-cost-vs-speed-explained.png)
 
-Measured from 50 [Foundry traces](#tracing) in October 2026, with each option answering the same 10 board positions at Azure retail prices. All Cache moves were cache hits. Times vary with model load.
+Measured from 50 [Foundry traces](#tracing) on the 2 CPU game server in October 2026, with each option answering the same 10 board positions at Azure retail prices. 7 of 10 Cache moves were cache hits; hits are not guaranteed. Times vary with model load.
 
-[![Where MCP's $2.18 per 1,000 moves goes: game state $1.42, instructions $0.45, MCP lookahead $0.27, and Luna's reply $0.04. The MCP tool adds 2.1 seconds per move.](docs/images/luna-mcp-cost-breakdown.png)](docs/images/luna-mcp-cost-breakdown.png)
+[![Where MCP's $2.21 per 1,000 moves goes: game state $1.44, instructions $0.46, MCP lookahead $0.27, and Luna's reply $0.04. The MCP tool adds 0.5 seconds per move, down from 2.1 seconds on 0.5 CPU.](docs/images/luna-mcp-cost-breakdown.png)](docs/images/luna-mcp-cost-breakdown.png)
 
-MCP adds 1,362 lookahead tokens per move (+14% cost) and 2.1 s of tool time. Costs and savings are estimates, not invoices; Cache can lower price, not allowance consumption.
+MCP adds 1,375 lookahead tokens per move (+14% cost) and 0.5 s of tool time, down from 2.1 s when the container had 0.5 CPU. Costs and savings are estimates, not invoices; Cache can lower price, not allowance consumption.
 
 ### Limits and capacity
 
@@ -98,9 +98,9 @@ MCP adds 1,362 lookahead tokens per move (+14% cost) and 2.1 s of tool time. Cos
 - **Throughput:** the server admits up to 80% of the tokens per minute Azure reports in its rate-limit headers, at most 8 Luna calls per second, and at most 4 MCP lookups at a time.
 - **Fallback:** manual play remains available when AI limits are reached.
 
-[![How many Luna players at once: each Luna player uses about 298K tokens per minute and players add up. 6,950K tokens per minute of Azure capacity fits about 23 players, about 17 after the game's 28% safety margin, while the game server's 8 Luna calls per second fit about 15.](docs/images/luna-capacity-scaling.png)](docs/images/luna-capacity-scaling.png)
+[![How many Luna players at once: a Luna player next to Azure uses about 311K tokens per minute, one in Johannesburg about 246K, and players add up. 6,950K tokens per minute of Azure capacity fits about 22 nearby players, about 16 after the game's 28% safety margin, while the game server's 8 Luna calls per second fit about 14.](docs/images/luna-capacity-scaling.png)](docs/images/luna-capacity-scaling.png)
 
-Measured with 1-4 bot players (Plain moves, 40 seconds each) in October 2026. To size capacity for an audience, allow about 415K tokens per minute per simultaneous Luna player: about 300K used plus the 28% safety margin (20% spare and the extra each move reserves). The 8 calls per second cap fits about 15 players.
+Measured in October 2026 with bot players making Plain moves for one minute per step: 1, 2 and 4 bots inside the app's container, next to Azure, and 1, 2, 4 and 8 bots in Johannesburg, about 230 ms away. Each move waits for two network round trips, so nearby players move faster and use more tokens per minute. To size capacity for an audience near East US 2, allow about 430K tokens per minute per simultaneous Luna player: about 310K used plus the 28% safety margin (20% spare and the extra each move reserves). The 8 calls per second cap fits about 14 nearby players or about 19 in Johannesburg. With 8 players the server used under 10% of its 2 CPUs, while Luna's replies slowed by about 16%.
 
 ## Architecture
 
@@ -113,9 +113,9 @@ Tokenfall is deliberately a small TypeScript application that shows the full pat
 | Part | Built with | Role |
 | --- | --- | --- |
 | Browser | React 19, Vite, TypeScript | Draws the board, runs the [shared game engine](shared/game.ts) at 60 FPS, and talks to the server over Socket.IO. |
-| Game server | Node.js 24, Express 5, Socket.IO 4 | Runs the `.ts` files directly, with no server build. Serves the web app, replays every input to verify scores, and admits Luna requests ([room](server/room.ts), [model gateway](server/model.ts)). |
+| Game server | Node.js 24, Express 5, Socket.IO 4 | One Container Apps replica with 2 CPUs and 4 GiB. Runs the `.ts` files directly, with no server build. Serves the web app, replays every input to verify scores, and admits Luna requests ([room](server/room.ts), [model gateway](server/model.ts)). |
 | Local MCP server | MCP TypeScript SDK, stdio | A child process in the same container, not a separate service. Its read-only `analyze_future_moves` tool simulates the next two placements and never plays a move ([client](server/mcp.ts), [server](server/mcp-server.ts)). |
-| SQLite | `node:sqlite` on Azure Files | Stores players, scores, sentences, allowances, and usage in `/data/tokenfall.sqlite`. SQLite has one writer, so the app runs one replica. |
+| SQLite | `node:sqlite` on Azure Files | Stores players, scores, sentences, allowances, and usage in `/data/tokenfall.sqlite`. SQLite has one writer, so the app runs one replica: a test with three replicas crashed all of them and corrupted the database indexes. |
 | Managed identity | Microsoft Entra ID | How the app signs in to Azure: `AcrPull` for the image, `Cognitive Services OpenAI User` for Luna, and `Monitoring Metrics Publisher` for traces. Foundry and Application Insights have key auth turned off. |
 | Microsoft Foundry | `gpt-5.6-luna`, GlobalStandard | Picks one of the legal placements the server sends, as strict JSON. |
 | Application Insights | Azure Monitor, OpenTelemetry | Keeps one trace per Luna move for 30 days in Log Analytics, for the Foundry trace view. |
