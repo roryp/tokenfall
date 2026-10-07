@@ -1,0 +1,72 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="900" viewBox="0 0 1600 900">
+<defs><marker id="arrow" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto"><path d="M0,0 L0,6 L9,3 z" fill="#4A5568"/></marker></defs>
+<rect width="1600" height="900" fill="#FFFFFF"/>
+<text x="70" y="65" font-family="Segoe UI,Arial,sans-serif" font-size="42" font-weight="700" text-anchor="start" fill="#17202A">Tokenfall architecture</text>
+<text x="70" y="100" font-family="Segoe UI,Arial,sans-serif" font-size="20" font-weight="400" text-anchor="start" fill="#5B6573">TypeScript on Azure Container Apps • Managed Identity • Foundry/Luna • local MCP • SQLite</text>
+<rect x="70" y="150" width="330" height="520" rx="14" fill="#DCEBFA" stroke="#4F81BD" stroke-width="2"/>
+<text x="235" y="195" font-family="Segoe UI,Arial,sans-serif" font-size="28" font-weight="700" text-anchor="middle" fill="#17202A">Browser</text>
+<text x="235" y="228" font-family="Segoe UI,Arial,sans-serif" font-size="19" font-weight="600" text-anchor="middle" fill="#17202A">React + TypeScript + Vite</text>
+<rect x="105" y="275" width="260" height="95" rx="14" fill="#FFFFFF" stroke="#4F81BD" stroke-width="2"/>
+<text x="235" y="312" font-family="Segoe UI,Arial,sans-serif" font-size="22" font-weight="700" text-anchor="middle" fill="#17202A">Tetris UI</text>
+<text x="235" y="342" font-family="Segoe UI,Arial,sans-serif" font-size="17" font-weight="400" text-anchor="middle" fill="#5B6573">GameBoard + controls</text>
+<rect x="105" y="405" width="260" height="110" rx="14" fill="#FFFFFF" stroke="#4F81BD" stroke-width="2"/>
+<text x="235" y="442" font-family="Segoe UI,Arial,sans-serif" font-size="21" font-weight="700" text-anchor="middle" fill="#17202A">Shared game engine</text>
+<text x="235" y="472" font-family="Segoe UI,Arial,sans-serif" font-size="17" font-weight="400" text-anchor="middle" fill="#5B6573">placementsFor()</text>
+<text x="235" y="497" font-family="Segoe UI,Arial,sans-serif" font-size="17" font-weight="400" text-anchor="middle" fill="#5B6573">refreshPlacement()</text>
+<rect x="105" y="550" width="260" height="80" rx="14" fill="#FFFFFF" stroke="#4F81BD" stroke-width="2"/>
+<text x="235" y="583" font-family="Segoe UI,Arial,sans-serif" font-size="21" font-weight="700" text-anchor="middle" fill="#17202A">Socket.IO client</text>
+<text x="235" y="609" font-family="Segoe UI,Arial,sans-serif" font-size="16" font-weight="400" text-anchor="middle" fill="#5B6573">HTTPS / WebSocket</text>
+<rect x="465" y="150" width="510" height="520" rx="14" fill="#E2F0D9" stroke="#70AD47" stroke-width="2"/>
+<text x="720" y="195" font-family="Segoe UI,Arial,sans-serif" font-size="28" font-weight="700" text-anchor="middle" fill="#17202A">Azure Container App</text>
+<text x="720" y="228" font-family="Segoe UI,Arial,sans-serif" font-size="19" font-weight="600" text-anchor="middle" fill="#17202A">Docker • Node.js 24 • TypeScript</text>
+<rect x="500" y="275" width="205" height="100" rx="14" fill="#FFFFFF" stroke="#70AD47" stroke-width="2"/>
+<text x="602" y="312" font-family="Segoe UI,Arial,sans-serif" font-size="21" font-weight="700" text-anchor="middle" fill="#17202A">Express</text>
+<text x="602" y="342" font-family="Segoe UI,Arial,sans-serif" font-size="16" font-weight="400" text-anchor="middle" fill="#5B6573">REST + static files</text>
+<rect x="735" y="275" width="205" height="100" rx="14" fill="#FFFFFF" stroke="#70AD47" stroke-width="2"/>
+<text x="837" y="312" font-family="Segoe UI,Arial,sans-serif" font-size="21" font-weight="700" text-anchor="middle" fill="#17202A">Socket.IO</text>
+<text x="837" y="342" font-family="Segoe UI,Arial,sans-serif" font-size="16" font-weight="400" text-anchor="middle" fill="#5B6573">join / inputs / assist</text>
+<rect x="500" y="410" width="205" height="125" rx="14" fill="#FFFFFF" stroke="#70AD47" stroke-width="2"/>
+<text x="602" y="447" font-family="Segoe UI,Arial,sans-serif" font-size="20" font-weight="700" text-anchor="middle" fill="#17202A">Room + model gate</text>
+<text x="602" y="477" font-family="Segoe UI,Arial,sans-serif" font-size="16" font-weight="400" text-anchor="middle" fill="#5B6573">budget / cooldown</text>
+<text x="602" y="502" font-family="Segoe UI,Arial,sans-serif" font-size="16" font-weight="400" text-anchor="middle" fill="#5B6573">rate / concurrency</text>
+<rect x="735" y="410" width="205" height="125" rx="14" fill="#FFFFFF" stroke="#70AD47" stroke-width="2"/>
+<text x="837" y="447" font-family="Segoe UI,Arial,sans-serif" font-size="20" font-weight="700" text-anchor="middle" fill="#17202A">Luna gateway</text>
+<text x="837" y="477" font-family="Segoe UI,Arial,sans-serif" font-size="16" font-weight="400" text-anchor="middle" fill="#5B6573">OpenAI JS SDK</text>
+<text x="837" y="502" font-family="Segoe UI,Arial,sans-serif" font-size="16" font-weight="400" text-anchor="middle" fill="#5B6573">validated placement ID</text>
+<rect x="500" y="575" width="205" height="65" rx="14" fill="#FFFFFF" stroke="#70AD47" stroke-width="2"/>
+<text x="602" y="615" font-family="Segoe UI,Arial,sans-serif" font-size="20" font-weight="700" text-anchor="middle" fill="#17202A">SQLite</text>
+<rect x="735" y="575" width="205" height="65" rx="14" fill="#FFFFFF" stroke="#C55A11" stroke-width="2"/>
+<text x="837" y="603" font-family="Segoe UI,Arial,sans-serif" font-size="19" font-weight="700" text-anchor="middle" fill="#17202A">Local MCP</text>
+<text x="837" y="626" font-family="Segoe UI,Arial,sans-serif" font-size="14" font-weight="400" text-anchor="middle" fill="#5B6573">stdio child process</text>
+<rect x="1040" y="150" width="490" height="520" rx="14" fill="#F2F2F2" stroke="#A6A6A6" stroke-width="2"/>
+<text x="1285" y="195" font-family="Segoe UI,Arial,sans-serif" font-size="28" font-weight="700" text-anchor="middle" fill="#17202A">Azure services</text>
+<rect x="1080" y="265" width="185" height="105" rx="14" fill="#E4DFEC" stroke="#8064A2" stroke-width="2"/>
+<text x="1172" y="298" font-family="Segoe UI,Arial,sans-serif" font-size="19" font-weight="700" text-anchor="middle" fill="#17202A">Azure AI Foundry</text>
+<text x="1172" y="327" font-family="Segoe UI,Arial,sans-serif" font-size="18" font-weight="600" text-anchor="middle" fill="#17202A">GPT-5.6 Luna</text>
+<text x="1172" y="351" font-family="Segoe UI,Arial,sans-serif" font-size="15" font-weight="400" text-anchor="middle" fill="#5B6573">GlobalStandard</text>
+<rect x="1305" y="265" width="185" height="105" rx="14" fill="#DCEBFA" stroke="#4F81BD" stroke-width="2"/>
+<text x="1397" y="298" font-family="Segoe UI,Arial,sans-serif" font-size="19" font-weight="700" text-anchor="middle" fill="#17202A">Managed Identity</text>
+<text x="1397" y="327" font-family="Segoe UI,Arial,sans-serif" font-size="18" font-weight="600" text-anchor="middle" fill="#17202A">Entra ID auth</text>
+<text x="1397" y="351" font-family="Segoe UI,Arial,sans-serif" font-size="15" font-weight="400" text-anchor="middle" fill="#5B6573">no model API key</text>
+<rect x="1080" y="405" width="185" height="105" rx="14" fill="#FCE4D6" stroke="#C55A11" stroke-width="2"/>
+<text x="1172" y="438" font-family="Segoe UI,Arial,sans-serif" font-size="19" font-weight="700" text-anchor="middle" fill="#17202A">Azure Files</text>
+<text x="1172" y="467" font-family="Segoe UI,Arial,sans-serif" font-size="18" font-weight="600" text-anchor="middle" fill="#17202A">/data mount</text>
+<text x="1172" y="491" font-family="Segoe UI,Arial,sans-serif" font-size="15" font-weight="400" text-anchor="middle" fill="#5B6573">SQLite persistence</text>
+<rect x="1305" y="405" width="185" height="105" rx="14" fill="#DCEBFA" stroke="#4F81BD" stroke-width="2"/>
+<text x="1397" y="438" font-family="Segoe UI,Arial,sans-serif" font-size="18" font-weight="700" text-anchor="middle" fill="#17202A">Container Registry</text>
+<text x="1397" y="467" font-family="Segoe UI,Arial,sans-serif" font-size="17" font-weight="600" text-anchor="middle" fill="#17202A">Docker image</text>
+<text x="1397" y="491" font-family="Segoe UI,Arial,sans-serif" font-size="15" font-weight="400" text-anchor="middle" fill="#5B6573">managed pull</text>
+<rect x="1080" y="550" width="410" height="90" rx="14" fill="#E4DFEC" stroke="#8064A2" stroke-width="2"/>
+<text x="1285" y="584" font-family="Segoe UI,Arial,sans-serif" font-size="18" font-weight="700" text-anchor="middle" fill="#17202A">OpenTelemetry → Application Insights</text>
+<text x="1285" y="611" font-family="Segoe UI,Arial,sans-serif" font-size="17" font-weight="400" text-anchor="middle" fill="#5B6573">Log Analytics → Foundry traces</text>
+<line x1="400" y1="335" x2="465" y2="335" stroke="#4A5568" stroke-width="3" marker-end="url(#arrow)"/><text x="432.5" y="325.0" font-family="Segoe UI,Arial,sans-serif" font-size="16" font-weight="600" text-anchor="middle" fill="#5B6573">HTTPS / Socket.IO</text>
+<line x1="940" y1="470" x2="1080" y2="317" stroke="#4A5568" stroke-width="3" marker-end="url(#arrow)"/><text x="1010.0" y="383.5" font-family="Segoe UI,Arial,sans-serif" font-size="16" font-weight="600" text-anchor="middle" fill="#5B6573">chat completions</text>
+<line x1="705" y1="607" x2="1080" y2="458" stroke="#4A5568" stroke-width="3" marker-end="url(#arrow)"/><text x="892.5" y="522.5" font-family="Segoe UI,Arial,sans-serif" font-size="16" font-weight="600" text-anchor="middle" fill="#5B6573">persist</text>
+<line x1="940" y1="610" x2="1080" y2="595" stroke="#4A5568" stroke-width="3" marker-end="url(#arrow)"/><text x="1010.0" y="592.5" font-family="Segoe UI,Arial,sans-serif" font-size="16" font-weight="600" text-anchor="middle" fill="#5B6573">OTel</text>
+<line x1="1305" y1="317" x2="950" y2="330" stroke="#4A5568" stroke-width="3" marker-end="url(#arrow)" stroke-dasharray="8 7"/><text x="1127.5" y="313.5" font-family="Segoe UI,Arial,sans-serif" font-size="16" font-weight="600" text-anchor="middle" fill="#5B6573">identity</text>
+<line x1="1397" y1="405" x2="900" y2="185" stroke="#4A5568" stroke-width="3" marker-end="url(#arrow)" stroke-dasharray="8 7"/><text x="1148.5" y="285.0" font-family="Segoe UI,Arial,sans-serif" font-size="16" font-weight="600" text-anchor="middle" fill="#5B6573">pull image</text>
+<rect x="70" y="735" width="1460" height="110" rx="14" fill="#FFFFFF" stroke="#A6A6A6" stroke-width="2"/>
+<text x="95" y="770" font-family="Segoe UI,Arial,sans-serif" font-size="21" font-weight="700" text-anchor="start" fill="#17202A">Infrastructure: azd + Bicep</text>
+<text x="95" y="801" font-family="Segoe UI,Arial,sans-serif" font-size="17" font-weight="400" text-anchor="start" fill="#5B6573">Bicep provisions Container Apps, ACR, Managed Identity, Azure Files, Foundry/Luna, Application Insights and Log Analytics.</text>
+<text x="95" y="827" font-family="Segoe UI,Arial,sans-serif" font-size="17" font-weight="400" text-anchor="start" fill="#5B6573">The app stays at one replica because SQLite is single-writer. MCP runs locally inside the app over stdio; it is not a separate Azure service.</text>
+</svg>
