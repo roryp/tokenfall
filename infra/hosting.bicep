@@ -184,7 +184,7 @@ resource app 'Microsoft.App/containerApps@2026-01-01' = {
         {
           name: 'web'
           image: empty(image) ? 'mcr.microsoft.com/azuredocs/containerapps-helloworld:latest' : image
-          resources: { cpu: json('0.5'), memory: '1Gi' }
+          resources: { cpu: json('2'), memory: '4Gi' }
           env: [
             { name: 'NODE_ENV', value: 'production' }
             { name: 'HOST', value: '0.0.0.0' }
@@ -225,6 +225,7 @@ resource app 'Microsoft.App/containerApps@2026-01-01' = {
           ]
         }
       ]
+      // SQLite on Azure Files allows one writer: a 3-replica test crashed every replica and corrupted indexes.
       scale: { minReplicas: 1, maxReplicas: 1 }
       volumes: [
         {
