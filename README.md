@@ -1,10 +1,30 @@
 # Tetris With Luna
 
-Tetris with sentence-generated pieces, optional GPT-5.6 Luna play, and shared leaderboards.
+Tetris with sentence-generated pieces, optional GPT-5.6 Luna play, and shared leaderboards. One TypeScript app runs on Azure Container Apps and asks Microsoft Foundry for Luna's moves.
+
+[Play](https://aka.ms/tokenfall) | [Workshop slides](Slides.pdf)
+
+## Contents
+
+- [Play](#play)
+- [Sentence mode](#sentence-mode)
+- [Controls](#controls)
+- [Luna](#luna)
+  - [Cost and speed](#cost-and-speed)
+  - [Limits and capacity](#limits-and-capacity)
+- [Architecture](#architecture)
+  - [What runs where](#what-runs-where)
+  - [Infra flow: azd up](#infra-flow-azd-up)
+  - [Azure flow: one Luna move](#azure-flow-one-luna-move)
+- [Run locally](#run-locally)
+- [Deploy](#deploy)
+- [Tracing](#tracing)
+- [Reset room data](#reset-room-data)
+- [Checks](#checks)
 
 ## Play
 
-1. Open the game and enter a name (2-16 letters, numbers, spaces, underscores, or hyphens).
+1. Open [the game](https://aka.ms/tokenfall) and enter a name (2-16 letters, numbers, spaces, underscores, or hyphens).
 2. Choose **Sentence** for a repeating token-derived queue or **Classic** for shuffled seven-piece bags.
 3. Click **Join game**. Fill horizontal rows to clear them; the run ends when a piece cannot spawn or locks entirely above the board.
 
@@ -46,39 +66,9 @@ The example produces `Z J O I L S T L`. Sentence text is not sent to Luna or sho
 
 Touch controls sit below the board. Hold is available once per piece. The ghost marks the hard-drop position. Click the board if keys stop responding after editing a field.
 
-## Architecture
-
-Tokenfall is deliberately a fairly small TypeScript application, but it shows the full path from browser game logic to an Azure-hosted AI model.
-
-[![Tokenfall architecture: React and TypeScript in the browser, a TypeScript Node.js server in Azure Container Apps, GPT-5.6 Luna in Azure AI Foundry, local MCP, SQLite on Azure Files, Managed Identity, and OpenTelemetry tracing.](docs/images/tokenfall-architecture.svg)](docs/images/tokenfall-architecture.svg)
-
-### What runs where
-
-- **Browser:** React, TypeScript, and Vite render the game. The same shared TypeScript game engine is used to enumerate and re-check legal Tetris placements.
-- **Azure Container Apps:** a Dockerized Node.js 24 server hosts the built frontend, Express endpoints, Socket.IO sessions, room state, AI admission controls, and the Luna gateway.
-- **Managed Identity:** the Container App uses a user-assigned managed identity and Microsoft Entra ID to call the Azure AI model and publish telemetry. The app does not need a model API key.
-- **Azure AI Foundry:** the infrastructure creates an AI Services account, a `gpt-5.6-luna` GlobalStandard deployment, and the `tokenfall` Foundry project.
-- **Local MCP:** when MCP is enabled, the server starts a local MCP process over stdio. Its `analyze_future_moves` tool simulates every legal current placement and the next placement. It returns facts to Luna; it does not play the game or call a remote MCP service.
-- **SQLite + Azure Files:** scores, player identities, token allowances, sentences, and AI usage live in SQLite under `/data`. Azure Files persists that directory between Container App revisions. The deployment intentionally stays at one replica because SQLite is a single-writer design.
-- **Observability:** OpenTelemetry GenAI spans are exported to Application Insights and Log Analytics. The Foundry project connects to Application Insights so each Luna move can be inspected as an agent trace.
-- **Infrastructure as code:** `azd` drives the deployment and the Bicep files under `infra/` create the model, monitoring, managed identity, registry, storage, and Container App.
-
-### Deployment and runtime flow
-
-[![Tokenfall sequence flow showing azd and Bicep deployment followed by one browser-to-Container-App-to-MCP-to-Luna move.](docs/images/tokenfall-sequence.svg)](docs/images/tokenfall-sequence.svg)
-
-The two flows are intentionally separate:
-
-1. **Infrastructure flow:** `azd provision` runs the Bicep modules. They create the Azure services and permissions. `azd deploy web` builds the TypeScript application, packages it as a Docker image, pushes it to Azure Container Registry, and updates the Container App. At runtime the Container App pulls that image, mounts Azure Files at `/data`, and receives the Foundry endpoint, Luna deployment name, Application Insights connection string, and managed identity configuration.
-2. **Azure/Luna flow:** the browser sends an `assist` request through Socket.IO. The server checks cooldowns, token budgets, deployment capacity, and concurrency before spending model tokens. It snapshots the current game and generates the legal placements. If MCP is enabled, a local stdio tool performs two-placement lookahead and adds those facts to the prompt. The server then calls GPT-5.6 Luna.
-3. **Luna chooses; the game engine executes:** Luna returns strict JSON containing a `placementId` and a short tip. The server accepts the answer only if that ID maps to a legal placement generated by the shared engine. The browser receives the validated placement, re-checks it with `refreshPlacement()`, executes the placement's action path, and sends the resulting input events back to the server.
-4. **Telemetry and persistence:** the server records score and AI usage in SQLite and emits OpenTelemetry spans for the agent request, optional MCP tool call, and Luna chat call. Application Insights stores those spans and Foundry presents them as the `tokenfall-luna` trace.
-
-The important boundary is that **Luna never directly controls the browser and MCP never executes a move**. Luna selects from legal placements produced by deterministic game code; the browser then executes that already-validated path.
-
 ## Luna
 
-**Ask Luna starts continuous paid Azure AI requests.** Manual play and sentence previews make no model calls. The board pauses during each request, then executes the validated move.
+**Ask Luna starts continuous paid Azure AI requests.** Manual play and sentence previews make no model calls. The board pauses during each request, then executes the validated move. To resume manual play, turn off **Ask Luna** or click **Stop Luna**, then **Play**; an in-flight request may still be charged, but its late move is discarded.
 
 [![AI cost ticker and Luna controls.](docs/images/ai-costs-luna-controls.png)](docs/images/ai-costs-luna-controls.png)
 
@@ -89,7 +79,9 @@ The important boundary is that **Luna never directly controls the browser and MC
 | Compression | Packs the same board into fewer input tokens without removing cells. |
 | Cache | Reuses instructions when the provider confirms a hit. Writes may cost extra; hits are not guaranteed. |
 
-Options default off, are disabled while Luna is off, and affect the next request. Saved choices return when Luna is enabled again.
+Options default off, are disabled while Luna is off, and affect the next request. Saved choices return when Luna is enabled again. **Information & tools** contains the prompt, cache, MCP, and cost inspectors.
+
+### Cost and speed
 
 [![Annotated cost vs speed per Luna move: one move costs about $0.002. Compression and Cache cost about a quarter less than Plain at the same speed; Reasoning and MCP cost about 15% more and are about twice as slow.](docs/images/luna-cost-vs-speed-explained.png)](docs/images/luna-cost-vs-speed-explained.png)
 
@@ -97,17 +89,67 @@ Measured from 50 [Foundry traces](#tracing) in October 2026, with each option an
 
 [![Where MCP's $2.18 per 1,000 moves goes: game state $1.42, instructions $0.45, MCP lookahead $0.27, and Luna's reply $0.04. The MCP tool adds 2.1 seconds per move.](docs/images/luna-mcp-cost-breakdown.png)](docs/images/luna-mcp-cost-breakdown.png)
 
-MCP adds 1,362 lookahead tokens per move (+14% cost) and 2.1 s of tool time.
+MCP adds 1,362 lookahead tokens per move (+14% cost) and 2.1 s of tool time. Costs and savings are estimates, not invoices; Cache can lower price, not allowance consumption.
 
-To resume manual play, turn off **Ask Luna** or click **Stop Luna**, then **Play**. An in-flight request may still be charged, but its late move is discarded.
+### Limits and capacity
 
-New players receive **1,000,000 AI tokens** across all their games. Reported input and output, including cached input, consume the allowance; restarting does not refill it. The room also has shared limits and supports 50 online players. Room Luna throughput follows the model deployment's capacity: the server admits up to 80% of the tokens per minute Azure reports in its rate-limit headers, with at most 4 MCP lookups at a time. Manual play remains available when AI limits are reached.
+- **Player:** new players receive **1,000,000 AI tokens** across all their games. Reported input and output, including cached input, consume the allowance; restarting does not refill it.
+- **Room:** shared AI limits and up to 50 online players. **AI tokens left** is the smaller personal/room balance; **Available now** also subtracts pending holds.
+- **Throughput:** the server admits up to 80% of the tokens per minute Azure reports in its rate-limit headers, at most 8 Luna calls per second, and at most 4 MCP lookups at a time.
+- **Fallback:** manual play remains available when AI limits are reached.
 
 [![How many Luna players at once: each Luna player uses about 298K tokens per minute and players add up. 6,950K tokens per minute of Azure capacity fits about 23 players, about 17 after the game's 28% safety margin, while the game server's 8 Luna calls per second fit about 15.](docs/images/luna-capacity-scaling.png)](docs/images/luna-capacity-scaling.png)
 
-Measured with 1-4 bot players (Plain moves, 40 seconds each) in October 2026. To size capacity for an audience, allow about 415K tokens per minute per simultaneous Luna player: about 300K used plus the 28% safety margin (20% spare and the extra each move reserves). The game server also caps a room at 8 Luna calls per second, about 15 players.
+Measured with 1-4 bot players (Plain moves, 40 seconds each) in October 2026. To size capacity for an audience, allow about 415K tokens per minute per simultaneous Luna player: about 300K used plus the 28% safety margin (20% spare and the extra each move reserves). The 8 calls per second cap fits about 15 players.
 
-**AI tokens left** is the smaller personal/room balance; **Available now** also subtracts pending holds. Costs and savings are estimates, not invoices. Cache can lower price, not allowance consumption. **Information & tools** contains the prompt, cache, MCP, and cost inspectors.
+## Architecture
+
+Tokenfall is deliberately a small TypeScript application that shows the full path from browser game logic to an Azure-hosted AI model. The diagrams are 16:9 slides; each PNG has an editable `.excalidraw` source next to it in [docs/images](docs/images).
+
+[![Tokenfall architecture: the browser (React and TypeScript) talks to the game server (Node.js and TypeScript) in Azure Container Apps over Socket.IO. The app also contains a local MCP server and SQLite on Azure Files. With a managed identity and no keys, it sends Luna moves to Microsoft Foundry and OpenTelemetry traces to Application Insights, which Foundry shows as traces. azd up deploys everything with Bicep and Docker.](docs/images/architecture.png)](docs/images/architecture.png)
+
+### What runs where
+
+| Part | Built with | Role |
+| --- | --- | --- |
+| Browser | React 19, Vite, TypeScript | Draws the board, runs the [shared game engine](shared/game.ts) at 60 FPS, and talks to the server over Socket.IO. |
+| Game server | Node.js 24, Express 5, Socket.IO 4 | Runs the `.ts` files directly, with no server build. Serves the web app, replays every input to verify scores, and admits Luna requests ([room](server/room.ts), [model gateway](server/model.ts)). |
+| Local MCP server | MCP TypeScript SDK, stdio | A child process in the same container, not a separate service. Its read-only `analyze_future_moves` tool simulates the next two placements and never plays a move ([client](server/mcp.ts), [server](server/mcp-server.ts)). |
+| SQLite | `node:sqlite` on Azure Files | Stores players, scores, sentences, allowances, and usage in `/data/tokenfall.sqlite`. SQLite has one writer, so the app runs one replica. |
+| Managed identity | Microsoft Entra ID | How the app signs in to Azure: `AcrPull` for the image, `Cognitive Services OpenAI User` for Luna, and `Monitoring Metrics Publisher` for traces. Foundry and Application Insights have key auth turned off. |
+| Microsoft Foundry | `gpt-5.6-luna`, GlobalStandard | Picks one of the legal placements the server sends, as strict JSON. |
+| Application Insights | Azure Monitor, OpenTelemetry | Keeps one trace per Luna move for 30 days in Log Analytics, for the Foundry trace view. |
+| azd | Azure Developer CLI, Bicep, Docker | Builds the image, creates the Azure resources in [infra/](infra/main.bicep), and deploys. |
+
+Also used: Zod validates messages and MCP replies, js-tiktoken (`o200k_base`) counts tokens, and the Azure Retail Prices API supplies live prices. Prompts are built in [tokens.ts](server/tokens.ts) from the [policy](server/policy.md).
+
+### Infra flow: `azd up`
+
+[![Infra flow for azd up: package builds the TypeScript app and Docker image; provision runs Bicep to create gpt-5.6-luna in Microsoft Foundry and the container app with its managed identity; deploy pushes the image and deploys a new revision, which pulls the image with the managed identity.](docs/images/infra-flow.png)](docs/images/infra-flow.png)
+
+| Steps | Phase | What happens |
+| --- | --- | --- |
+| 1 | Package | The [prepackage hook](azure.yaml) runs `npm ci`, `tsc`, and the Vite build; azd then builds the [Docker image](Dockerfile): Node.js 24, non-root, with `server/`, `shared/`, and `web/dist`. |
+| 2-4 | Provision | [main.bicep](infra/main.bicep) runs [monitoring.bicep](infra/monitoring.bicep) (Log Analytics, Entra-only Application Insights), [model.bicep](infra/model.bicep) (keyless Foundry resource, `gpt-5.6-luna`, `tokenfall` project), and [hosting.bicep](infra/hosting.bicep) (managed identity and roles, registry, Azure Files, Container App). |
+| 5-7 | Deploy | azd pushes the image and deploys a new revision, which pulls the image with the managed identity, mounts `/data`, runs `node server/index.ts`, and serves once `/api/health` passes. |
+
+Provisioning writes the endpoints and the Application Insights connection string to `.azure/<env>/.env`, which the local server also reads. Link the `tokenfall-luna` agent in Foundry once to see traces under **Agents** ([Tracing](#tracing)).
+
+### Azure flow: one Luna move
+
+[![Azure flow for one Luna move: the browser asks Luna; the game server optionally runs the local MCP lookahead, gets a token from its managed identity, sends the board and rules to gpt-5.6-luna in Microsoft Foundry, validates the move and saves usage to SQLite, returns the move to the browser, and sends a trace to Application Insights.](docs/images/azure-flow.png)](docs/images/azure-flow.png)
+
+| Steps | What happens |
+| --- | --- |
+| 1 | The browser sends an `assist` event with the four options. Before any paid work, the server checks cooldowns, token budgets, and room capacity, then opens the `invoke_agent Luna` span. |
+| 2-3 | With MCP on, the server starts the local MCP server and calls `analyze_future_moves`. The reply must pass its Zod schema and match the board's hash, or the request stops before Luna is called. |
+| 4 | `ManagedIdentityCredential` gets an Entra ID token, cached between moves. |
+| 5-6 | The server sends the rules, board, and legal placements to `gpt-5.6-luna`, which must reply with strict JSON: a `placementId` and a tip. Its rate-limit headers resize the room's limits. |
+| 7 | The server accepts only a `placementId` it offered, then saves token usage to SQLite. |
+| 8 | The browser re-checks the placement with the shared engine, plays it, and sends the inputs back like any move. |
+| 9 | The spans go to Application Insights with the managed identity and reach Foundry within minutes ([Tracing](#tracing)). |
+
+**Luna never controls the browser, and MCP never plays a move:** Luna only picks from legal placements produced by deterministic game code. Joining and manual play make no model calls; the server replays input batches before saving a best score. Locally, your `az login` session replaces the managed identity and `./data` replaces Azure Files.
 
 ## Run locally
 
@@ -127,23 +169,19 @@ npm run build
 npm start
 ```
 
-Open http://127.0.0.1:3100. Set `AZURE_LOCATION` to your resource's region for pricing. Local inference uses Azure CLI credentials; leave `AZURE_CLIENT_ID` unset because it selects managed identity.
+Open http://127.0.0.1:3100. Local inference uses your Azure CLI sign-in; leave `AZURE_CLIENT_ID` unset because it selects managed identity. Set `AZURE_LOCATION` to your resource's region for pricing.
 
-Configuration precedence is process variables, root dotenv file, then selected `azd` environment. See [configuration](server/config.ts). `npm run dev` watches the backend; rebuild frontend changes with `npm --prefix web run build`.
-
-When `APPLICATIONINSIGHTS_CONNECTION_STRING` is set (provisioning stores it in the `azd` environment), the local server exports [Luna traces](#tracing) with your Azure CLI identity. Set it to an empty value in the root dotenv file to keep local runs out of the shared traces.
-
-SQLite persists scores, sentences, allowances, and usage under `DATA_DIRECTORY`. Boards are lost on server restart. A second server needs a different `PORT` and `DATA_DIRECTORY`; keep databases and backups private.
-
-For network sharing, set `HOST=0.0.0.0` and an audience-reachable `PUBLIC_BASE_URL`. A saved `DATA_DIRECTORY/public-url.json` overrides that URL; update it or stop the old tunnel helper and remove it. Check **Share game** before distributing the link.
-
-Rules and replay validation: [game engine](shared/game.ts). AI prompts and validation: [token handling](server/tokens.ts), [policy](server/policy.md), and [model gateway](server/model.ts).
+- **Configuration:** process variables override the root dotenv file, which overrides the selected `azd` environment ([configuration](server/config.ts)).
+- **Development:** `npm run dev` watches the backend; rebuild frontend changes with `npm --prefix web run build`.
+- **Tracing:** when `APPLICATIONINSIGHTS_CONNECTION_STRING` is set (provisioning stores it in the `azd` environment), local Luna moves are [traced](#tracing) with your Azure CLI identity. Set it to an empty value in the root dotenv file to keep local runs out of the shared traces.
+- **Data:** SQLite persists scores, sentences, allowances, and usage under `DATA_DIRECTORY`; boards are lost on restart. A second server needs a different `PORT` and `DATA_DIRECTORY`. Keep databases and backups private.
+- **Sharing:** set `HOST=0.0.0.0` and an audience-reachable `PUBLIC_BASE_URL`. A saved `DATA_DIRECTORY/public-url.json` overrides that URL; update it, or stop the old tunnel helper and remove it. Check **Share game** before distributing the link.
 
 ## Deploy
 
-[azure.yaml](azure.yaml), [Dockerfile](Dockerfile), and [hosting template](infra/hosting.bicep) configure Azure Container Apps. Packaging requires Docker, PowerShell 7, authenticated `azd`, and the Windows frontend toolchain.
+[azure.yaml](azure.yaml), [Dockerfile](Dockerfile), and [hosting template](infra/hosting.bicep) configure Azure Container Apps. Packaging requires Docker, PowerShell 7, authenticated `azd`, and the Windows frontend toolchain. For a new environment, `azd up` packages, provisions, and deploys in one step ([infra flow](#infra-flow-azd-up)).
 
-**SQLite requires one writer. Deployments need downtime:** [Single revision mode overlaps old and new containers](https://learn.microsoft.com/en-us/azure/container-apps/revisions#zero-downtime-deployment).
+**Updates need downtime because SQLite requires one writer:** [Single revision mode overlaps old and new containers](https://learn.microsoft.com/en-us/azure/container-apps/revisions#zero-downtime-deployment).
 
 1. Disconnect players and wait for pending Luna requests to finish.
 2. Disable sticky sessions with `az containerapp ingress sticky-sessions set --affinity none` (supply the app name and resource group), switch to **Multiple** revision mode, and deactivate every active revision. Wait for **zero running replicas on every revision**; zero traffic is not enough.
@@ -157,7 +195,10 @@ Rules and replay validation: [game engine](shared/game.ts). AI prompts and valid
 
 For rollback, stop the new revision and wait for zero replicas before activating the previous one. Keep one running replica, one active revision, and no traffic splitting outside maintenance.
 
-Do not run `azd init` over the configured environment. Preview infrastructure changes with `azd provision --preview` before provisioning; app-only deployment does not update container settings. The hosting template sets `TRUST_PROXY_HOPS=1` for ingress-forwarded client addresses; leave it unset locally. Preserve Azure Files `nobrl` mounting and SQLite `DELETE` journaling/full synchronization.
+- Do not run `azd init` over the configured environment.
+- Preview infrastructure changes with `azd provision --preview`; app-only deployment does not update container settings.
+- The hosting template sets `TRUST_PROXY_HOPS=1` for ingress-forwarded client addresses; leave it unset locally.
+- Preserve Azure Files `nobrl` mounting and SQLite `DELETE` journaling with full synchronization.
 
 ## Tracing
 
@@ -178,9 +219,9 @@ How a Luna move reaches Foundry:
 
 Select a trace to see its spans. Set **Display mode** to **Tokens** for the token waterfall, and select the `chat` span for the input, output, cache, and reasoning tokens. Moves in one game share the conversation ID. Traces arrive within 2-5 minutes and follow the Log Analytics workspace's 30-day retention.
 
-Link Luna once per project in [Microsoft Foundry](https://ai.azure.com): **Build › Agents › New agent › Link external agent**, with the agent name and OTel agent ID `tokenfall-luna`. [External agents](https://learn.microsoft.com/azure/foundry/agents/how-to/register-external-agent) are in preview. Without the link, traces still reach Application Insights but do not appear under **Agents**.
+**Link Luna once per project** in [Microsoft Foundry](https://ai.azure.com): **Build › Agents › New agent › Link external agent**, with the agent name and OTel agent ID `tokenfall-luna`. [External agents](https://learn.microsoft.com/azure/foundry/agents/how-to/register-external-agent) are in preview. Without the link, traces still reach Application Insights but do not appear under **Agents**.
 
-The [model template](infra/model.bicep) upgrades the Azure OpenAI resource in place to a Microsoft Foundry resource with the same name, endpoint, and deployment, and adds the `tokenfall` project. The [monitoring template](infra/monitoring.bicep) connects an Entra-only Application Insights resource to that project. The app, the project, and the deploying user receive `Monitoring Metrics Publisher`; the user also receives `Log Analytics Reader` and `Foundry User`.
+The [model template](infra/model.bicep) upgrades the Azure OpenAI resource in place to a Microsoft Foundry resource with the same name, endpoint, and deployment, adds the `tokenfall` project, and connects it to the Entra-only Application Insights resource from the [monitoring template](infra/monitoring.bicep). The app, the project, and the deploying user receive `Monitoring Metrics Publisher`; the user also receives `Log Analytics Reader` and `Foundry User`.
 
 To total usage in Application Insights:
 
