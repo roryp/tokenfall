@@ -33,6 +33,13 @@ Tetris with sentence-generated pieces, optional GPT-5.6 Luna play, and shared le
 
 After each piece locks, the score shows the points it added and how: line clears (× level from level 2), back-to-back, combos, perfect clears, and 2 points per hard-drop row or 1 per soft-drop row.
 
+**Level** starts at 1 and goes up by 1 for every 10 lines cleared (level = 1 + lines ÷ 10, rounded down). It has two effects:
+
+- **Score:** line-clear, combo, and perfect-clear points are multiplied by the level, so a Tetris is worth 800 at level 1 and 2,400 at level 3. Drop points are not multiplied.
+- **Speed:** pieces fall faster each level, from 1 row per second at level 1. The speed stops increasing at level 20.
+
+Rankings also show each player's best level.
+
 <img src="docs/images/score-points.png" alt="Score panel: total score 1,200, then +134 for the last move, from a Single (100) and a hard drop of 17 rows × 2." width="560">
 
 **New game** resets the board, score, lines, and level, but keeps your best score and AI usage. Luna starts off.
