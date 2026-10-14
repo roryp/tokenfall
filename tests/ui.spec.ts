@@ -1820,6 +1820,93 @@ test('an admin link joins a full room without staying in the address bar, and a 
   assert.deepEqual(errors, []);
 });
 
+test('Switch player saves the current player, frees the seat, and the tab can join as someone else and return by name', async context => {
+  const setup = await fixture();
+  context.after(setup.close);
+  const { page, application } = setup;
+  await page.getByRole('button', { name: 'Hard drop (Space)', exact: true }).click();
+  await waitPieces(page, 1);
+  const first = setup.player();
+  const firstRun = first.runId;
+  await page.getByRole('button', { name: 'Switch player', exact: true }).click();
+  await page.getByRole('textbox', { name: 'Name', exact: true }).waitFor();
+  await page.getByRole('alert').filter({ hasText: 'Test Player is saved. Join with that name to continue, or enter a new name.' }).waitFor();
+  assert.equal(await page.evaluate(() => sessionStorage.getItem('tokenfall-session')), null);
+  assert.equal(application.room.online, 0);
+  assert.equal(first.socketId, null);
+  assert.equal(first.game.status, 'paused');
+  assert.ok(first.game.score > 0);
+  assert.equal(application.room.records().find(record => record.id === first.record.id)!.best_score, first.game.score);
+  const join = async (name: string) => {
+    await page.getByRole('textbox', { name: 'Name', exact: true }).fill(name);
+    await page.getByRole('radio', { name: 'Classic', exact: true }).check();
+    await page.getByRole('button', { name: 'Join game', exact: true }).click();
+  };
+  await join('Second Player');
+  await page.getByTestId('player-name').filter({ hasText: 'Second Player' }).waitFor();
+  assert.equal(numeric(await page.getByTestId('game-score').innerText()), 0);
+  assert.notEqual(setup.player().record.id, first.record.id);
+  await page.reload();
+  await page.getByTestId('player-name').filter({ hasText: 'Second Player' }).waitFor();
+  await page.getByRole('button', { name: 'Switch player', exact: true }).click();
+  await join('test player');
+  await page.getByTestId('player-name').filter({ hasText: 'Test Player' }).waitFor();
+  assert.equal(setup.player().record.id, first.record.id);
+  assert.equal(setup.player().runId, firstRun);
+  assert.equal(numeric(await page.getByTestId('game-score').innerText()), first.game.score);
+  assert.equal(application.room.online, 1);
+  assert.equal(setup.calls.length, 0);
+  assert.deepEqual(setup.errors, []);
+});
+
+test('Switch player stops Luna, records the in-flight request for the old player, and the next player starts clean', async context => {
+  const setup = await fixture();
+  context.after(setup.close);
+  const { page } = setup;
+  const first = setup.player();
+  setup.controls.hold = true;
+  await page.getByRole('checkbox', { name: 'Ask Luna', exact: true }).check();
+  await setup.waitForCalls(1);
+  await page.getByRole('button', { name: 'Switch player', exact: true }).click();
+  await page.getByRole('textbox', { name: 'Name', exact: true }).waitFor();
+  setup.release();
+  for (const deadline = Date.now() + 5000; first.metrics.requests < 1 && Date.now() < deadline;) await new Promise(resolve => setTimeout(resolve, 50));
+  assert.equal(first.metrics.requests, 1);
+  assert.equal(first.record.attempts, 1);
+  await page.getByRole('textbox', { name: 'Name', exact: true }).fill('Second Player');
+  await page.getByRole('radio', { name: 'Classic', exact: true }).check();
+  await page.getByRole('button', { name: 'Join game', exact: true }).click();
+  await page.getByTestId('player-name').filter({ hasText: 'Second Player' }).waitFor();
+  assert.equal(await page.getByRole('checkbox', { name: 'Ask Luna', exact: true }).isChecked(), false);
+  assert.equal(await page.getByTestId('ai-tokens').innerText(), '0');
+  await page.waitForTimeout(1500);
+  assert.equal(setup.calls.length, 1);
+  assert.equal(setup.player().metrics.requests, 0);
+  assert.deepEqual(setup.errors, []);
+});
+
+test('a duplicated tab that cannot rejoin its player can switch to a new one', async context => {
+  const setup = await fixture();
+  context.after(setup.close);
+  const { page, application } = setup;
+  const session = await page.evaluate(() => sessionStorage.getItem('tokenfall-session'));
+  const copy = await page.context().newPage();
+  await copy.goto(page.url());
+  await copy.evaluate(value => sessionStorage.setItem('tokenfall-session', value!), session);
+  await copy.reload();
+  await copy.getByRole('alert').filter({ hasText: 'This player is already playing in another tab.' }).waitFor();
+  await copy.getByRole('button', { name: 'Rejoin game', exact: true }).waitFor();
+  await copy.getByRole('button', { name: 'Switch player', exact: true }).click();
+  await copy.getByRole('textbox', { name: 'Name', exact: true }).fill('Copy Player');
+  await copy.getByRole('radio', { name: 'Classic', exact: true }).check();
+  await copy.getByRole('button', { name: 'Join game', exact: true }).click();
+  await copy.getByTestId('player-name').filter({ hasText: 'Copy Player' }).waitFor();
+  assert.equal(application.room.online, 2);
+  assert.equal(await page.getByTestId('player-name').innerText(), 'Test Player');
+  assert.equal(setup.calls.length, 0);
+  assert.deepEqual(setup.errors, []);
+});
+
 test('sentence editor shows server failures in the dialog and can retry without losing the run', async context => {
   const setup = await fixture();
   context.after(setup.close);

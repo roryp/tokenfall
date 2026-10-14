@@ -1,5 +1,5 @@
 import { useEffect, useId, useRef, useState } from 'react';
-import { ArrowUp, Check, ChevronLeft, ChevronRight, Copy, LocateFixed, Play, QrCode, RotateCcw, Settings2, Trash2, Trophy, Users, X } from 'lucide-react';
+import { ArrowLeftRight, ArrowUp, Check, ChevronLeft, ChevronRight, Copy, LocateFixed, Play, QrCode, RotateCcw, Settings2, Trash2, Trophy, Users, X } from 'lucide-react';
 import { QRCodeCanvas } from 'qrcode.react';
 import { DEFAULT_TOKEN_TEXT, tokenLabel, tokenShape } from '../../shared/game.ts';
 import { reportedTokenBalance } from '../../shared/protocol.ts';
@@ -173,6 +173,7 @@ export function RoomPanel({ game, rankingsOpen, onCloseRankings, onReturn }: { g
   const rankingsDialog = useRef<HTMLDialogElement | null>(null);
   const room = game.room;
   const full = room !== null && room.online >= room.capacity;
+  const switchButton = <button className="switch-player" title="Save this player and join with another name" disabled={game.joining} onClick={() => void game.switchPlayer()}><ArrowLeftRight size={16} />Switch player</button>;
   const entries = (ranking === 'points' ? room?.pointsLeaderboard : room?.leaderboard?.filter(entry => entry.challengeScore !== null)) ?? [];
   const pageCount = Math.max(1, Math.ceil(entries.length / 10));
   const currentPage = Math.min(page, pageCount - 1);
@@ -206,7 +207,7 @@ export function RoomPanel({ game, rankingsOpen, onCloseRankings, onReturn }: { g
       {(game.allowance?.unconfirmed ?? 0) > 0 && <span data-testid="allowance-unconfirmed">{game.allowance!.unconfirmed.toLocaleString()} held / usage unconfirmed</span>}
     </div>
     <div className="room-entry">
-      {!game.joined ? game.sessionName ? <div className="returning-player"><h2>{game.sessionName}</h2><button className="primary-button" disabled={!game.connected || game.joining} onClick={() => game.join()}><Play size={18} />{game.joining ? 'Reconnecting...' : 'Rejoin game'}</button></div> : <GameSetup disabled={!game.connected || !room || (full && !game.adminAccess)} pending={game.joining} onSubmit={game.join} /> : <div className="player-summary"><div><strong data-testid="player-name">{game.player?.name}</strong>{game.player?.admin && <small className="admin-badge" data-testid="admin-badge">Admin</small>}<p title={game.player?.tokenText}>{game.player?.tokenText || 'Classic pieces'}</p></div></div>}
+      {!game.joined ? game.sessionName ? <div className="returning-player"><h2>{game.sessionName}</h2><button className="primary-button" disabled={!game.connected || game.joining} onClick={() => game.join()}><Play size={18} />{game.joining ? 'Reconnecting...' : 'Rejoin game'}</button>{switchButton}</div> : <GameSetup disabled={!game.connected || !room || (full && !game.adminAccess)} pending={game.joining} onSubmit={game.join} /> : <div className="player-summary"><div><strong data-testid="player-name">{game.player?.name}</strong>{game.player?.admin && <small className="admin-badge" data-testid="admin-badge">Admin</small>}<p title={game.player?.tokenText}>{game.player?.tokenText || 'Classic pieces'}</p></div>{switchButton}</div>}
       {!game.joined && room && (full
         ? <p className={game.adminAccess ? 'admin-note' : 'field-error'} role="status">{game.adminAccess ? 'Room full. Admin access lets you join.' : 'Room full. Waiting for a free spot.'}</p>
         : game.adminAccess && <p className="admin-note" role="status">Admin access is on for this browser.</p>)}

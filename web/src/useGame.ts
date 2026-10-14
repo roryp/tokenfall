@@ -227,6 +227,27 @@ export function useGame() {
     try { localStorage.removeItem(ADMIN_KEY_STORAGE); } catch { return; }
   }
 
+  // Pauses and saves the current player, releases the seat, and returns this tab to the join form. The admin key is kept.
+  async function switchPlayer() {
+    if (joiningRef.current) return;
+    const name = session.current?.name ?? player?.name;
+    joiningRef.current = true;
+    setJoining(true);
+    stopAutopilot();
+    if (active.current && game.current) {
+      if (game.current.status === 'playing') { game.current.act('pause'); refresh(); }
+      await flushAll();
+    }
+    const connection = socket.current;
+    const left = !connection?.connected || await new Promise<boolean>(resolve => {
+      connection.timeout(5000).emit('leave', (error: Error | null, reply: Reply<null>) => resolve(!error && reply.ok));
+    });
+    clearRoomSession('all');
+    // Reconnecting makes the server release the seat even when it did not confirm the leave.
+    if (!left) connection?.disconnect().connect();
+    setNotice(name ? `${name} is saved. Join with that name to continue, or enter a new name.` : '');
+  }
+
   function join(setup?: { name: string; text?: string }) {
     if (!roomRef.current || !socket.current?.connected || active.current || joiningRef.current) return;
     const code = roomRef.current.code;
@@ -496,5 +517,5 @@ export function useGame() {
 
   const rates = room?.pricing.snapshot?.usdPerMillion;
   const cost = rates ? costForUsage(metrics, rates) : null;
-  return { room, connected, joined, joining, player, sessionName, adminAccess: adminKey !== null, view, metrics, allowance, insight, requestHistory, cost, busy, notice, setNotice, options, setOptions, autopilot, autopilotStatus, inspectionPaused, pauseForInspection, resumeAfterInspection, prepareMaintenance, resetVersion, retryAutopilot, toggleAutopilot, requestOptions, unmeteredRequests, join, act, restart };
+  return { room, connected, joined, joining, player, sessionName, adminAccess: adminKey !== null, view, metrics, allowance, insight, requestHistory, cost, busy, notice, setNotice, options, setOptions, autopilot, autopilotStatus, inspectionPaused, pauseForInspection, resumeAfterInspection, prepareMaintenance, resetVersion, retryAutopilot, toggleAutopilot, requestOptions, unmeteredRequests, join, switchPlayer, act, restart };
 }

@@ -175,6 +175,17 @@ export function createApplication(config: AppConfig, gateway: ModelGateway = new
           if (data.adminKey !== undefined) throw new RequestError('Admin key not recognized.', 'admin');
         }
         respond({ ok: true, data: room.join(data.name, data.room, data.token, socket.id, data.text, data.classic, admin) });
+        // Only the joining tab gets an immediate snapshot; everyone else receives the next batched broadcast.
+        socket.emit('room', room.view());
+      } catch (error) { respond(errorReply(error)); }
+    });
+    // Frees this connection's seat so it can join as another player; the player's game is paused and saved like a disconnect.
+    socket.on('leave', respond => {
+      if (typeof respond !== 'function') return;
+      try {
+        room.disconnect(socket.id);
+        respond({ ok: true, data: null });
+        socket.emit('room', room.view());
       } catch (error) { respond(errorReply(error)); }
     });
     socket.on('inputs', (payload, respond) => {

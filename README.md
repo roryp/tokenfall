@@ -46,6 +46,8 @@ Rankings also show each player's best level.
 
 Names are room identities, not authenticated accounts. Reusing a name continues its scores and usage and replaces the previous tab's session. Use a distinctive name and one tab per player.
 
+To play as someone else in the same tab, click **Switch player** next to your name. The current game is paused and its scores stay saved; joining with that name again continues them.
+
 Leaderboards rank best score or best score divided by cumulative AI spend in US cents. Zero spend or incomplete cost data is unranked on **Points / cent**. Manual and AI runs share the rankings.
 
 ## Sentence mode

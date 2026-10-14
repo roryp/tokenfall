@@ -213,6 +213,7 @@ export interface ServerEvents {
 }
 export interface ClientEvents {
   join: (data: { name: string; room: string; token?: string; text?: string; classic?: boolean; adminKey?: string }, reply: (result: Reply<JoinResult>) => void) => void;
+  leave: (reply: (result: Reply<null>) => void) => void;
   inputs: (data: InputBatch, reply: (result: Reply<InputAck>) => void) => void;
   restart: (reply: (result: Reply<JoinResult>) => void) => void;
   configure: (data: { text: string }, reply: (result: Reply<JoinResult>) => void) => void;

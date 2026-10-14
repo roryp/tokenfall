@@ -341,6 +341,11 @@ html:has(dialog:modal) { overflow: hidden; }
 .room-entry > [role="status"] { margin: -12px 0 20px; }
 .admin-badge { margin-left: 8px; padding: 1px 5px; border: 1px solid var(--cp-accent); border-radius: 3px; color: var(--cp-accent); font: 9px var(--cp-mono); text-transform: uppercase; vertical-align: 1px; }
 .admin-note { color: var(--cp-text-muted); font-size: 12px; line-height: 1.5; }
+.switch-player { min-height: 36px; display: inline-flex; align-items: center; justify-content: center; gap: 6px; flex-shrink: 0; padding: 6px 10px; background: var(--cp-surface-soft); color: var(--cp-text); border: 1px solid var(--cp-border); border-radius: 4px; font-size: 12px; white-space: nowrap; }
+.switch-player > svg { color: var(--cp-accent); }
+.switch-player:hover:not(:disabled) { border-color: var(--cp-accent); background: var(--cp-accent-soft); }
+.switch-player:focus-visible { outline: 2px solid var(--cp-link); outline-offset: 2px; }
+.returning-player .switch-player { min-height: 44px; }
 .player-summary p { margin-top: 5px; display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 2; overflow: hidden; overflow-wrap: anywhere; font: 11px/1.5 var(--cp-mono); color: var(--cp-text-muted); }
 .returning-player { display: grid; gap: 14px; padding-bottom: 24px; }
 .sentence-dialog { max-width: 480px; }

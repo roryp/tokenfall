@@ -1797,6 +1797,42 @@ test('an admin key joins a full room from a rate-limited venue address, while wr
   } finally { clients.forEach(client => client.disconnect()); await application.close(); rmSync(setup.dataDirectory, { recursive: true, force: true }); }
 });
 
+test('leaving frees the seat and keeps the player, so one connection can switch players and switch back', async () => {
+  const setup = fixture();
+  const application = createApplication({ ...setup.config, roomCapacity: 1 }, setup.gateway);
+  await new Promise<void>(resolve => application.server.listen(0, '127.0.0.1', resolve));
+  const address = application.server.address() as { port: number };
+  const client = connect(`http://127.0.0.1:${address.port}`, { transports: ['websocket'], forceNew: true, reconnection: false });
+  const join = (name: string) => client.timeout(5000).emitWithAck('join', { name, room: application.room.code }) as Promise<Reply<JoinResult>>;
+  const leave = () => client.timeout(5000).emitWithAck('leave') as Promise<Reply<null>>;
+  try {
+    await new Promise<void>((resolve, reject) => { client.once('connect', resolve); client.once('connect_error', reject); });
+    assert.deepEqual(await leave(), { ok: true, data: null });
+    const first = await join('First Player');
+    assert.ok(first.ok);
+    const played = await client.timeout(5000).emitWithAck('inputs', { runId: first.data.runId, sequence: 1, frame: 0, events: [{ frame: 0, action: 'hardDrop' }] }) as Reply<{ score: number }>;
+    assert.ok(played.ok && played.data.score > 0);
+    assert.deepEqual(await leave(), { ok: true, data: null });
+    assert.equal(application.room.online, 0);
+    const saved = application.room.players.get(first.data.playerId)!;
+    assert.equal(saved.socketId, null);
+    assert.equal(saved.game.status, 'paused');
+    assert.equal(application.room.records().find(record => record.id === first.data.playerId)!.best_score, played.data.score);
+    const second = await join('Second Player');
+    assert.ok(second.ok);
+    assert.notEqual(second.data.playerId, first.data.playerId);
+    const stale = await client.timeout(5000).emitWithAck('inputs', { runId: first.data.runId, sequence: 2, frame: 1, events: [] }) as Reply<unknown>;
+    assert.ok(!stale.ok && stale.code === 'resync');
+    assert.deepEqual(await leave(), { ok: true, data: null });
+    const back = await join('first player');
+    assert.ok(back.ok);
+    assert.equal(back.data.playerId, first.data.playerId);
+    assert.equal(back.data.runId, first.data.runId);
+    assert.equal(Game.restore(back.data.replay).score, played.data.score);
+    assert.equal(application.room.online, 1);
+  } finally { client.disconnect(); await application.close(); rmSync(setup.dataDirectory, { recursive: true, force: true }); }
+});
+
 test('fifty simultaneous sockets can join, play and receive the complete live leaderboard', async () => {
   const setup = fixture();
   const application = createApplication(setup.config, setup.gateway);
