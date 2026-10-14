@@ -15,7 +15,7 @@ import { countTokens, tokenChips } from './tokens.ts';
 
 const nameSchema = z.string().trim().min(2).max(16).regex(/^[\p{L}\p{N} _-]+$/u, 'Use letters, numbers, spaces, underscores or hyphens.');
 const setupSchema = z.object({ text: z.string().min(1).max(500) }).strict();
-const joinSchema = z.object({ name: nameSchema, room: z.string().length(6), token: z.string().length(64).optional(), text: z.string().min(1).max(500).optional(), classic: z.boolean().optional() }).strict();
+const joinSchema = z.object({ name: nameSchema, room: z.string().length(6), token: z.string().length(64).optional(), text: z.string().min(1).max(500).optional(), classic: z.boolean().optional(), adminKey: z.string().min(1).max(256).optional() }).strict();
 const inputSchema = z.object({
   runId: z.string().uuid(), sequence: z.number().int().positive(), frame: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
   events: z.array(z.object({ frame: z.number().int().nonnegative(), action: z.enum(ACTIONS) }).strict()).max(64),
@@ -23,6 +23,13 @@ const inputSchema = z.object({
 const aiSchema = z.object({ cache: z.boolean(), compression: z.boolean(), reasoning: z.boolean().optional(), mcp: z.boolean().optional(), autopilot: z.boolean().optional() }).strict();
 export const SOCKET_EVENT_BURST = 120;
 export const SOCKET_EVENTS_PER_SECOND = 60;
+// Audiences often share one venue address, so per-address limits grow with the room.
+export const JOINS_PER_SEAT_PER_MINUTE = 3;
+export const TOKENIZE_REQUESTS_PER_SEAT_PER_MINUTE = 6;
+
+export const ROOM_BROADCAST_MS = 500;
+export const LARGE_AUDIENCE_SOCKETS = 100;
+export const LARGE_AUDIENCE_BROADCAST_MS = 1000;
 
 const loopback = (address: string) => address === '::1' || /^(::ffff:)?127\./.test(address);
 // Mirrors Express `trust proxy`: 0 trusts loopback proxies only; N trusts exactly N hops such as the Container Apps ingress.
@@ -70,7 +77,7 @@ export function createApplication(config: AppConfig, gateway: ModelGateway = new
       const window = tokenWindows.get(address) ?? { start: now, count: 0 };
       window.count += 1;
       tokenWindows.set(address, window);
-      if (window.count > 300) { response.status(429).json({ error: 'Token lab is busy. Try again in a moment.' }); return; }
+      if (window.count > TOKENIZE_REQUESTS_PER_SEAT_PER_MINUTE * room.capacity) { response.status(429).json({ error: 'Token lab is busy. Try again in a moment.' }); return; }
       response.json({ count: countTokens(text), tokens: tokenChips(text, 256), encoding: 'o200k_base', estimate: true });
     } catch (error) { response.status(400).json(errorReply(error)); }
   });
@@ -156,15 +163,18 @@ export function createApplication(config: AppConfig, gateway: ModelGateway = new
       if (typeof respond !== 'function') return;
       try {
         const data = joinSchema.parse(payload);
-        const now = Date.now();
-        for (const [key, window] of joinWindows) if (now - window.started >= 60000) joinWindows.delete(key);
-        const address = clientAddress(socket.handshake.address, socket.handshake.headers['x-forwarded-for'], trust);
-        const window = joinWindows.get(address) ?? { started: now, count: 0 };
-        window.count += 1;
-        joinWindows.set(address, window);
-        if (window.count > 150) throw new RequestError('Too many join attempts. Try again shortly.', 'rate', 30000);
-        respond({ ok: true, data: room.join(data.name, data.room, data.token, socket.id, data.text, data.classic) });
-        io.emit('room', room.view());
+        const admin = data.adminKey !== undefined && room.isAdminKey(data.adminKey);
+        if (!admin) {
+          const now = Date.now();
+          for (const [key, window] of joinWindows) if (now - window.started >= 60000) joinWindows.delete(key);
+          const address = clientAddress(socket.handshake.address, socket.handshake.headers['x-forwarded-for'], trust);
+          const window = joinWindows.get(address) ?? { started: now, count: 0 };
+          window.count += 1;
+          joinWindows.set(address, window);
+          if (window.count > JOINS_PER_SEAT_PER_MINUTE * room.capacity) throw new RequestError('Too many join attempts. Try again shortly.', 'rate', 30000);
+          if (data.adminKey !== undefined) throw new RequestError('Admin key not recognized.', 'admin');
+        }
+        respond({ ok: true, data: room.join(data.name, data.room, data.token, socket.id, data.text, data.classic, admin) });
       } catch (error) { respond(errorReply(error)); }
     });
     socket.on('inputs', (payload, respond) => {
@@ -198,24 +208,37 @@ export function createApplication(config: AppConfig, gateway: ModelGateway = new
         socket.emit('usage', room.usage(player));
         const data = await pending;
         respond({ ok: true, data });
-        io.emit('room', room.view());
       } catch (error) { respond(errorReply(error)); }
       finally {
         const player = [...room.players.values()].find(candidate => candidate.socketId === socket.id);
         if (player) socket.emit('usage', room.usage(player));
       }
     });
-    socket.on('disconnect', () => { if (room.disconnect(socket.id)) io.emit('room', room.view()); });
+    socket.on('disconnect', () => { room.disconnect(socket.id); });
   });
-  const broadcast = setInterval(() => {
-    io.emit('room', room.view());
-    for (const player of room.players.values()) if (player.socketId) io.to(player.socketId).emit('usage', room.usage(player));
-  }, 500);
+  // One room snapshot per interval, skipped when unchanged, so a burst of joins or Luna replies costs one send per socket rather than one per event.
+  // Large audiences receive snapshots half as often, halving the venue download traffic.
+  let publishedRoom = '';
+  let broadcast: NodeJS.Timeout;
+  const publish = () => {
+    try {
+      const view = room.view();
+      const snapshot = JSON.stringify(view);
+      if (snapshot !== publishedRoom) {
+        publishedRoom = snapshot;
+        io.emit('room', view);
+      }
+      for (const player of room.players.values()) if (player.socketId) io.to(player.socketId).emit('usage', room.usage(player));
+    } catch (error) { console.error('Room broadcast failed:', error instanceof Error ? error.message : 'Unknown error'); }
+    broadcast = setTimeout(publish, io.engine.clientsCount > LARGE_AUDIENCE_SOCKETS ? LARGE_AUDIENCE_BROADCAST_MS : ROOM_BROADCAST_MS);
+    broadcast.unref();
+  };
+  broadcast = setTimeout(publish, ROOM_BROADCAST_MS);
   broadcast.unref();
   return {
     app, server, io, room,
     close: async () => {
-      clearInterval(broadcast);
+      clearTimeout(broadcast);
       await new Promise<void>(resolve => io.close(() => resolve()));
       room.close();
     },

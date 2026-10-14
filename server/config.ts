@@ -6,6 +6,9 @@ import type { TokenCredential } from '@azure/identity';
 import { parse } from 'dotenv';
 
 export const ROOT = fileURLToPath(new URL('../', import.meta.url));
+export const DEFAULT_ROOM_CAPACITY = 250;
+export const MAX_ROOM_CAPACITY = 500;
+export const MIN_ADMIN_KEY_LENGTH = 32;
 export interface AppConfig {
   port: number;
   host?: '127.0.0.1' | '0.0.0.0';
@@ -20,6 +23,8 @@ export interface AppConfig {
   localMaintenance?: boolean;
   trustProxyHops?: number;
   appInsightsConnectionString?: string;
+  roomCapacity?: number;
+  adminKey?: string;
 }
 
 export function azureCredential(config: Pick<AppConfig, 'managedIdentityClientId' | 'tenantId'>): TokenCredential {
@@ -53,11 +58,16 @@ export function loadConfig(environment: NodeJS.ProcessEnv = process.env): AppCon
   if (localMaintenance && (host !== '127.0.0.1' || values.NODE_ENV === 'production' || values.AZURE_CLIENT_ID)) throw new Error('Unauthenticated room maintenance is restricted to a local loopback development server.');
   const trustProxyHops = Number(values.TRUST_PROXY_HOPS ?? 0);
   if (!Number.isInteger(trustProxyHops) || trustProxyHops < 0 || trustProxyHops > 5) throw new Error('TRUST_PROXY_HOPS must be an integer from 0 to 5.');
+  const roomCapacity = Number(values.ROOM_CAPACITY || DEFAULT_ROOM_CAPACITY);
+  if (!Number.isInteger(roomCapacity) || roomCapacity < 1 || roomCapacity > MAX_ROOM_CAPACITY) throw new Error(`ROOM_CAPACITY must be an integer from 1 to ${MAX_ROOM_CAPACITY}.`);
+  const adminKey = values.ADMIN_KEY || undefined;
+  if (adminKey !== undefined && (adminKey.length < MIN_ADMIN_KEY_LENGTH || adminKey.length > 256 || /\s/.test(adminKey))) throw new Error(`ADMIN_KEY must be ${MIN_ADMIN_KEY_LENGTH} to 256 characters without spaces.`);
   return {
     port, host, endpoint: values.AZURE_OPENAI_ENDPOINT, deployment: values.AZURE_OPENAI_DEPLOYMENT,
     tenantId: values.AZURE_TENANT_ID, dataDirectory: path.resolve(values.DATA_DIRECTORY ?? path.join(ROOT, 'data')), publicUrl: values.PUBLIC_BASE_URL,
     pricingRegion: values.AZURE_LOCATION,
     managedIdentityClientId: values.AZURE_CLIENT_ID, sqliteJournalMode, localMaintenance, trustProxyHops,
     appInsightsConnectionString: values.APPLICATIONINSIGHTS_CONNECTION_STRING || undefined,
+    roomCapacity, adminKey,
   };
 }

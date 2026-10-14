@@ -18,6 +18,7 @@ Tetris with sentence-generated pieces, optional GPT-5.6 Luna play, and shared le
   - [Azure flow: one Luna move](#azure-flow-one-luna-move)
 - [Run locally](#run-locally)
 - [Deploy](#deploy)
+- [Admin access](#admin-access)
 - [Tracing](#tracing)
 - [Reset room data](#reset-room-data)
 - [Checks](#checks)
@@ -94,13 +95,16 @@ MCP adds 1,375 lookahead tokens per move (+14% cost) and 0.5 s of tool time, dow
 ### Limits and capacity
 
 - **Player:** new players receive **1,000,000 AI tokens** across all their games. Reported input and output, including cached input, consume the allowance; restarting does not refill it.
-- **Room:** shared AI limits and up to 50 online players. **AI tokens left** is the smaller personal/room balance; **Available now** also subtracts pending holds.
+- **Room:** shared AI limits and up to 250 online players (`ROOM_CAPACITY`, at most 500). A full room makes newcomers wait for a free spot, but the host's [admin link](#admin-access) always gets in. **AI tokens left** is the smaller personal/room balance; **Available now** also subtracts pending holds.
+- **Shared Wi-Fi:** per-address limits grow with the room (3 joins and 6 sentence previews per minute for each seat), so a whole audience can share one venue address.
 - **Throughput:** the server admits up to 80% of the tokens per minute Azure reports in its rate-limit headers, at most 8 Luna calls per second, and at most 4 MCP lookups at a time.
 - **Fallback:** manual play remains available when AI limits are reached.
 
 [![How many Luna players at once: a Luna player next to Azure uses about 311K tokens per minute, one in Johannesburg about 246K, and players add up. 6,950K tokens per minute of Azure capacity fits about 22 nearby players, about 16 after the game's 28% safety margin, while the game server's 8 Luna calls per second fit about 14.](docs/images/luna-capacity-scaling.png)](docs/images/luna-capacity-scaling.png)
 
 Measured in October 2026 with bot players making Plain moves for one minute per step: 1, 2 and 4 bots inside the app's container, next to Azure, and 1, 2, 4 and 8 bots in Johannesburg, about 230 ms away. Each move waits for two network round trips, so nearby players move faster and use more tokens per minute. To size capacity for an audience near East US 2, allow about 430K tokens per minute per simultaneous Luna player: about 310K used plus the 28% safety margin (20% spare and the extra each move reserves). The 8 calls per second cap fits about 14 nearby players or about 19 in Johannesburg. With 8 players the server used under 10% of its 2 CPUs, while Luna's replies slowed by about 16%.
+
+Room size was measured locally in October 2026 with bots playing manually (30% also asking Luna) plus spectators. With 250 players and 50 spectators the server's event loop was 26–33% busy across runs and sent 5.4 MB/s of room updates, with input acknowledgements under 70 ms at the 95th percentile. 500 players and 100 spectators used 36% and 10.7 MB/s. New best scores are written to SQLite together on each room update, and rooms with more than 100 connections send updates every second instead of every half second. Azure Files writes are slower than a local disk, so rehearse on Azure before relying on more than 250 players.
 
 ## Architecture
 
@@ -176,6 +180,7 @@ Open http://127.0.0.1:3100. Local inference uses your Azure CLI sign-in; leave `
 - **Tracing:** when `APPLICATIONINSIGHTS_CONNECTION_STRING` is set (provisioning stores it in the `azd` environment), local Luna moves are [traced](#tracing) with your Azure CLI identity. Set it to an empty value in the root dotenv file to keep local runs out of the shared traces.
 - **Data:** SQLite persists scores, sentences, allowances, and usage under `DATA_DIRECTORY`; boards are lost on restart. A second server needs a different `PORT` and `DATA_DIRECTORY`. Keep databases and backups private.
 - **Sharing:** set `HOST=0.0.0.0` and an audience-reachable `PUBLIC_BASE_URL`. A saved `DATA_DIRECTORY/public-url.json` overrides that URL; update it, or stop the old tunnel helper and remove it. Check **Share game** before distributing the link.
+- **Room size and admin:** `ROOM_CAPACITY` sets the online seats (default 250, at most 500). `ADMIN_KEY` enables [admin access](#admin-access); an `ADMIN_KEY` in the `azd` environment applies locally too.
 
 ## Deploy
 
@@ -197,8 +202,30 @@ For rollback, stop the new revision and wait for zero replicas before activating
 
 - Do not run `azd init` over the configured environment.
 - Preview infrastructure changes with `azd provision --preview`; app-only deployment does not update container settings.
+- Provisioning also starts a new revision and restores **Single** revision mode, so run it in the same window as a deployment: complete steps 1–2, run `azd provision --environment tokenfall-dev --no-prompt` in place of step 3, and confirm one healthy replica. Then repeat steps 2–4 for `azd deploy`; never run one right after the other while a revision is still running.
 - The hosting template sets `TRUST_PROXY_HOPS=1` for ingress-forwarded client addresses; leave it unset locally.
 - Preserve Azure Files `nobrl` mounting and SQLite `DELETE` journaling with full synchronization.
+
+## Admin access
+
+The event host can join even when the room is full. Admins skip the room's player, registration, and per-address join limits; AI limits and everything else stay the same.
+
+1. Store a random key of at least 32 characters in the `azd` environment:
+
+   ```powershell
+   azd env set ADMIN_KEY (node -e "console.log(require('crypto').randomBytes(32).toString('base64url'))")
+   ```
+
+2. Provision it as described in [Deploy](#deploy). The key becomes a Container App secret, exposed to the server as `ADMIN_KEY`. Without a key, admin access is off.
+3. Before the event, open the admin link once in the browser you will present from, before projecting:
+
+   ```powershell
+   "$(azd env get-value SERVICE_WEB_ENDPOINT_URL)/#admin=$(azd env get-value ADMIN_KEY)"
+   ```
+
+The key travels in the URL fragment, which browsers do not send to servers. The page saves it in that browser's local storage and removes it from the address bar; share links never include it. **Admin access is on for this browser** shows before you join, and an **Admin** badge shows next to your name after you join.
+
+Keep the key private: anyone with it can join a full room. A browser forgets a key the server rejects, and opening `/#admin=` forgets it on purpose. To rotate the key, set a new value and provision again.
 
 ## Tracing
 

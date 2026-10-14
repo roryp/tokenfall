@@ -1,4 +1,4 @@
-import { createHash, randomBytes, randomUUID } from 'node:crypto';
+import { createHash, randomBytes, randomUUID, timingSafeEqual } from 'node:crypto';
 import { chmodSync, existsSync, mkdirSync, readFileSync } from 'node:fs';
 import path from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
@@ -6,6 +6,7 @@ import { Game, FPS, placementsFor } from '../shared/game.ts';
 import { costForUsage, DEFAULT_TOKEN_ALLOWANCE, emptyMetrics, MAX_REQUEST_TOKENS, MAX_TOKEN_ALLOWANCE, pointsPerCent, tokenAllowance } from '../shared/protocol.ts';
 import type { AiOptions, InputAck, InputBatch, JoinResult, LeaderboardEntry, Metrics, PlayerUsage, PromptPreview, RoomResetMode, RoomResetPreview, RoomView, TokenPricing } from '../shared/protocol.ts';
 import type { AppConfig } from './config.ts';
+import { DEFAULT_ROOM_CAPACITY } from './config.ts';
 import { AI_COOLDOWN_MS, AUTOPILOT_COOLDOWN_MS, MAX_OUTPUT_TOKENS, maxCompletionTokens, ModelGate, PREFIX_TOKENS, ROOM_REQUEST_LIMIT, ROOM_TOKEN_BUDGET, RequestError } from './model.ts';
 import type { ModelGateway } from './model.ts';
 import { addUsage, buildPrompts, gameTokens } from './tokens.ts';
@@ -31,6 +32,8 @@ interface PlayerRecord {
 // Names identify players, so matching ignores case, Unicode width variants and repeated spaces.
 export const nameKey = (name: string) => name.normalize('NFKC').trim().replace(/\s+/gu, ' ').toLowerCase();
 const fingerprint = (value: unknown) => createHash('sha256').update(JSON.stringify(value)).digest('hex');
+const digest = (value: string) => createHash('sha256').update(value).digest();
+export const MIN_REGISTRATION_LIMIT = 500;
 export interface Player {
   record: PlayerRecord;
   metrics: Metrics;
@@ -48,10 +51,15 @@ export class Room {
   database: DatabaseSync;
   players = new Map<string, Player>();
   code: string;
+  readonly capacity: number;
+  readonly registrationLimit: number;
   gate = new ModelGate();
   pricing: TokenPricing = { status: 'loading', snapshot: null };
   private previewTimes = new Map<string, number>();
   private pendingTokens = new Map<string, number>();
+  // New best scores arrive with most input batches; they are committed together on the next read instead of one synchronous write per batch.
+  private pendingScores = new Set<Player>();
+  private adminDigest: Buffer | null;
   private resetting = false;
   private resetPreviews = new Map<string, { mode: RoomResetMode; expiresAt: number; fingerprint: string }>();
   config: AppConfig;
@@ -60,6 +68,9 @@ export class Room {
   constructor(config: AppConfig, gateway: ModelGateway) {
     this.config = config;
     this.gateway = gateway;
+    this.capacity = config.roomCapacity ?? DEFAULT_ROOM_CAPACITY;
+    this.registrationLimit = Math.max(MIN_REGISTRATION_LIMIT, this.capacity * 2);
+    this.adminDigest = config.adminKey ? digest(config.adminKey) : null;
     mkdirSync(config.dataDirectory, { recursive: true });
     this.database = new DatabaseSync(path.join(config.dataDirectory, 'tokenfall.sqlite'));
     this.database.exec(`
@@ -145,7 +156,13 @@ export class Room {
   }
 
   get online() { return [...this.players.values()].filter(player => player.socketId !== null).length; }
-  records() { return this.database.prepare('SELECT * FROM players ORDER BY best_score DESC, best_lines DESC, updated ASC').all() as unknown as PlayerRecord[]; }
+  records() {
+    this.flushScores();
+    return this.database.prepare('SELECT * FROM players ORDER BY best_score DESC, best_lines DESC, updated ASC').all() as unknown as PlayerRecord[];
+  }
+
+  // Compares digests so the check takes the same time for every key.
+  isAdminKey(key: string) { return this.adminDigest !== null && timingSafeEqual(digest(key), this.adminDigest); }
 
   get maintenanceStatus() {
     return {
@@ -179,6 +196,7 @@ export class Room {
   async reset(mode: RoomResetMode, confirmRoom: string, confirmationId?: string) {
     this.assertAvailable();
     if (confirmRoom !== this.code) throw new RequestError('Enter the current room code to confirm the reset.', 'validation');
+    this.flushScores();
     if (confirmationId !== undefined) {
       const preview = this.resetPreviews.get(confirmationId);
       this.resetPreviews.delete(confirmationId);
@@ -194,6 +212,7 @@ export class Room {
       await assertIdle();
       const result = await resetRoom({ databasePath: path.join(this.config.dataDirectory, 'tokenfall.sqlite'), mode, apply: true, confirmRoom, assertIdle });
       this.players.clear();
+      this.pendingScores.clear();
       this.previewTimes.clear();
       this.resetPreviews.clear();
       return result;
@@ -202,6 +221,11 @@ export class Room {
 
   save(player: Player) {
     this.assertAvailable(player);
+    this.pendingScores.delete(player);
+    this.write(player);
+  }
+
+  private write(player: Player) {
     player.record.metrics = JSON.stringify(player.metrics);
     const record = player.record;
     this.database.prepare(`INSERT INTO players (id, token_hash, name, name_key, best_score, best_lines, best_level, metrics, attempts, updated, token_text, token_limit)
@@ -211,10 +235,26 @@ export class Room {
       .run(record.id, record.token_hash, record.name, record.name_key, record.best_score, record.best_lines, record.best_level, record.metrics, record.attempts, record.updated, record.token_text, record.token_limit);
   }
 
-  totals() {
+  flushScores() {
+    if (!this.pendingScores.size || this.resetting || !this.database.isOpen) return;
+    const players = [...this.pendingScores].filter(player => this.players.get(player.record.id) === player);
+    this.pendingScores.clear();
+    if (!players.length) return;
+    try {
+      this.database.exec('BEGIN IMMEDIATE');
+      for (const player of players) this.write(player);
+      this.database.exec('COMMIT');
+    } catch (error) {
+      if (this.database.isTransaction) this.database.exec('ROLLBACK');
+      for (const player of players) if (this.players.get(player.record.id) === player) this.pendingScores.add(player);
+      throw error;
+    }
+  }
+
+  totals(records = this.records()) {
     const metrics = emptyMetrics();
     let attempts = 0;
-    for (const record of this.records()) {
+    for (const record of records) {
       const saved = JSON.parse(record.metrics) as Metrics;
       for (const key of Object.keys(metrics) as (keyof Metrics)[]) metrics[key] += saved[key] ?? 0;
       attempts += record.attempts;
@@ -227,7 +267,7 @@ export class Room {
     catch { throw new RequestError('Use 1 to 500 characters and at most 256 tokens.', 'token-setup'); }
   }
 
-  join(name: string, code: string, token: string | undefined, socketId: string, text?: string, classic = false): JoinResult {
+  join(name: string, code: string, token: string | undefined, socketId: string, text?: string, classic = false, admin = false): JoinResult {
     this.assertAvailable();
     if (code !== this.code) throw new RequestError('That room code is not active.', 'room');
     if (classic && text !== undefined) throw new RequestError('Classic games do not use token text.', 'validation');
@@ -246,12 +286,12 @@ export class Room {
     if (token && !record) throw new RequestError('Your previous session expired. Join again.', 'session');
     let player = record ? this.players.get(record.id) : undefined;
     if (player?.socketId && player.socketId !== socketId) throw new RequestError('This player is already playing in another tab.', 'session-active');
-    if (!player?.socketId && this.online >= 50) throw new RequestError('The room has 50 players. A spot opens when someone leaves.', 'full');
+    if (!admin && !player?.socketId && this.online >= this.capacity) throw new RequestError(`The room has ${this.capacity} players. A spot opens when someone leaves.`, 'full');
     const tokenText = token ? (classic ? '' : undefined) : text ?? '';
     const currentText = player?.record.token_text ?? record?.token_text;
     const game = tokenText !== undefined && (!player || tokenText !== currentText) ? this.gameFor(tokenText) : undefined;
     if (!record) {
-      if (this.registrationCount() >= 500 && !this.reclaimRegistration()) throw new RequestError('This workshop has reached its registration limit.', 'full');
+      if (this.registrationCount() >= this.registrationLimit && !this.reclaimRegistration() && !admin) throw new RequestError('This workshop has reached its registration limit.', 'full');
       record = { id: randomUUID(), token_hash: tokenHash, name, name_key: key, best_score: 0, best_lines: 0, best_level: 1, metrics: JSON.stringify(emptyMetrics()), attempts: 0, updated: now, token_text: tokenText ?? '', token_limit: DEFAULT_TOKEN_ALLOWANCE };
     }
     if (!player) {
@@ -270,7 +310,7 @@ export class Room {
     player.socketId = socketId;
     player.lastSeen = now;
     this.save(player);
-    return this.joinResult(player, sessionToken);
+    return { ...this.joinResult(player, sessionToken), ...(admin ? { admin: true as const } : {}) };
   }
 
   private registrationCount() { return Number(this.database.prepare('SELECT COUNT(*) AS count FROM players').get()!.count); }
@@ -343,7 +383,7 @@ export class Room {
       player.record.best_lines = player.game.lines;
       player.record.best_level = player.game.level;
       player.record.updated = now;
-      this.save(player);
+      this.pendingScores.add(player);
     }
     return this.ack(player);
   }
@@ -449,8 +489,9 @@ export class Room {
 
   view(): RoomView {
     const rates = this.pricing.snapshot?.usdPerMillion;
-    const totals = this.totals();
-    const entries: LeaderboardEntry[] = this.records().map(record => {
+    const records = this.records();
+    const totals = this.totals(records);
+    const entries: LeaderboardEntry[] = records.map(record => {
       const metrics: Metrics = { ...emptyMetrics(), ...JSON.parse(record.metrics) };
       // An in-flight request has not reported usage yet; only completed requests without usage leave spend incomplete.
       const unmeteredRequests = Math.max(0, record.attempts - metrics.requests - Number(this.pendingTokens.has(record.id)));
@@ -458,13 +499,13 @@ export class Room {
       return {
         id: record.id, name: record.name, score: record.best_score, costUsd, unmeteredRequests,
         challengeScore: costUsd !== null && unmeteredRequests === 0 ? pointsPerCent(record.best_score, costUsd) : null,
-        lines: record.best_lines, level: record.best_level, online: Boolean(this.players.get(record.id)?.socketId), metrics,
+        lines: record.best_lines, level: record.best_level, online: Boolean(this.players.get(record.id)?.socketId),
       };
     });
     const leaderboard = [...entries].sort((first, second) => (second.challengeScore ?? -1) - (first.challengeScore ?? -1) || second.score - first.score || second.lines - first.lines).slice(0, 50);
     const pointsLeaderboard = entries.sort((first, second) => second.score - first.score || second.lines - first.lines).slice(0, 50);
     return {
-      code: this.code, online: this.online, capacity: 50, leaderboard, pointsLeaderboard, metrics: totals.metrics,
+      code: this.code, online: this.online, capacity: this.capacity, leaderboard, pointsLeaderboard, metrics: totals.metrics,
       joinUrl: this.publicUrl(), model: this.config.deployment, prefixTokens: PREFIX_TOKENS,
       tokenBudget: ROOM_TOKEN_BUDGET, playerTokenBudget: DEFAULT_TOKEN_ALLOWANCE,
       allowance: this.roomAllowance(totals), requestsRemaining: Math.max(0, ROOM_REQUEST_LIMIT - totals.attempts),
@@ -474,7 +515,10 @@ export class Room {
     };
   }
 
-  close() { this.database.close(); }
+  close() {
+    try { this.flushScores(); }
+    finally { this.database.close(); }
+  }
 }
 
 export { AI_COOLDOWN_MS };

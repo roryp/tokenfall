@@ -1054,6 +1054,7 @@ test('room maintenance scores-only resets both tabs and keeps identities and rep
   await dialog.getByRole('radio', { name: 'Scores only', exact: true }).check();
   await dialog.getByTestId('reset-preview').waitFor();
   await dialog.getByRole('textbox', { name: 'Confirm room code', exact: true }).fill(application.room.code);
+  await page.waitForFunction(() => document.querySelector('[data-testid="reset-active-games"]')?.textContent === '1');
   assert.equal(await dialog.getByRole('button', { name: 'Reset scores', exact: true }).isEnabled(), false);
   await other.getByRole('button', { name: 'Pause game', exact: true }).click();
   await page.waitForFunction(() => document.querySelector('[data-testid="reset-active-games"]')?.textContent === '0');
@@ -1510,13 +1511,13 @@ test('shared leaderboard joins independent players, updates scores, pages all en
   await second.getByRole('button', { name: 'Pause game', exact: true }).click();
   await page.getByRole('button', { name: 'Show my ranking', exact: true }).click();
   await page.waitForFunction(id => Number(document.querySelector(`[data-player-id="${id}"] .rank-score strong`)?.textContent?.replaceAll(',', '')) > 0, guest.record.id);
-  assert.equal(await page.locator('.room-heading small').innerText(), '2/50 online');
+  assert.equal(await page.locator('.room-heading small').innerText(), `2/${application.room.capacity} online`);
   const guestRow = page.locator(`[data-player-id="${guest.record.id}"]`);
   assert.equal(numeric(await guestRow.locator('.rank-score strong').innerText()), guest.record.best_score);
   assert.equal(await guestRow.getByTitle('Online', { exact: true }).count(), 1);
   await secondContext.close();
   await guestRow.getByTitle('Offline', { exact: true }).waitFor();
-  assert.equal(await page.locator('.room-heading small').innerText(), '1/50 online');
+  assert.equal(await page.locator('.room-heading small').innerText(), `1/${application.room.capacity} online`);
   assert.equal(setup.calls.length, 0);
   assert.deepEqual(setup.errors, []);
 });
@@ -1746,7 +1747,8 @@ test('expired sessions and full rooms recover without silent joins or leaking se
   await page.getByRole('textbox', { name: 'Name', exact: true }).waitFor();
   assert.equal(application.room.players.size, 0);
   await page.getByRole('button', { name: 'Dismiss message', exact: true }).click();
-  for (let index = 0; index < 50; index += 1) application.room.join(`Guest ${index}`, application.room.code, undefined, `full-${index}`);
+  const capacity = application.room.capacity;
+  for (let index = 0; index < capacity; index += 1) application.room.join(`Guest ${index}`, application.room.code, undefined, `full-${index}`);
   await page.getByText('Room full. Waiting for a free spot.', { exact: true }).waitFor();
   await page.getByRole('textbox', { name: 'Name', exact: true }).fill('New Player');
   await page.getByRole('textbox', { name: 'Your sentence', exact: true }).fill('Private sentence is not public room data.');
@@ -1754,7 +1756,7 @@ test('expired sessions and full rooms recover without silent joins or leaking se
   application.room.disconnect('full-0');
   await page.getByRole('button', { name: 'Join game', exact: true }).click();
   await page.locator('.tetris-app[data-playing="true"]').waitFor();
-  assert.equal(application.room.online, 50);
+  assert.equal(application.room.online, capacity);
   const published = await page.request.get(new URL('/api/room', page.url()).href);
   const publicData = await published.text();
   assert.equal(publicData.includes('Private sentence'), false);
@@ -1762,6 +1764,60 @@ test('expired sessions and full rooms recover without silent joins or leaking se
   assert.equal(publicData.includes('tokenText'), false);
   assert.equal(setup.calls.length, 0);
   assert.deepEqual(setup.errors, []);
+});
+
+test('an admin link joins a full room without staying in the address bar, and a rejected key is forgotten', async context => {
+  const dataDirectory = mkdtempSync(path.join(os.tmpdir(), 'tetris-ui-'));
+  const adminKey = 'Tokenfall-UI-admin-key-0123456789abcdef';
+  const application = createApplication({ port: 0, endpoint: 'https://fixture.invalid', deployment: 'gpt-5.6-luna', tenantId: 'fixture', dataDirectory, roomCapacity: 1, adminKey }, { complete: async () => { throw new Error('This test makes no model calls.'); } });
+  await new Promise<void>(resolve => application.server.listen(0, '127.0.0.1', resolve));
+  const origin = `http://127.0.0.1:${(application.server.address() as { port: number }).port}`;
+  const browserContext = await browser.newContext({ viewport: { width: 1366, height: 768 }, deviceScaleFactor: 1 });
+  context.after(async () => { await browserContext.close(); await application.close(); rmSync(dataDirectory, { recursive: true, force: true }); });
+  const errors: string[] = [];
+  const open = async (url: string) => {
+    const page = await browserContext.newPage();
+    page.setDefaultTimeout(8000);
+    page.on('pageerror', error => errors.push(error.message));
+    await page.goto(url);
+    return page;
+  };
+  const fillJoin = async (page: Page, name: string) => {
+    await page.getByRole('textbox', { name: 'Name', exact: true }).fill(name);
+    await page.getByRole('radio', { name: 'Classic', exact: true }).check();
+  };
+  application.room.join('Seated Player', application.room.code, undefined, 'seated');
+  const page = await open(`${origin}/?room=${application.room.code}`);
+  await page.getByText('Room full. Waiting for a free spot.', { exact: true }).waitFor();
+  await fillJoin(page, 'Host');
+  assert.equal(await page.getByRole('button', { name: 'Join game', exact: true }).isEnabled(), false);
+  await page.evaluate(key => { window.location.hash = `admin=${encodeURIComponent(key)}`; }, adminKey);
+  await page.getByText('Room full. Admin access lets you join.', { exact: true }).waitFor();
+  assert.equal(await page.evaluate(() => window.location.hash), '');
+  assert.equal(await page.evaluate(() => localStorage.getItem('tokenfall-admin-key')), adminKey);
+  await page.getByRole('button', { name: 'Join game', exact: true }).click();
+  await page.locator('.tetris-app[data-playing="true"]').waitFor();
+  await page.getByTestId('admin-badge').waitFor();
+  assert.equal(application.room.online, 2);
+  await page.locator('.room-heading small').filter({ hasText: '2/1 online' }).waitFor();
+  await page.getByRole('button', { name: 'Share game', exact: true }).click();
+  const invite = await page.getByRole('textbox', { name: 'Game invite link', exact: true }).inputValue();
+  assert.equal(invite.includes(adminKey) || invite.includes('admin'), false);
+  await page.getByRole('button', { name: 'Close join QR code', exact: true }).click();
+
+  const remembered = await open(`${origin}/`);
+  await remembered.getByText('Room full. Admin access lets you join.', { exact: true }).waitFor();
+  await remembered.close();
+  const rejected = await open(`${origin}/#admin=${'w'.repeat(40)}`);
+  assert.equal(await rejected.evaluate(() => window.location.hash), '');
+  await fillJoin(rejected, 'Impostor');
+  await rejected.getByRole('button', { name: 'Join game', exact: true }).click();
+  await rejected.getByRole('alert').filter({ hasText: 'Admin key not recognized, so this browser forgot it.' }).waitFor();
+  assert.equal(await rejected.evaluate(() => localStorage.getItem('tokenfall-admin-key')), null);
+  await rejected.getByText('Room full. Waiting for a free spot.', { exact: true }).waitFor();
+  assert.equal(await rejected.getByRole('button', { name: 'Join game', exact: true }).isEnabled(), false);
+  assert.equal(application.room.online, 2);
+  assert.deepEqual(errors, []);
 });
 
 test('sentence editor shows server failures in the dialog and can retry without losing the run', async context => {

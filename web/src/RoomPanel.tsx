@@ -172,6 +172,7 @@ export function RoomPanel({ game, rankingsOpen, onCloseRankings, onReturn }: { g
   const [page, setPage] = useState(0);
   const rankingsDialog = useRef<HTMLDialogElement | null>(null);
   const room = game.room;
+  const full = room !== null && room.online >= room.capacity;
   const entries = (ranking === 'points' ? room?.pointsLeaderboard : room?.leaderboard?.filter(entry => entry.challengeScore !== null)) ?? [];
   const pageCount = Math.max(1, Math.ceil(entries.length / 10));
   const currentPage = Math.min(page, pageCount - 1);
@@ -197,15 +198,19 @@ export function RoomPanel({ game, rankingsOpen, onCloseRankings, onReturn }: { g
       {game.joined && <div className="own-rank"><span>Your position <b data-testid="own-rank">{ownIndex >= 0 ? `#${ownIndex + 1}` : ranking === 'points' ? 'Outside top 50' : 'Unranked'}</b></span><button className="icon-button" aria-label="Show my ranking" title="Show my ranking" disabled={ownIndex < 0} onClick={() => setPage(Math.floor(ownIndex / 10))}><LocateFixed size={18} /></button></div>}
     </section>;
   return <aside className="room-panel" aria-label="Game room">
-    <header className="room-heading"><div><span>ROOM <b data-testid="room-code">{room?.code ?? '------'}</b></span><small><Users size={14} />{game.connected ? `${room?.online ?? 0}/${room?.capacity ?? 50} online` : 'Reconnecting'}</small></div>{game.joined && <button className="icon-button" aria-label="Back to game" title="Back to game" onClick={onReturn}><ArrowUp size={19} /></button>}</header>
+    <header className="room-heading"><div><span>ROOM <b data-testid="room-code">{room?.code ?? '------'}</b></span><small><Users size={14} />{game.connected ? `${room?.online ?? 0}/${room?.capacity ?? '--'} online` : 'Reconnecting'}</small></div>{game.joined && <button className="icon-button" aria-label="Back to game" title="Back to game" onClick={onReturn}><ArrowUp size={19} /></button>}</header>
     <div className="allowance-strip" aria-label="AI allowance balances">
       {game.joined && <span>Personal <b data-testid="personal-tokens-left">{game.allowance ? reportedTokenBalance(game.allowance).toLocaleString() : '--'}</b> / <b data-testid="ai-token-limit">{game.allowance?.limit.toLocaleString() ?? '--'}</b></span>}<span>Room <b data-testid="room-tokens-left">{room?.allowance ? reportedTokenBalance(room.allowance).toLocaleString() : '--'}</b> tokens left</span><span><b data-testid="room-requests-left">{room?.requestsRemaining?.toLocaleString() ?? '--'}</b> room requests left</span>
       {game.joined && <span>Available now <b data-testid="available-tokens-now">{game.allowance && room?.allowance ? Math.min(game.allowance.remaining, room.allowance.remaining).toLocaleString() : '--'}</b></span>}
       {(game.busy || (game.allowance?.reserved ?? 0) > 0) && <span data-testid="allowance-reserved">{game.allowance?.reserved ? `${game.allowance.reserved.toLocaleString()} held for current request` : 'Reservation pending'}</span>}
       {(game.allowance?.unconfirmed ?? 0) > 0 && <span data-testid="allowance-unconfirmed">{game.allowance!.unconfirmed.toLocaleString()} held / usage unconfirmed</span>}
     </div>
-    {!game.joined ? game.sessionName ? <div className="returning-player"><h2>{game.sessionName}</h2><button className="primary-button" disabled={!game.connected || game.joining} onClick={() => game.join()}><Play size={18} />{game.joining ? 'Reconnecting...' : 'Rejoin game'}</button></div> : <GameSetup disabled={!game.connected || !room || room.online >= room.capacity} pending={game.joining} onSubmit={game.join} /> : <div className="player-summary"><div><strong data-testid="player-name">{game.player?.name}</strong><p title={game.player?.tokenText}>{game.player?.tokenText || 'Classic pieces'}</p></div></div>}
-    {!game.joined && room && room.online >= room.capacity && <p className="field-error" role="status">Room full. Waiting for a free spot.</p>}
+    <div className="room-entry">
+      {!game.joined ? game.sessionName ? <div className="returning-player"><h2>{game.sessionName}</h2><button className="primary-button" disabled={!game.connected || game.joining} onClick={() => game.join()}><Play size={18} />{game.joining ? 'Reconnecting...' : 'Rejoin game'}</button></div> : <GameSetup disabled={!game.connected || !room || (full && !game.adminAccess)} pending={game.joining} onSubmit={game.join} /> : <div className="player-summary"><div><strong data-testid="player-name">{game.player?.name}</strong>{game.player?.admin && <small className="admin-badge" data-testid="admin-badge">Admin</small>}<p title={game.player?.tokenText}>{game.player?.tokenText || 'Classic pieces'}</p></div></div>}
+      {!game.joined && room && (full
+        ? <p className={game.adminAccess ? 'admin-note' : 'field-error'} role="status">{game.adminAccess ? 'Room full. Admin access lets you join.' : 'Room full. Waiting for a free spot.'}</p>
+        : game.adminAccess && <p className="admin-note" role="status">Admin access is on for this browser.</p>)}
+    </div>
     {!rankingsOpen && leaderboard}
     <dialog className="prompt-dialog leaderboard-dialog" ref={rankingsDialog} aria-labelledby={`${id}-scores`} onClose={onCloseRankings}>{rankingsOpen && leaderboard}</dialog>
   </aside>;

@@ -10,6 +10,9 @@ param principalId string
 @description('Luna GlobalStandard capacity: thousands of tokens per minute, which also sets requests per minute.')
 param modelCapacity int = 6950
 param webImage string = ''
+@secure()
+@description('Optional key that lets the event host join a full room. Empty disables admin access.')
+param adminKey string = ''
 
 resource resourceGroup 'Microsoft.Resources/resourceGroups@2024-03-01' = {
   name: 'rg-${environmentName}'
@@ -51,6 +54,7 @@ module hosting './hosting.bicep' = {
     logAnalyticsWorkspaceName: monitoring.outputs.logAnalyticsWorkspaceName
     appInsightsName: monitoring.outputs.appInsightsName
     image: webImage
+    adminKey: adminKey
   }
 }
 

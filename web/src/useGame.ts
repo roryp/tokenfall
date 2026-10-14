@@ -10,6 +10,7 @@ import type { AiOptions, ClientEvents, Insight, InputAck, InputBatch, JoinResult
 type GameSocket = Socket<ServerEvents, ClientEvents>;
 interface Session { token: string; name: string; room: string }
 export interface RequestRecord { number: number; receivedAt: string; insight: Insight }
+const ADMIN_KEY_STORAGE = 'tokenfall-admin-key';
 
 function savedSession(): Session | null {
   try {
@@ -26,12 +27,30 @@ function savedOptions(): AiOptions {
   return { cache: false, compression: false, reasoning: false, mcp: false };
 }
 
+// Admin links carry the key in the URL fragment, which browsers never send to the server. The key is kept for this
+// browser and removed from the address bar as soon as the script loads; an empty `#admin=` forgets it.
+let linkedAdminKey: string | null = null;
+function captureAdminLink() {
+  const link = /(?:^#|&)admin=([^&]*)/.exec(window.location.hash);
+  if (!link) return;
+  window.history.replaceState(window.history.state, '', `${window.location.pathname}${window.location.search}`);
+  try { linkedAdminKey = decodeURIComponent(link[1]).trim() || null; } catch { linkedAdminKey = null; }
+  try { if (linkedAdminKey) localStorage.setItem(ADMIN_KEY_STORAGE, linkedAdminKey); else localStorage.removeItem(ADMIN_KEY_STORAGE); } catch { return; }
+}
+captureAdminLink();
+
+function savedAdminKey(): string | null {
+  captureAdminLink();
+  try { return localStorage.getItem(ADMIN_KEY_STORAGE) || null; } catch { return linkedAdminKey; }
+}
+
 export function useGame() {
   const [room, setRoom] = useState<RoomView | null>(null);
   const [connected, setConnected] = useState(false);
   const [joined, setJoined] = useState(false);
   const [joining, setJoining] = useState(false);
-  const [player, setPlayer] = useState<{ id: string; name: string; tokenText: string } | null>(null);
+  const [player, setPlayer] = useState<{ id: string; name: string; tokenText: string; admin: boolean } | null>(null);
+  const [adminKey, setAdminKey] = useState(savedAdminKey);
   const [sessionName, setSessionName] = useState<string>();
   const [unmeteredRequests, setUnmeteredRequests] = useState(0);
   const [view, setView] = useState<GameView>(() => new Game('preview').view());
@@ -73,6 +92,12 @@ export function useGame() {
   useEffect(() => {
     try { sessionStorage.setItem('tetris-luna-options', JSON.stringify(options)); } catch { return; }
   }, [options]);
+
+  useEffect(() => {
+    const capture = () => { if (/(?:^#|&)admin=/.test(window.location.hash)) setAdminKey(savedAdminKey()); };
+    window.addEventListener('hashchange', capture);
+    return () => window.removeEventListener('hashchange', capture);
+  }, []);
 
   function refresh() { if (game.current) setView(game.current.view()); }
 
@@ -184,7 +209,7 @@ export function useGame() {
     sending.current = null;
     active.current = true;
     joiningRef.current = false;
-    setPlayer({ id: data.playerId, name: data.name, tokenText: data.tokenText });
+    setPlayer({ id: data.playerId, name: data.name, tokenText: data.tokenText, admin: data.admin === true });
     setSessionName(data.name);
     setUnmeteredRequests(data.unmeteredRequests);
     setMetrics(data.metrics);
@@ -197,6 +222,11 @@ export function useGame() {
     refresh();
   }
 
+  function forgetAdminKey() {
+    setAdminKey(null);
+    try { localStorage.removeItem(ADMIN_KEY_STORAGE); } catch { return; }
+  }
+
   function join(setup?: { name: string; text?: string }) {
     if (!roomRef.current || !socket.current?.connected || active.current || joiningRef.current) return;
     const code = roomRef.current.code;
@@ -207,12 +237,16 @@ export function useGame() {
     setJoining(true);
     setNotice('');
     const name = previous?.name ?? setup!.name.trim();
-    socket.current.timeout(8000).emit('join', { name, room: code, ...(previous ? { token: previous.token } : { ...(setup?.text !== undefined ? { text: setup.text } : {}) }) }, (error: Error | null, reply: Reply<JoinResult>) => {
+    socket.current.timeout(8000).emit('join', { name, room: code, ...(previous ? { token: previous.token } : { ...(setup?.text !== undefined ? { text: setup.text } : {}) }), ...(adminKey ? { adminKey } : {}) }, (error: Error | null, reply: Reply<JoinResult>) => {
       joiningRef.current = false;
       setJoining(false);
       if (error || !reply.ok) {
         joinFailed.current = true;
         setNotice(!error && !reply.ok ? reply.error : 'Could not connect. Join again to retry.');
+        if (!error && !reply.ok && reply.code === 'admin') {
+          forgetAdminKey();
+          setNotice('Admin key not recognized, so this browser forgot it. Join again to play without admin access.');
+        }
         if (!error && !reply.ok && reply.code === 'session') {
           clearRoomSession('all');
           joinFailed.current = false;
@@ -462,5 +496,5 @@ export function useGame() {
 
   const rates = room?.pricing.snapshot?.usdPerMillion;
   const cost = rates ? costForUsage(metrics, rates) : null;
-  return { room, connected, joined, joining, player, sessionName, view, metrics, allowance, insight, requestHistory, cost, busy, notice, setNotice, options, setOptions, autopilot, autopilotStatus, inspectionPaused, pauseForInspection, resumeAfterInspection, prepareMaintenance, resetVersion, retryAutopilot, toggleAutopilot, requestOptions, unmeteredRequests, join, act, restart };
+  return { room, connected, joined, joining, player, sessionName, adminAccess: adminKey !== null, view, metrics, allowance, insight, requestHistory, cost, busy, notice, setNotice, options, setOptions, autopilot, autopilotStatus, inspectionPaused, pauseForInspection, resumeAfterInspection, prepareMaintenance, resetVersion, retryAutopilot, toggleAutopilot, requestOptions, unmeteredRequests, join, act, restart };
 }

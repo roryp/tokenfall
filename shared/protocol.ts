@@ -147,7 +147,6 @@ export interface LeaderboardEntry {
   lines: number;
   level: number;
   online: boolean;
-  metrics: Metrics;
 }
 export type RoomResetMode = 'all' | 'scores';
 export interface RoomMaintenanceStatus { online: number; activeGames: number; pendingRequests: number; resetting: boolean }
@@ -200,6 +199,7 @@ export interface JoinResult extends PlayerUsage {
   replay: Replay;
   name: string;
   tokenText: string;
+  admin?: true;
 }
 export interface InputBatch { runId: string; sequence: number; frame: number; events: InputEvent[] }
 export interface InputAck { sequence: number; score: number; lines: number; pieceId: number; frame: number }
@@ -212,7 +212,7 @@ export interface ServerEvents {
   roomReset: (reset: { id: string; mode: RoomResetMode }) => void;
 }
 export interface ClientEvents {
-  join: (data: { name: string; room: string; token?: string; text?: string; classic?: boolean }, reply: (result: Reply<JoinResult>) => void) => void;
+  join: (data: { name: string; room: string; token?: string; text?: string; classic?: boolean; adminKey?: string }, reply: (result: Reply<JoinResult>) => void) => void;
   inputs: (data: InputBatch, reply: (result: Reply<InputAck>) => void) => void;
   restart: (reply: (result: Reply<JoinResult>) => void) => void;
   configure: (data: { text: string }, reply: (result: Reply<JoinResult>) => void) => void;

@@ -7,6 +7,9 @@ param openAIDeployment string
 param logAnalyticsWorkspaceName string
 param appInsightsName string
 param image string = ''
+@secure()
+@description('Optional key that lets the event host join a full room. Empty disables admin access.')
+param adminKey string = ''
 
 var resourceToken = uniqueString(subscription().id, resourceGroup().id, location, environmentName)
 var appName = 'azapp${resourceToken}'
@@ -178,6 +181,9 @@ resource app 'Microsoft.App/containerApps@2026-01-01' = {
       registries: [
         { server: registry.properties.loginServer, identity: identity.id }
       ]
+      secrets: empty(adminKey) ? [] : [
+        { name: 'admin-key', value: adminKey }
+      ]
     }
     template: {
       containers: [
@@ -185,7 +191,7 @@ resource app 'Microsoft.App/containerApps@2026-01-01' = {
           name: 'web'
           image: empty(image) ? 'mcr.microsoft.com/azuredocs/containerapps-helloworld:latest' : image
           resources: { cpu: json('2'), memory: '4Gi' }
-          env: [
+          env: concat([
             { name: 'NODE_ENV', value: 'production' }
             { name: 'HOST', value: '0.0.0.0' }
             { name: 'PORT', value: '3100' }
@@ -199,7 +205,9 @@ resource app 'Microsoft.App/containerApps@2026-01-01' = {
             { name: 'PUBLIC_BASE_URL', value: publicUrl }
             { name: 'TRUST_PROXY_HOPS', value: '1' }
             { name: 'APPLICATIONINSIGHTS_CONNECTION_STRING', value: appInsights.properties.ConnectionString }
-          ]
+          ], empty(adminKey) ? [] : [
+            { name: 'ADMIN_KEY', secretRef: 'admin-key' }
+          ])
           volumeMounts: [
             { volumeName: 'state', mountPath: '/data' }
           ]

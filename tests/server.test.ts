@@ -13,11 +13,11 @@ import { TETROMINOES } from 'miaoda-game-fallblock-core';
 import { boardMetrics, Game, placementsFor } from '../shared/game.ts';
 import { costForUsage, DEFAULT_TOKEN_ALLOWANCE, emptyMetrics, reportedTokenBalance, tokenAllowance, tokenCreditsUsed } from '../shared/protocol.ts';
 import type { Insight, JoinResult, Reply, RoomView, TokenPricing } from '../shared/protocol.ts';
-import { clientAddress, createApplication, SOCKET_EVENT_BURST, trustedProxy } from '../server/app.ts';
-import { loadConfig } from '../server/config.ts';
+import { clientAddress, createApplication, JOINS_PER_SEAT_PER_MINUTE, SOCKET_EVENT_BURST, TOKENIZE_REQUESTS_PER_SEAT_PER_MINUTE, trustedProxy } from '../server/app.ts';
+import { DEFAULT_ROOM_CAPACITY, loadConfig, MIN_ADMIN_KEY_LENGTH } from '../server/config.ts';
 import { AI_COOLDOWN_MS, AUTOPILOT_COOLDOWN_MS, BASE_ROOM_LIMITS, deploymentLimits, EVALUATION_INTERVAL_MS, LunaGateway, MAX_MCP_IN_FLIGHT, MAX_OUTPUT_TOKENS, MAX_REASONING_COMPLETION_TOKENS, ModelGate, PLAYER_REQUEST_LIMIT, PLAYER_TOKEN_BUDGET, POLICY, PREFIX_TOKENS, ROOM_EVALUATIONS_PER_SECOND, ROOM_REQUEST_LIMIT, ROOM_TOKEN_BUDGET, roomLimits } from '../server/model.ts';
 import type { ModelGateway } from '../server/model.ts';
-import { Room } from '../server/room.ts';
+import { MIN_REGISTRATION_LIMIT, Room } from '../server/room.ts';
 import { buildPrompts, countTokens, gameTokens } from '../server/tokens.ts';
 import { lookaheadSnapshot, lookupBoardFacts, lookupFutureMoves, McpLookupError, MAX_MCP_CONTEXT_TOKENS } from '../server/mcp.ts';
 import { analyzeFutureMoves, boardFactsSchema, lookaheadOutputSchema } from '../server/mcp-server.ts';
@@ -192,6 +192,49 @@ for (const mode of ['all', 'scores'] as const) test(`in-app room reset ${mode} c
       assert.equal(rejoined.metrics.requests, 1);
     }
   } finally { room.close(); rmSync(setup.dataDirectory, { recursive: true, force: true }); }
+});
+
+test('new best scores are committed together on the next room read and on close', () => {
+  const setup = fixture();
+  let room = new Room(setup.config, setup.gateway);
+  try {
+    const joined = room.join('Batch Player', room.code, undefined, 'batch');
+    const player = room.playerFor('batch');
+    const stored = () => Number(room.database.prepare('SELECT best_score FROM players WHERE id = ?').get(joined.playerId)!.best_score);
+    const drop = (sequence: number) => room.inputs(player, { runId: joined.runId, sequence, frame: sequence, events: [{ frame: sequence - 1, action: 'hardDrop' }] }, player.started + 1000);
+    drop(1);
+    const first = player.record.best_score;
+    assert.ok(first > 0);
+    assert.equal(stored(), 0);
+    assert.equal(room.view().pointsLeaderboard[0].score, first);
+    assert.equal(stored(), first);
+    drop(2);
+    const best = player.record.best_score;
+    assert.ok(best > first);
+    assert.equal(stored(), first);
+    room.close();
+    room = new Room(setup.config, setup.gateway);
+    assert.equal(room.records()[0].best_score, best);
+  } finally { if (room.database.isOpen) room.close(); rmSync(setup.dataDirectory, { recursive: true, force: true }); }
+});
+
+for (const mode of ['all', 'scores'] as const) test(`in-app room reset ${mode} commits pending best scores to its backup and never restores them`, async () => {
+  const setup = fixture();
+  let room = new Room(setup.config, setup.gateway);
+  try {
+    const joined = room.join('Pending Player', room.code, undefined, 'pending');
+    const player = room.playerFor('pending');
+    room.inputs(player, { runId: joined.runId, sequence: 1, frame: 1, events: [{ frame: 0, action: 'hardDrop' }, { frame: 1, action: 'pause' }] }, player.started + 1000);
+    const best = player.record.best_score;
+    assert.ok(best > 0);
+    const result = await room.reset(mode, room.code);
+    const backup = new DatabaseSync(result.backupPath!, { readOnly: true });
+    try { assert.equal(backup.prepare('SELECT best_score FROM players').get()!.best_score, best); }
+    finally { backup.close(); }
+    room.close();
+    room = new Room(setup.config, setup.gateway);
+    assert.deepEqual(room.records().map(record => record.best_score), mode === 'all' ? [] : [0]);
+  } finally { if (room.database.isOpen) room.close(); rmSync(setup.dataDirectory, { recursive: true, force: true }); }
 });
 
 test('in-app room reset refuses active games and pending Luna requests and releases its lock', async () => {
@@ -856,6 +899,12 @@ test('container settings enable external binding and managed identity without ch
   assert.throws(() => loadConfig({ ...settings, TRUST_PROXY_HOPS: 'all' }));
   assert.throws(() => loadConfig({ ...settings, SQLITE_JOURNAL_MODE: 'invalid' }));
   assert.throws(() => loadConfig({ ...settings, HOST: 'invalid' }));
+  assert.equal(loadConfig({ ...settings, ROOM_CAPACITY: '' }).roomCapacity, DEFAULT_ROOM_CAPACITY);
+  assert.equal(loadConfig({ ...settings, ROOM_CAPACITY: '400' }).roomCapacity, 400);
+  for (const roomCapacity of ['0', '501', '2.5', 'many']) assert.throws(() => loadConfig({ ...settings, ROOM_CAPACITY: roomCapacity }), /ROOM_CAPACITY/);
+  assert.equal(loadConfig({ ...settings, ADMIN_KEY: '' }).adminKey, undefined);
+  assert.equal(loadConfig({ ...settings, ADMIN_KEY: 'a'.repeat(MIN_ADMIN_KEY_LENGTH) }).adminKey, 'a'.repeat(MIN_ADMIN_KEY_LENGTH));
+  for (const adminKey of ['a'.repeat(MIN_ADMIN_KEY_LENGTH - 1), `${'a'.repeat(MIN_ADMIN_KEY_LENGTH)} b`, 'a'.repeat(257)]) assert.throws(() => loadConfig({ ...settings, ADMIN_KEY: adminKey }), /ADMIN_KEY/);
 });
 
 test('token setup is authoritative, private, replayable, and persistent without resetting spend', () => {
@@ -1237,7 +1286,7 @@ test('real priced usage determines the efficiency leaderboard while base scores 
     assert.ok(Math.abs(winner.costUsd! - 0.000154) < 1e-12);
     assert.ok(Math.abs(winner.challengeScore! - 100 * 0.01 / 0.000154) < 1e-6);
     assert.ok(winner.challengeScore! > room.view().leaderboard[1].challengeScore!);
-    assert.equal(tokenCreditsUsed(winner.metrics), 520);
+    assert.equal(tokenCreditsUsed(efficient.metrics), 520);
   } finally { room.close(); rmSync(setup.dataDirectory, { recursive: true, force: true }); }
 });
 
@@ -1364,18 +1413,49 @@ test('room verifies input replay, rejects speed-ups and ignores duplicate batche
   } finally { room.close(); rmSync(setup.dataDirectory, { recursive: true, force: true }); }
 });
 
-test('fifty players can join, one connection cannot claim multiple seats, and disconnect releases a seat', () => {
+test('a full room refuses new players until a seat is released, and one connection cannot claim multiple seats', () => {
   const setup = fixture();
   const room = new Room(setup.config, setup.gateway);
   try {
-    for (let index = 0; index < 50; index += 1) room.join(`Player ${index}`, room.code, undefined, `socket-${index}`);
-    assert.equal(room.online, 50);
-    assert.throws(() => room.join('Extra Player', room.code, undefined, 'socket-51'));
+    assert.equal(room.capacity, DEFAULT_ROOM_CAPACITY);
+    assert.equal(room.view().capacity, DEFAULT_ROOM_CAPACITY);
+    for (let index = 0; index < DEFAULT_ROOM_CAPACITY; index += 1) room.join(`Player ${index}`, room.code, undefined, `socket-${index}`);
+    assert.equal(room.online, DEFAULT_ROOM_CAPACITY);
+    assert.throws(() => room.join('Extra Player', room.code, undefined, 'socket-extra'), { code: 'full', message: `The room has ${DEFAULT_ROOM_CAPACITY} players. A spot opens when someone leaves.` });
     assert.throws(() => room.join('Duplicate', room.code, undefined, 'socket-0'));
     room.disconnect('socket-0');
-    room.join('New Player', room.code, undefined, 'socket-51');
-    assert.equal(room.online, 50);
+    room.join('New Player', room.code, undefined, 'socket-extra');
+    assert.equal(room.online, DEFAULT_ROOM_CAPACITY);
   } finally { room.close(); rmSync(setup.dataDirectory, { recursive: true, force: true }); }
+});
+
+test('admins join full rooms, and only a configured key matches', () => {
+  const setup = fixture();
+  const adminKey = 'k'.repeat(MIN_ADMIN_KEY_LENGTH);
+  const room = new Room({ ...setup.config, roomCapacity: 2, adminKey }, setup.gateway);
+  const unconfigured = new Room({ ...setup.config, dataDirectory: mkdtempSync(path.join(os.tmpdir(), 'tokenfall-test-')) }, setup.gateway);
+  try {
+    assert.equal(room.isAdminKey(adminKey), true);
+    assert.equal(room.isAdminKey(`${adminKey}x`), false);
+    assert.equal(room.isAdminKey(adminKey.slice(1)), false);
+    assert.equal(unconfigured.isAdminKey(adminKey), false);
+    assert.equal('admin' in room.join('Seat One', room.code, undefined, 'one'), false);
+    room.join('Seat Two', room.code, undefined, 'two');
+    assert.throws(() => room.join('Audience', room.code, undefined, 'audience'), { code: 'full', message: 'The room has 2 players. A spot opens when someone leaves.' });
+    const admin = room.join('Host', room.code, undefined, 'host', undefined, true, true);
+    assert.equal(admin.admin, true);
+    assert.equal(room.online, 3);
+    assert.equal(room.view().online, 3);
+    assert.equal(room.view().capacity, 2);
+    room.disconnect('host');
+    assert.equal(room.join('Host', room.code, admin.token, 'host-again', undefined, false, true).playerId, admin.playerId);
+    assert.throws(() => room.join('Audience', room.code, undefined, 'audience'), { code: 'full' });
+  } finally {
+    room.close();
+    unconfigured.close();
+    rmSync(setup.dataDirectory, { recursive: true, force: true });
+    rmSync(unconfigured.config.dataDirectory, { recursive: true, force: true });
+  }
 });
 
 test('a player name identifies one player across sessions, ignoring case and spacing', () => {
@@ -1485,6 +1565,7 @@ test('the registration cap recycles idle players without AI usage or a top-50 sc
   const setup = fixture();
   const room = new Room(setup.config, setup.gateway);
   try {
+    assert.equal(room.registrationLimit, MIN_REGISTRATION_LIMIT);
     for (let index = 0; index < 500; index += 1) {
       room.join(`Player ${index}`, room.code, undefined, `socket-${index}`);
       const player = room.playerFor(`socket-${index}`);
@@ -1503,7 +1584,16 @@ test('the registration cap recycles idle players without AI usage or a top-50 sc
     room.database.exec('UPDATE players SET attempts = 1');
     room.players.clear();
     assert.throws(() => room.join('Latecomer', room.code, undefined, 'latecomer'), /registration limit/);
+    assert.equal(room.join('Late Host', room.code, undefined, 'host', undefined, true, true).admin, true);
+    assert.equal(room.records().length, 501);
   } finally { room.close(); rmSync(setup.dataDirectory, { recursive: true, force: true }); }
+});
+
+test('larger rooms keep at least two registrations per seat', () => {
+  const setup = fixture();
+  const room = new Room({ ...setup.config, roomCapacity: 400 }, setup.gateway);
+  try { assert.equal(room.registrationLimit, 800); }
+  finally { room.close(); rmSync(setup.dataDirectory, { recursive: true, force: true }); }
 });
 
 test('verbose prompts cannot exceed the rolling token-throughput allowance', () => {
@@ -1656,7 +1746,7 @@ test('rate limits key on the forwarded client address only through trusted proxi
   assert.equal(clientAddress('100.100.0.2', 'spoofed, 198.51.100.7', trustedProxy(1)), '198.51.100.7');
   assert.equal(clientAddress('100.100.0.2', undefined, trustedProxy(1)), '100.100.0.2');
   const setup = fixture();
-  const application = createApplication({ ...setup.config, trustProxyHops: 1 }, setup.gateway);
+  const application = createApplication({ ...setup.config, trustProxyHops: 1, roomCapacity: 50 }, setup.gateway);
   await new Promise<void>(resolve => application.server.listen(0, '127.0.0.1', resolve));
   const address = application.server.address() as { port: number };
   const url = `http://127.0.0.1:${address.port}`;
@@ -1664,14 +1754,46 @@ test('rate limits key on the forwarded client address only through trusted proxi
   const clients = [socketFor('198.51.100.1'), socketFor('198.51.100.1'), socketFor('198.51.100.2')];
   try {
     await Promise.all(clients.map(client => new Promise<void>((resolve, reject) => { client.once('connect', resolve); client.once('connect_error', reject); })));
+    assert.equal(JOINS_PER_SEAT_PER_MINUTE * 50, 150);
     const attempts = await Promise.all(Array.from({ length: 151 }, (_, index) => clients[index % 2].timeout(5000).emitWithAck('join', { name: 'Blocked Name', room: 'WRONG0' }))) as Reply<unknown>[];
     assert.equal(attempts.filter(reply => !reply.ok && reply.code === 'rate').length, 1);
     const other = await clients[2].timeout(5000).emitWithAck('join', { name: 'Other Address', room: application.room.code }) as Reply<JoinResult>;
     assert.equal(other.ok, true);
     const tokenize = (client: string) => fetch(`${url}/api/tokenize`, { method: 'POST', headers: { 'Content-Type': 'application/json', 'X-Forwarded-For': client }, body: JSON.stringify({ text: 'hi' }) });
+    assert.equal(TOKENIZE_REQUESTS_PER_SEAT_PER_MINUTE * 50, 300);
     for (let request = 0; request < 300; request += 1) assert.equal((await tokenize('198.51.100.1')).status, 200);
     assert.equal((await tokenize('198.51.100.1')).status, 429);
     assert.equal((await tokenize('198.51.100.2')).status, 200);
+  } finally { clients.forEach(client => client.disconnect()); await application.close(); rmSync(setup.dataDirectory, { recursive: true, force: true }); }
+});
+
+test('an admin key joins a full room from a rate-limited venue address, while wrong keys are refused and counted', async () => {
+  const setup = fixture();
+  const adminKey = 'Tokenfall-admin-key-for-tests-0123456789';
+  const application = createApplication({ ...setup.config, trustProxyHops: 1, roomCapacity: 1, adminKey }, setup.gateway);
+  await new Promise<void>(resolve => application.server.listen(0, '127.0.0.1', resolve));
+  const address = application.server.address() as { port: number };
+  const venue = () => connect(`http://127.0.0.1:${address.port}`, { transports: ['websocket'], forceNew: true, extraHeaders: { 'X-Forwarded-For': '198.51.100.9' } });
+  const clients = [venue(), venue(), venue()];
+  const join = (client: typeof clients[number], data: { name: string; adminKey?: string }) => client.timeout(5000).emitWithAck('join', { room: application.room.code, ...data }) as Promise<Reply<JoinResult>>;
+  try {
+    await Promise.all(clients.map(client => new Promise<void>((resolve, reject) => { client.once('connect', resolve); client.once('connect_error', reject); })));
+    const first = await join(clients[0], { name: 'First Player' });
+    assert.ok(first.ok && first.data.admin === undefined);
+    const full = await join(clients[1], { name: 'Second Player' });
+    assert.ok(!full.ok && full.code === 'full');
+    assert.deepEqual(await join(clients[1], { name: 'Second Player', adminKey: 'x'.repeat(40) }), { ok: false, error: 'Admin key not recognized.', code: 'admin', retryAfterMs: 0 });
+    for (const data of [{ name: 'Second Player' }, { name: 'Second Player', adminKey: 'x'.repeat(40) }]) {
+      const limited = await join(clients[1], data);
+      assert.ok(!limited.ok && limited.code === 'rate');
+    }
+    const admin = await join(clients[2], { name: 'Host', adminKey });
+    assert.ok(admin.ok && admin.data.admin === true);
+    assert.equal(application.room.online, 2);
+    const view = await (await fetch(`http://127.0.0.1:${address.port}/api/room`)).json() as RoomView;
+    assert.equal(view.online, 2);
+    assert.equal(view.capacity, 1);
+    assert.equal(JSON.stringify(view).includes(adminKey), false);
   } finally { clients.forEach(client => client.disconnect()); await application.close(); rmSync(setup.dataDirectory, { recursive: true, force: true }); }
 });
 
