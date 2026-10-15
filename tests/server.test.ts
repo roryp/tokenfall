@@ -10,12 +10,13 @@ import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
 import { io as connect } from 'socket.io-client';
 import { TETROMINOES } from 'miaoda-game-fallblock-core';
+import OpenAI from 'openai';
 import { boardMetrics, Game, placementsFor } from '../shared/game.ts';
 import { costForUsage, DEFAULT_TOKEN_ALLOWANCE, emptyMetrics, reportedTokenBalance, tokenAllowance, tokenCreditsUsed } from '../shared/protocol.ts';
-import type { Insight, JoinResult, Reply, RoomView, TokenPricing } from '../shared/protocol.ts';
+import type { AiOptions, Insight, JoinResult, Reply, RoomView, TokenPricing } from '../shared/protocol.ts';
 import { clientAddress, createApplication, JOINS_PER_SEAT_PER_MINUTE, SOCKET_EVENT_BURST, TOKENIZE_REQUESTS_PER_SEAT_PER_MINUTE, trustedProxy } from '../server/app.ts';
 import { DEFAULT_ROOM_CAPACITY, loadConfig, MIN_ADMIN_KEY_LENGTH } from '../server/config.ts';
-import { AI_COOLDOWN_MS, AUTOPILOT_COOLDOWN_MS, BASE_ROOM_LIMITS, deploymentLimits, EVALUATION_INTERVAL_MS, LunaGateway, MAX_MCP_IN_FLIGHT, MAX_OUTPUT_TOKENS, MAX_REASONING_COMPLETION_TOKENS, ModelGate, PLAYER_REQUEST_LIMIT, PLAYER_TOKEN_BUDGET, POLICY, PREFIX_TOKENS, ROOM_EVALUATIONS_PER_SECOND, ROOM_REQUEST_LIMIT, ROOM_TOKEN_BUDGET, roomLimits } from '../server/model.ts';
+import { AI_COOLDOWN_MS, AUTOPILOT_COOLDOWN_MS, BASE_ROOM_LIMITS, deploymentLimits, EVALUATION_INTERVAL_MS, LUNA_ATTEMPT_TIMEOUT_MS, LUNA_REASONING_ATTEMPT_TIMEOUT_MS, LUNA_RETRY_DELAY_MS, LunaGateway, MAX_MCP_IN_FLIGHT, MAX_OUTPUT_TOKENS, MAX_REASONING_COMPLETION_TOKENS, ModelGate, PLAYER_REQUEST_LIMIT, PLAYER_TOKEN_BUDGET, POLICY, PREFIX_TOKENS, ROOM_EVALUATIONS_PER_SECOND, ROOM_REQUEST_LIMIT, ROOM_TOKEN_BUDGET, roomLimits } from '../server/model.ts';
 import type { ModelGateway } from '../server/model.ts';
 import { MIN_REGISTRATION_LIMIT, Room } from '../server/room.ts';
 import { buildPrompts, countTokens, gameTokens } from '../server/tokens.ts';
@@ -806,7 +807,7 @@ test('reasoning is opt-in, uses a bounded completion budget, and never bypasses 
     assert.equal(JSON.parse(JSON.stringify(sent)).max_completion_tokens, MAX_OUTPUT_TOKENS);
     assert.equal(disabled.status, 'invalid');
     assert.equal(disabled.reasoningEnabled, false);
-    assert.equal(timeout, 20000);
+    assert.equal(timeout, LUNA_ATTEMPT_TIMEOUT_MS);
     const enabled = await gateway.complete(game, { compression: true, cache: false, reasoning: true }, 'test');
     assert.equal(JSON.parse(JSON.stringify(sent)).reasoning_effort, 'low');
     assert.equal(JSON.parse(JSON.stringify(sent)).max_completion_tokens, MAX_REASONING_COMPLETION_TOKENS);
@@ -815,7 +816,7 @@ test('reasoning is opt-in, uses a bounded completion budget, and never bypasses 
     assert.equal(enabled.usage.reasoning, 128);
     assert.equal(enabled.usage.output, 160);
     assert.equal(enabled.usage.total, 4160);
-    assert.equal(timeout, 60000);
+    assert.equal(timeout, LUNA_REASONING_ATTEMPT_TIMEOUT_MS);
     finishReason = 'length';
     const truncated = await gateway.complete(game, { compression: true, cache: false, reasoning: true }, 'test');
     assert.equal(truncated.status, 'invalid');
@@ -832,6 +833,48 @@ test('reasoning is opt-in, uses a bounded completion budget, and never bypasses 
     assert.equal(invalid.status, 'invalid');
     assert.equal(invalid.placement, null);
     assert.equal(game.pieces, 0);
+  } finally { rmSync(setup.dataDirectory, { recursive: true, force: true }); }
+});
+
+test('Luna retries one stalled or failed call within the browser wait and leaves rate limits to the room gate', async context => {
+  // The limits mirror the assist acknowledgement waits in web/src/useGame.ts.
+  assert.ok(2 * LUNA_ATTEMPT_TIMEOUT_MS + LUNA_RETRY_DELAY_MS < 25000);
+  assert.ok(2 * LUNA_REASONING_ATTEMPT_TIMEOUT_MS + LUNA_RETRY_DELAY_MS < 65000);
+  const setup = fixture();
+  const gateway = new LunaGateway(setup.config);
+  const game = new Game('retry');
+  const placementId = placementsFor(game)[0].id;
+  const failures: Error[] = [];
+  const timeouts: number[] = [];
+  const warn = context.mock.method(console, 'warn', () => undefined);
+  context.mock.method(gateway['client'].chat.completions, 'create', async (_request: unknown, options: { timeout: number }) => {
+    timeouts.push(options.timeout);
+    const failure = failures.shift();
+    if (failure) throw failure;
+    return { choices: [{ finish_reason: 'stop', message: { content: JSON.stringify({ placementId, tip: 'A legal move.' }) } }], usage: { prompt_tokens: 4000, completion_tokens: 20, total_tokens: 4020, prompt_tokens_details: { cached_tokens: 0, cache_write_tokens: 0 }, completion_tokens_details: { reasoning_tokens: 0 } } };
+  });
+  const request = (queued: Error[], options: AiOptions = { compression: true, cache: false }) => {
+    failures.push(...queued);
+    timeouts.length = 0;
+    return gateway.complete(game, options, 'test');
+  };
+  try {
+    const stalled = await request([new OpenAI.APIConnectionTimeoutError()]);
+    assert.equal(stalled.status, 'ready');
+    assert.equal(stalled.usage.total, 4020);
+    assert.deepEqual(timeouts, [LUNA_ATTEMPT_TIMEOUT_MS, LUNA_ATTEMPT_TIMEOUT_MS]);
+    const serverError = await request([OpenAI.APIError.generate(500, undefined, 'Internal server error', new Headers())], { compression: true, cache: false, reasoning: true });
+    assert.equal(serverError.status, 'ready');
+    assert.deepEqual(timeouts, [LUNA_REASONING_ATTEMPT_TIMEOUT_MS, LUNA_REASONING_ATTEMPT_TIMEOUT_MS]);
+    await assert.rejects(request([new OpenAI.APIConnectionTimeoutError(), new OpenAI.APIConnectionTimeoutError()]), OpenAI.APIConnectionTimeoutError);
+    assert.equal(timeouts.length, 2);
+    for (const status of [429, 400]) {
+      await assert.rejects(request([OpenAI.APIError.generate(status, undefined, 'Not retried', new Headers())]), (error: unknown) => error instanceof OpenAI.APIError && error.status === status);
+      assert.equal(timeouts.length, 1);
+    }
+    assert.equal(failures.length, 0);
+    assert.equal(warn.mock.callCount(), 3);
+    assert.match(warn.mock.calls[0].arguments.join(' '), /retrying once: Request timed out/);
   } finally { rmSync(setup.dataDirectory, { recursive: true, force: true }); }
 });
 

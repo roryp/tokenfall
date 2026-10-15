@@ -1,5 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import { readFileSync } from 'node:fs';
+import { setTimeout as delay } from 'node:timers/promises';
 import OpenAI from 'openai';
 import { getBearerTokenProvider } from '@azure/identity';
 import { z } from 'zod';
@@ -20,6 +21,14 @@ export const MCP_GUIDANCE = '\n\nMCP LOOKAHEAD\nWith MCP enabled, the optional t
 export const MAX_OUTPUT_TOKENS = 128;
 export const MAX_REASONING_COMPLETION_TOKENS = 2048;
 export const maxCompletionTokens = (options: AiOptions) => options.reasoning ? MAX_REASONING_COMPLETION_TOKENS : MAX_OUTPUT_TOKENS;
+// Rare provider stalls run far past the normal p99 (about 3s, or 8s with reasoning), so a stalled call is abandoned and retried once.
+// Both attempts plus the pause fit inside the browser's 25s and 65s assist waits.
+export const LUNA_ATTEMPT_TIMEOUT_MS = 10000;
+export const LUNA_REASONING_ATTEMPT_TIMEOUT_MS = 30000;
+export const LUNA_RETRY_DELAY_MS = 500;
+export const lunaAttemptTimeout = (options: AiOptions) => options.reasoning ? LUNA_REASONING_ATTEMPT_TIMEOUT_MS : LUNA_ATTEMPT_TIMEOUT_MS;
+// 429s are not retried: a long Retry-After could outlast the browser's wait, and the room gate already paces requests.
+export const retryableLunaError = (error: unknown) => error instanceof OpenAI.APIConnectionError || error instanceof OpenAI.InternalServerError;
 export const PLAYER_TOKEN_BUDGET = 160000;
 export const ROOM_TOKEN_BUDGET = MAX_TOKEN_ALLOWANCE;
 export const PLAYER_REQUEST_LIMIT = 40;
@@ -148,8 +157,9 @@ export class LunaGateway implements ModelGateway {
     this.client = new OpenAI({
       baseURL: `${config.endpoint.replace(/\/$/, '')}/openai/v1/`,
       apiKey: getBearerTokenProvider(azureCredential(config), 'https://cognitiveservices.azure.com/.default'),
+      // SDK retries stay off because chat() retries only the transient failures.
       maxRetries: 0,
-      timeout: 20000,
+      timeout: LUNA_ATTEMPT_TIMEOUT_MS,
       fetch: async (url, init) => {
         const response = await fetch(url, init);
         this.limits = deploymentLimits(response.headers) ?? this.limits;
@@ -207,12 +217,7 @@ export class LunaGateway implements ModelGateway {
         },
       },
     };
-    const { result, usage } = await traceChat(this.deployment, maxCompletionTokens(options), this.client.baseURL, async span => {
-      const result = await this.client.chat.completions.create(request, { timeout: options.reasoning ? 60000 : 20000 });
-      const usage = normalizeUsage(result.usage);
-      recordChatResponse(span, result, usage);
-      return { result, usage };
-    });
+    const { result, usage } = await this.chat(request, options);
     const latencyMs = Math.round(performance.now() - started);
     const outputText = result.choices[0]?.message.content ?? '';
     let selection: z.infer<typeof moveSchema> | null = null;
@@ -232,5 +237,23 @@ export class LunaGateway implements ModelGateway {
       prompt, systemPrompt, outputText, inputChips: tokenChips(prompt), outputChips: tokenChips(outputText),
       promptComparison: { verbose: prompts.verbose, packed: prompts.packed },
     };
+  }
+
+  // Each attempt gets its own chat span, so a stalled call and its retry both appear in traces.
+  private async chat(request: OpenAI.Chat.ChatCompletionCreateParamsNonStreaming, options: AiOptions) {
+    for (let attempt = 1; ; attempt += 1) {
+      try {
+        return await traceChat(this.deployment, maxCompletionTokens(options), this.client.baseURL, async span => {
+          const result = await this.client.chat.completions.create(request, { timeout: lunaAttemptTimeout(options) });
+          const usage = normalizeUsage(result.usage);
+          recordChatResponse(span, result, usage);
+          return { result, usage };
+        });
+      } catch (error) {
+        if (attempt > 1 || !retryableLunaError(error)) throw error;
+        console.warn('Luna call failed, retrying once:', error instanceof Error ? error.message : 'Unknown error');
+        await delay(LUNA_RETRY_DELAY_MS);
+      }
+    }
   }
 }

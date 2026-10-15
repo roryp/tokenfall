@@ -5,6 +5,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { SpanKind, SpanStatusCode, trace } from '@opentelemetry/api';
 import { InMemorySpanExporter, NodeTracerProvider, SimpleSpanProcessor } from '@opentelemetry/sdk-trace-node';
+import OpenAI from 'openai';
 import { LunaGateway, MAX_REASONING_COMPLETION_TOKENS } from '../server/model.ts';
 import { Room } from '../server/room.ts';
 
@@ -90,6 +91,39 @@ test('Failed Luna requests mark the agent and chat spans with the provider error
       assert.equal(span.attributes['gen_ai.usage.input_tokens'], undefined);
       assert.ok(span.events.some(event => event.name === 'exception'));
     }
+  } finally {
+    room.close();
+    rmSync(dataDirectory, { recursive: true, force: true });
+  }
+});
+
+test('A retried Luna stall exports the failed and successful chat attempts under one agent span', async context => {
+  exporter.reset();
+  const { dataDirectory, gateway, room } = fixture();
+  context.mock.method(console, 'warn', () => undefined);
+  let calls = 0;
+  context.mock.method(gateway['client'].chat.completions, 'create', async (request: unknown) => {
+    calls += 1;
+    if (calls === 1) throw new OpenAI.APIConnectionTimeoutError();
+    const prompt = JSON.parse(JSON.parse(JSON.stringify(request)).messages[1].content);
+    return {
+      choices: [{ finish_reason: 'stop', message: { content: JSON.stringify({ placementId: prompt.placements[0].id, tip: 'Recovered.' }) } }],
+      usage: { prompt_tokens: 3000, completion_tokens: 20, total_tokens: 3020, prompt_tokens_details: { cached_tokens: 0, cache_write_tokens: 0 }, completion_tokens_details: { reasoning_tokens: 0 } },
+    };
+  });
+  try {
+    room.join('Trace Retry', room.code, undefined, 'retry');
+    const { insight } = await room.assist(room.playerFor('retry'), { compression: true, cache: false });
+    assert.equal(insight.status, 'ready');
+    const spans = exporter.getFinishedSpans();
+    const agent = spans.find(span => span.name === 'invoke_agent Luna')!;
+    const chats = spans.filter(span => span.name === 'chat test-only');
+    assert.equal(spans.length, 3);
+    assert.equal(agent.status.code, SpanStatusCode.UNSET);
+    assert.deepEqual(chats.map(span => span.status.code), [SpanStatusCode.ERROR, SpanStatusCode.UNSET]);
+    for (const chat of chats) assert.equal(chat.parentSpanContext?.spanId, agent.spanContext().spanId);
+    assert.deepEqual(chats.map(span => span.attributes['gen_ai.usage.input_tokens']), [undefined, 3000]);
+    assert.equal(agent.attributes['gen_ai.usage.input_tokens'], 3000);
   } finally {
     room.close();
     rmSync(dataDirectory, { recursive: true, force: true });
