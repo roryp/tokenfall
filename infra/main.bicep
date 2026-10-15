@@ -13,6 +13,8 @@ param webImage string = ''
 @secure()
 @description('Optional key that lets the event host join a full room. Empty disables admin access.')
 param adminKey string = ''
+@description('Optional online seats in the room, 1 to 500. Empty keeps the app default of 250.')
+param roomCapacity string = ''
 
 resource resourceGroup 'Microsoft.Resources/resourceGroups@2024-03-01' = {
   name: 'rg-${environmentName}'
@@ -55,6 +57,7 @@ module hosting './hosting.bicep' = {
     appInsightsName: monitoring.outputs.appInsightsName
     image: webImage
     adminKey: adminKey
+    roomCapacity: roomCapacity
   }
 }
 

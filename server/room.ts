@@ -34,6 +34,8 @@ export const nameKey = (name: string) => name.normalize('NFKC').trim().replace(/
 const fingerprint = (value: unknown) => createHash('sha256').update(JSON.stringify(value)).digest('hex');
 const digest = (value: string) => createHash('sha256').update(value).digest();
 export const MIN_REGISTRATION_LIMIT = 500;
+// A commit on Azure Files blocks the event loop for about 60 ms whatever its size, so player saves are committed together.
+export const WRITE_FLUSH_MS = 500;
 export interface Player {
   record: PlayerRecord;
   metrics: Metrics;
@@ -57,8 +59,12 @@ export class Room {
   pricing: TokenPricing = { status: 'loading', snapshot: null };
   private previewTimes = new Map<string, number>();
   private pendingTokens = new Map<string, number>();
-  // New best scores arrive with most input batches; they are committed together on the next read instead of one synchronous write per batch.
-  private pendingScores = new Set<Player>();
+  // Players with unsaved changes; reads overlay them and a timer commits them together every WRITE_FLUSH_MS.
+  private pendingWrites = new Set<Player>();
+  // Newly registered players that are not in the database yet, so registration limits still count them.
+  private unsaved = new Set<string>();
+  private writeTimer: NodeJS.Timeout | null = null;
+  private columns: string[];
   private adminDigest: Buffer | null;
   private resetting = false;
   private resetPreviews = new Map<string, { mode: RoomResetMode; expiresAt: number; fingerprint: string }>();
@@ -88,6 +94,7 @@ export class Room {
     if (!this.database.prepare('PRAGMA table_info(players)').all().some(column => column.name === 'token_text')) this.database.exec("ALTER TABLE players ADD COLUMN token_text TEXT NOT NULL DEFAULT ''");
     if (!this.database.prepare('PRAGMA table_info(players)').all().some(column => column.name === 'token_limit')) this.database.exec('ALTER TABLE players ADD COLUMN token_limit INTEGER NOT NULL DEFAULT 1000000');
     this.migratePlayerNames();
+    this.columns = this.database.prepare('PRAGMA table_info(players)').all().map(column => String(column.name));
     const saved = this.database.prepare("SELECT value FROM settings WHERE key = 'room'").get() as { value: string } | undefined;
     this.code = saved?.value ?? randomBytes(3).toString('hex').toUpperCase();
     if (!saved) this.database.prepare("INSERT INTO settings (key, value) VALUES ('room', ?)").run(this.code);
@@ -156,9 +163,22 @@ export class Room {
   }
 
   get online() { return [...this.players.values()].filter(player => player.socketId !== null).length; }
+  // Unsaved changes overlay the stored rows, so room views never wait for a commit.
   records() {
-    this.flushScores();
-    return this.database.prepare('SELECT * FROM players ORDER BY best_score DESC, best_lines DESC, updated ASC').all() as unknown as PlayerRecord[];
+    const rows = this.database.prepare('SELECT * FROM players ORDER BY best_score DESC, best_lines DESC, updated ASC').all() as unknown as PlayerRecord[];
+    const pending = [...this.pendingWrites].filter(player => this.players.get(player.record.id) === player);
+    if (!pending.length) return rows;
+    const byId = new Map(rows.map(row => [row.id, row]));
+    for (const player of pending) byId.set(player.record.id, this.storedRow(player));
+    return [...byId.values()].sort((first, second) => second.best_score - first.best_score || second.best_lines - first.best_lines || first.updated - second.updated);
+  }
+
+  // The row a commit would store, in the shape SQLite returns, so overlays compare and fingerprint like stored rows.
+  private storedRow(player: Player) {
+    const values: Record<string, unknown> = { ...player.record, metrics: JSON.stringify(player.metrics) };
+    const row: Record<string, unknown> = Object.create(null);
+    for (const column of this.columns) row[column] = values[column];
+    return row as unknown as PlayerRecord;
   }
 
   // Compares digests so the check takes the same time for every key.
@@ -196,7 +216,7 @@ export class Room {
   async reset(mode: RoomResetMode, confirmRoom: string, confirmationId?: string) {
     this.assertAvailable();
     if (confirmRoom !== this.code) throw new RequestError('Enter the current room code to confirm the reset.', 'validation');
-    this.flushScores();
+    this.flushWrites();
     if (confirmationId !== undefined) {
       const preview = this.resetPreviews.get(confirmationId);
       this.resetPreviews.delete(confirmationId);
@@ -212,7 +232,8 @@ export class Room {
       await assertIdle();
       const result = await resetRoom({ databasePath: path.join(this.config.dataDirectory, 'tokenfall.sqlite'), mode, apply: true, confirmRoom, assertIdle });
       this.players.clear();
-      this.pendingScores.clear();
+      this.pendingWrites.clear();
+      this.unsaved.clear();
       this.previewTimes.clear();
       this.resetPreviews.clear();
       return result;
@@ -221,8 +242,24 @@ export class Room {
 
   save(player: Player) {
     this.assertAvailable(player);
-    this.pendingScores.delete(player);
-    this.write(player);
+    this.queueWrite(player);
+  }
+
+  private queueWrite(player: Player) {
+    this.pendingWrites.add(player);
+    this.scheduleWrites();
+  }
+
+  private scheduleWrites() {
+    if (this.writeTimer || this.resetting) return;
+    this.writeTimer = setTimeout(() => {
+      this.writeTimer = null;
+      try { this.flushWrites(); } catch (error) {
+        console.error('Saving players failed:', error instanceof Error ? error.message : 'Unknown error');
+        this.scheduleWrites();
+      }
+    }, WRITE_FLUSH_MS);
+    this.writeTimer.unref();
   }
 
   private write(player: Player) {
@@ -235,20 +272,32 @@ export class Room {
       .run(record.id, record.token_hash, record.name, record.name_key, record.best_score, record.best_lines, record.best_level, record.metrics, record.attempts, record.updated, record.token_text, record.token_limit);
   }
 
-  flushScores() {
-    if (!this.pendingScores.size || this.resetting || !this.database.isOpen) return;
-    const players = [...this.pendingScores].filter(player => this.players.get(player.record.id) === player);
-    this.pendingScores.clear();
+  // Commits every queued player in one transaction. A row the database rejects is skipped so it cannot block everyone else's saves.
+  flushWrites() {
+    if (this.writeTimer) { clearTimeout(this.writeTimer); this.writeTimer = null; }
+    if (!this.pendingWrites.size || this.resetting || !this.database.isOpen) return;
+    const queued = [...this.pendingWrites];
+    this.pendingWrites.clear();
+    // A player removed from the room is not written, so it no longer counts as a pending registration.
+    for (const player of queued) if (!this.players.has(player.record.id)) this.unsaved.delete(player.record.id);
+    const players = queued.filter(player => this.players.get(player.record.id) === player);
     if (!players.length) return;
+    const saved: Player[] = [];
     try {
       this.database.exec('BEGIN IMMEDIATE');
-      for (const player of players) this.write(player);
+      for (const player of players) {
+        try { this.write(player); saved.push(player); } catch (error) {
+          if (!this.database.isTransaction) throw error;
+          console.error(`Saving player ${player.record.id} failed:`, error instanceof Error ? error.message : 'Unknown error');
+        }
+      }
       this.database.exec('COMMIT');
     } catch (error) {
       if (this.database.isTransaction) this.database.exec('ROLLBACK');
-      for (const player of players) if (this.players.get(player.record.id) === player) this.pendingScores.add(player);
+      for (const player of players) if (this.players.get(player.record.id) === player) this.pendingWrites.add(player);
       throw error;
     }
+    for (const player of saved) this.unsaved.delete(player.record.id);
   }
 
   totals(records = this.records()) {
@@ -280,7 +329,9 @@ export class Room {
     const key = nameKey(name);
     const boundPlayer = [...this.players.values()].find(candidate => candidate.socketId === socketId);
     if (boundPlayer && (token ? boundPlayer.record.token_hash !== tokenHash : boundPlayer.record.name_key !== key)) throw new RequestError('This connection has already joined the room.', 'session-active');
-    let record = (token
+    // Players in memory may have changes that are not committed yet, so they are matched before the database.
+    const known = [...this.players.values()].find(candidate => token ? candidate.record.token_hash === tokenHash : key !== '' && candidate.record.name_key === key);
+    let record = known?.record ?? (token
       ? this.database.prepare('SELECT * FROM players WHERE token_hash = ?').get(tokenHash)
       : this.database.prepare("SELECT * FROM players WHERE name_key = ? AND name_key <> ''").get(key)) as unknown as PlayerRecord | undefined;
     if (token && !record) throw new RequestError('Your previous session expired. Join again.', 'session');
@@ -290,6 +341,7 @@ export class Room {
     const tokenText = token ? (classic ? '' : undefined) : text ?? '';
     const currentText = player?.record.token_text ?? record?.token_text;
     const game = tokenText !== undefined && (!player || tokenText !== currentText) ? this.gameFor(tokenText) : undefined;
+    const registering = !record;
     if (!record) {
       if (this.registrationCount() >= this.registrationLimit && !this.reclaimRegistration() && !admin) throw new RequestError('This workshop has reached its registration limit.', 'full');
       record = { id: randomUUID(), token_hash: tokenHash, name, name_key: key, best_score: 0, best_lines: 0, best_level: 1, metrics: JSON.stringify(emptyMetrics()), attempts: 0, updated: now, token_text: tokenText ?? '', token_limit: DEFAULT_TOKEN_ALLOWANCE };
@@ -309,11 +361,12 @@ export class Room {
     player.record.token_hash = tokenHash;
     player.socketId = socketId;
     player.lastSeen = now;
+    if (registering) this.unsaved.add(player.record.id);
     this.save(player);
     return { ...this.joinResult(player, sessionToken), ...(admin ? { admin: true as const } : {}) };
   }
 
-  private registrationCount() { return Number(this.database.prepare('SELECT COUNT(*) AS count FROM players').get()!.count); }
+  private registrationCount() { return Number(this.database.prepare('SELECT COUNT(*) AS count FROM players').get()!.count) + this.unsaved.size; }
 
   // At the registration cap, recycle the oldest offline player that never used AI and is outside the top 50, so the room cannot be filled permanently.
   private reclaimRegistration() {
@@ -383,7 +436,7 @@ export class Room {
       player.record.best_lines = player.game.lines;
       player.record.best_level = player.game.level;
       player.record.updated = now;
-      this.pendingScores.add(player);
+      this.queueWrite(player);
     }
     return this.ack(player);
   }
@@ -516,8 +569,11 @@ export class Room {
   }
 
   close() {
-    try { this.flushScores(); }
-    finally { this.database.close(); }
+    try { this.flushWrites(); }
+    finally {
+      if (this.writeTimer) { clearTimeout(this.writeTimer); this.writeTimer = null; }
+      this.database.close();
+    }
   }
 }
 

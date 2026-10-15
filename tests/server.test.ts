@@ -18,7 +18,7 @@ import { clientAddress, createApplication, JOINS_PER_SEAT_PER_MINUTE, SOCKET_EVE
 import { DEFAULT_ROOM_CAPACITY, loadConfig, MIN_ADMIN_KEY_LENGTH } from '../server/config.ts';
 import { AI_COOLDOWN_MS, AUTOPILOT_COOLDOWN_MS, BASE_ROOM_LIMITS, deploymentLimits, EVALUATION_INTERVAL_MS, LUNA_ATTEMPT_TIMEOUT_MS, LUNA_REASONING_ATTEMPT_TIMEOUT_MS, LUNA_RETRY_DELAY_MS, LunaGateway, MAX_MCP_IN_FLIGHT, MAX_OUTPUT_TOKENS, MAX_REASONING_COMPLETION_TOKENS, ModelGate, PLAYER_REQUEST_LIMIT, PLAYER_TOKEN_BUDGET, POLICY, PREFIX_TOKENS, ROOM_EVALUATIONS_PER_SECOND, ROOM_REQUEST_LIMIT, ROOM_TOKEN_BUDGET, roomLimits } from '../server/model.ts';
 import type { ModelGateway } from '../server/model.ts';
-import { MIN_REGISTRATION_LIMIT, Room } from '../server/room.ts';
+import { MIN_REGISTRATION_LIMIT, Room, WRITE_FLUSH_MS } from '../server/room.ts';
 import { buildPrompts, countTokens, gameTokens } from '../server/tokens.ts';
 import { lookaheadSnapshot, lookupBoardFacts, lookupFutureMoves, McpLookupError, MAX_MCP_CONTEXT_TOKENS } from '../server/mcp.ts';
 import { analyzeFutureMoves, boardFactsSchema, lookaheadOutputSchema } from '../server/mcp-server.ts';
@@ -106,6 +106,7 @@ test('room reset script refuses unsafe confirmation, active games, changed data 
   try {
     room.join('Retained player', room.code, undefined, 'reset-guard');
     room.disconnect('reset-guard');
+    room.flushWrites();
     const databasePath = path.join(setup.dataDirectory, 'tokenfall.sqlite');
     const options = { databasePath, apply: true, confirmRoom: room.code, serverStopped: true };
     await assert.rejects(resetRoom({ databasePath: path.join(setup.dataDirectory, 'missing.sqlite') }), /does not exist/);
@@ -195,28 +196,69 @@ for (const mode of ['all', 'scores'] as const) test(`in-app room reset ${mode} c
   } finally { room.close(); rmSync(setup.dataDirectory, { recursive: true, force: true }); }
 });
 
-test('new best scores are committed together on the next room read and on close', () => {
+test('player saves and new best scores are committed together by the write timer and on close', async context => {
   const setup = fixture();
   let room = new Room(setup.config, setup.gateway);
   try {
     const joined = room.join('Batch Player', room.code, undefined, 'batch');
     const player = room.playerFor('batch');
-    const stored = () => Number(room.database.prepare('SELECT best_score FROM players WHERE id = ?').get(joined.playerId)!.best_score);
+    for (let index = 0; index < 20; index += 1) room.join(`Batch ${index}`, room.code, undefined, `batch-${index}`);
+    const stored = () => room.database.prepare('SELECT best_score FROM players WHERE id = ?').get(joined.playerId)?.best_score;
     const drop = (sequence: number) => room.inputs(player, { runId: joined.runId, sequence, frame: sequence, events: [{ frame: sequence - 1, action: 'hardDrop' }] }, player.started + 1000);
+    const exec = context.mock.method(room.database, 'exec');
+    const commits = () => exec.mock.calls.filter(call => call.arguments[0] === 'COMMIT').length;
     drop(1);
     const first = player.record.best_score;
     assert.ok(first > 0);
-    assert.equal(stored(), 0);
+    assert.equal(stored(), undefined);
     assert.equal(room.view().pointsLeaderboard[0].score, first);
+    assert.equal(room.records().length, 21);
+    assert.equal(stored(), undefined);
+    assert.equal(commits(), 0);
+    await new Promise(resolve => setTimeout(resolve, WRITE_FLUSH_MS + 200));
+    assert.equal(commits(), 1);
     assert.equal(stored(), first);
+    assert.equal(room.database.prepare('SELECT COUNT(*) AS count FROM players').get()!.count, 21);
     drop(2);
     const best = player.record.best_score;
     assert.ok(best > first);
     assert.equal(stored(), first);
     room.close();
+    assert.equal(commits(), 2);
     room = new Room(setup.config, setup.gateway);
     assert.equal(room.records()[0].best_score, best);
   } finally { if (room.database.isOpen) room.close(); rmSync(setup.dataDirectory, { recursive: true, force: true }); }
+});
+
+test('players joined or changed before the next commit are found by name and session token', () => {
+  const setup = fixture();
+  const room = new Room(setup.config, setup.gateway);
+  try {
+    const joined = room.join('Quick Player', room.code, undefined, 'first');
+    assert.throws(() => room.join('quick player', room.code, undefined, 'second'), { code: 'session-active' });
+    room.disconnect('first');
+    assert.equal(room.join('Quick Player', room.code, joined.token, 'again').playerId, joined.playerId);
+    room.disconnect('again');
+    assert.equal(room.join('QUICK player', room.code, undefined, 'third').playerId, joined.playerId);
+    assert.equal(room.records().length, 1);
+    room.flushWrites();
+    assert.equal(room.database.prepare('SELECT COUNT(*) AS count FROM players').get()!.count, 1);
+  } finally { room.close(); rmSync(setup.dataDirectory, { recursive: true, force: true }); }
+});
+
+test('a player row the database rejects is skipped without blocking other saves', context => {
+  const setup = fixture();
+  const room = new Room(setup.config, setup.gateway);
+  try {
+    const error = context.mock.method(console, 'error', () => undefined);
+    const alpha = room.join('Alpha', room.code, undefined, 'alpha');
+    const bravo = room.join('Bravo', room.code, undefined, 'bravo');
+    room.database.prepare("INSERT INTO players (id, token_hash, name, name_key, metrics, updated) VALUES ('other', 'other-token', 'BRAVO', 'bravo', '{}', 0)").run();
+    room.flushWrites();
+    assert.deepEqual(room.database.prepare('SELECT id FROM players').all().map(row => row.id).sort(), [alpha.playerId, 'other'].sort());
+    assert.equal(error.mock.callCount(), 1);
+    assert.match(String(error.mock.calls[0].arguments[0]), new RegExp(bravo.playerId));
+  } finally { room.close(); rmSync(setup.dataDirectory, { recursive: true, force: true }); }
 });
 
 for (const mode of ['all', 'scores'] as const) test(`in-app room reset ${mode} commits pending best scores to its backup and never restores them`, async () => {
@@ -396,6 +438,7 @@ test('existing databases gain the allowance setting without losing player record
     player.record.attempts = 50;
     player.record.best_score = 321;
     room.disconnect('legacy');
+    room.flushWrites();
     room.database.exec('ALTER TABLE players DROP COLUMN token_limit');
     room.close();
     room = new Room(setup.config, setup.gateway);
@@ -901,6 +944,7 @@ test('reasoning reserves its full output allowance and persists the actual repor
     const restored = room.join('Reasoning Player', room.code, joined.token, 'restored');
     assert.equal(restored.metrics.reasoning, 128);
     assert.equal(restored.metrics.output, 160);
+    room.flushWrites();
     const stored = room.database.prepare('SELECT metrics FROM players WHERE id = ?').get(joined.playerId)!;
     assert.equal(JSON.parse(stored.metrics as string).reasoning, 128);
     room.join('Budget Player', room.code, undefined, 'budget', 'Bounded reasoning.');
@@ -1023,6 +1067,7 @@ test('cache outcomes persist without inventing hit or miss history for older usa
   try {
     const joined = room.join('Cache History', room.code, undefined, 'socket', undefined, true);
     const legacy = { requests: 2, input: 4500, output: 40, cached: 1500, cacheWrites: 1500, reasoning: 0, compressionSaved: 5000 };
+    room.flushWrites();
     room.database.prepare('UPDATE players SET metrics = ?, attempts = ? WHERE id = ?').run(JSON.stringify(legacy), 2, joined.playerId);
     room.close();
     room = new Room(setup.config, setup.gateway);
@@ -1055,6 +1100,7 @@ test('existing databases gain token setup without losing sessions, scores, or us
     player.record.attempts = 2;
     player.metrics = { ...emptyMetrics(), requests: 2, input: 4321, output: 40 };
     room.save(player);
+    room.flushWrites();
     room.database.exec('ALTER TABLE players DROP COLUMN token_text');
     room.close();
     room = new Room(setup.config, setup.gateway);
@@ -1552,6 +1598,7 @@ test('existing rooms merge repeated names into their best player after a verifie
     room.join('Third', room.code, undefined, 'c');
     room.join('Someone Else', room.code, undefined, 'd');
     const totals = room.totals();
+    room.flushWrites();
     room.database.exec("DROP INDEX players_name_key; ALTER TABLE players DROP COLUMN name_key; UPDATE players SET name = 'rory' WHERE name = 'Second'; UPDATE players SET name = 'RORY' WHERE name = 'Third'");
     room.close();
     room = new Room(setup.config, setup.gateway);
@@ -1617,6 +1664,7 @@ test('the registration cap recycles idle players without AI usage or a top-50 sc
       room.save(player);
       room.disconnect(`socket-${index}`);
     }
+    room.flushWrites();
     for (const [id, player] of room.players) if (player.record.name !== 'Player 499') room.players.delete(id);
     room.join('Newcomer', room.code, undefined, 'newcomer');
     const names = new Set(room.records().map(record => record.name));
@@ -1624,6 +1672,7 @@ test('the registration cap recycles idle players without AI usage or a top-50 sc
     assert.ok(names.has('Newcomer'));
     for (const kept of ['Player 0', 'Player 49', 'Player 50', 'Player 499']) assert.ok(names.has(kept), kept);
     room.disconnect('newcomer');
+    room.flushWrites();
     room.database.exec('UPDATE players SET attempts = 1');
     room.players.clear();
     assert.throws(() => room.join('Latecomer', room.code, undefined, 'latecomer'), /registration limit/);

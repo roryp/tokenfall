@@ -113,7 +113,15 @@ MCP adds 1,375 lookahead tokens per move (+14% cost) and 0.5 s of tool time, dow
 
 Measured in October 2026 with bot players making Plain moves for one minute per step: 1, 2 and 4 bots inside the app's container, next to Azure, and 1, 2, 4 and 8 bots in Johannesburg, about 230 ms away. Each move waits for two network round trips, so nearby players move faster and use more tokens per minute. To size capacity for an audience near East US 2, allow about 430K tokens per minute per simultaneous Luna player: about 310K used plus the 28% safety margin (20% spare and the extra each move reserves). The 8 calls per second cap fits about 14 nearby players or about 19 in Johannesburg. With 8 players the server used under 10% of its 2 CPUs, while Luna's replies slowed by about 16%.
 
-Room size was measured locally in October 2026 with bots playing manually (30% also asking Luna) plus spectators. With 250 players and 50 spectators the server's event loop was 26–33% busy across runs and sent 5.4 MB/s of room updates, with input acknowledgements under 70 ms at the 95th percentile. 500 players and 100 spectators used 36% and 10.7 MB/s. New best scores are written to SQLite together on each room update, and rooms with more than 100 connections send updates every second instead of every half second. Azure Files writes are slower than a local disk, so rehearse on Azure before relying on more than 250 players.
+Room size was measured locally in October 2026 with bots playing manually (30% also asking Luna) plus spectators. With 250 players and 50 spectators the server's event loop was 26–33% busy across runs and sent 5.4 MB/s of room updates, with input acknowledgements under 70 ms at the 95th percentile. 500 players and 100 spectators used 36% and 10.7 MB/s. Rooms with more than 100 connections send updates every second instead of every half second.
+
+On Azure, each SQLite commit to Azure Files blocks the server for about 60 ms whatever its size, against under 5 ms on a local disk. Committing every join, game over and Luna move separately stalled an October 2026 rehearsal at about 320 of 500 players, so player saves and new best scores are committed together every half second ([room](server/room.ts)). The same rehearsal then held 500 players and 100 spectators on one replica, with 50 of the players switching Luna autopilot on together for two minutes. It had no restarts or disconnects; input acknowledgements were 2 ms at the median and about 35 ms at the 95th percentile, rising to about 0.6 s during the Luna burst; the server used about 0.2 CPUs (1.5 during the burst) and under 750 MB. A full room on autopilot uses about 6 room Luna requests per second, so the 2,000-request room allowance lasts about 5 minutes.
+
+Rehearse a room before an event with the [stress test](scripts/stress-room.ts), which plays real games over Socket.IO from one address like a venue audience. Run it next to Azure (for example as a Container Apps job) so the test machine's network is not the bottleneck, and do a [full reset](#reset-room-data) afterwards:
+
+```powershell
+node scripts/stress-room.ts --url https://your-app --players 500 --spectators 100 --join-seconds 90 --steady-seconds 360 --luna-bots 50 --luna-start 60 --luna-seconds 120 --workers 4
+```
 
 ## Architecture
 
@@ -189,7 +197,7 @@ Open http://127.0.0.1:3100. Local inference uses your Azure CLI sign-in; leave `
 - **Tracing:** when `APPLICATIONINSIGHTS_CONNECTION_STRING` is set (provisioning stores it in the `azd` environment), local Luna moves are [traced](#tracing) with your Azure CLI identity. Set it to an empty value in the root dotenv file to keep local runs out of the shared traces.
 - **Data:** SQLite persists scores, sentences, allowances, and usage under `DATA_DIRECTORY`; boards are lost on restart. A second server needs a different `PORT` and `DATA_DIRECTORY`. Keep databases and backups private.
 - **Sharing:** set `HOST=0.0.0.0` and an audience-reachable `PUBLIC_BASE_URL`. A saved `DATA_DIRECTORY/public-url.json` overrides that URL; update it, or stop the old tunnel helper and remove it. Check **Share game** before distributing the link.
-- **Room size and admin:** `ROOM_CAPACITY` sets the online seats (default 250, at most 500). `ADMIN_KEY` enables [admin access](#admin-access); an `ADMIN_KEY` in the `azd` environment applies locally too.
+- **Room size and admin:** `ROOM_CAPACITY` sets the online seats (default 250, at most 500); on Azure, run `azd env set ROOM_CAPACITY 500` and provision as described in [Deploy](#deploy). `ADMIN_KEY` enables [admin access](#admin-access). Both apply locally too when set in the `azd` environment.
 
 ## Deploy
 

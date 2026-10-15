@@ -10,6 +10,8 @@ param image string = ''
 @secure()
 @description('Optional key that lets the event host join a full room. Empty disables admin access.')
 param adminKey string = ''
+@description('Optional online seats in the room, 1 to 500. Empty keeps the app default of 250.')
+param roomCapacity string = ''
 
 var resourceToken = uniqueString(subscription().id, resourceGroup().id, location, environmentName)
 var appName = 'azapp${resourceToken}'
@@ -207,6 +209,8 @@ resource app 'Microsoft.App/containerApps@2026-01-01' = {
             { name: 'APPLICATIONINSIGHTS_CONNECTION_STRING', value: appInsights.properties.ConnectionString }
           ], empty(adminKey) ? [] : [
             { name: 'ADMIN_KEY', secretRef: 'admin-key' }
+          ], empty(roomCapacity) ? [] : [
+            { name: 'ROOM_CAPACITY', value: roomCapacity }
           ])
           volumeMounts: [
             { volumeName: 'state', mountPath: '/data' }

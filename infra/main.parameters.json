@@ -6,6 +6,7 @@
     "location": { "value": "${AZURE_LOCATION}" },
     "principalId": { "value": "${AZURE_PRINCIPAL_ID}" },
     "webImage": { "value": "${SERVICE_WEB_IMAGE_NAME}" },
-    "adminKey": { "value": "${ADMIN_KEY}" }
+    "adminKey": { "value": "${ADMIN_KEY}" },
+    "roomCapacity": { "value": "${ROOM_CAPACITY}" }
   }
 }
