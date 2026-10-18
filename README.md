@@ -68,7 +68,7 @@ Costs are estimates at Azure's published list prices in USD, not an invoice: dis
 | Cache write | `5.6 luna ShortCo Cd Wr Std Gl` | $0.25 |
 | Output, including reasoning | `5.6 luna ShortCo Opt Std Gl` | $1.20 |
 
-**Meter names:** `5.6 luna` is the model, `ShortCo` a short-context request, `Inp`, `Cd Inp`, `Cd Wr`, and `Opt` the token type, `Std` standard processing, and `Gl` a Global deployment. Luna's requests are around 10,000 input tokens, far below the long-context threshold. The API's other Luna meters don't apply to this deployment: `LongCo` long-context requests (2× input, 1.5× output), `PP` [priority processing](https://learn.microsoft.com/azure/foundry/openai/concepts/priority-processing) (2×), and `DZ` Data Zone deployments (+10%).
+**Meter names:** `5.6 luna` is the model, `ShortCo` a short-context request, `Inp`, `Cd Inp`, `Cd Wr`, and `Opt` the token type, `Std` standard processing, and `Gl` a Global deployment. Luna's requests are around 10,000 input tokens, far below the long-context threshold. The app doesn't use the API's other Luna meters: `LongCo` long-context requests (2× input, 1.5× output), `PP` [priority processing](https://learn.microsoft.com/azure/foundry/openai/concepts/priority-processing) (2×), `Fl` [Flex processing](https://learn.microsoft.com/azure/foundry/openai/how-to/flex-processing) (half price, but slower and sometimes unavailable), and `DZ` Data Zone deployments (+10%).
 
 **Choosing the rates:** for each token type, the server keeps only API items that match every field below and uses the newest `retailPrice`, the list price before discounts (`unitPrice` is the same). A missing meter, or conflicting prices with the same start date, fails the refresh.
 
