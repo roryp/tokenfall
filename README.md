@@ -55,11 +55,52 @@ Touch controls sit below the board. If keys stop responding after you type in a 
 
 Options start off and apply from the next request. **Information & tools** has the prompt, cache, MCP, and cost inspectors.
 
+### Pricing
+
+Costs are estimates at Azure's published list prices in USD, not an invoice: discounts and credits aren't applied. The server loads the rates from the [Azure Retail Prices API](https://learn.microsoft.com/rest/api/cost-management/retail-prices/azure-retail-prices) for the `AZURE_LOCATION` region at startup and every hour ([pricing](server/pricing.ts)). The cost ticker shows **Live rates**, **Last verified rates** when a refresh fails and the previous rates are kept, or **Rates unavailable** with `--` for dollar amounts when no rates have loaded (for example, without `AZURE_LOCATION`).
+
+`gpt-5.6-luna` Global Standard rates, checked October 18, 2026. They took effect on August 1, 2026 in East US 2 and are the same in every region that lists them:
+
+| Tokens | Meter (`skuName`) | USD per 1M tokens |
+| --- | --- | --- |
+| Input | `5.6 luna ShortCo Inp Std Gl` | $0.20 |
+| Cached input (cache hit) | `5.6 luna ShortCo Cd Inp Std Gl` | $0.02 |
+| Cache write | `5.6 luna ShortCo Cd Wr Std Gl` | $0.25 |
+| Output, including reasoning | `5.6 luna ShortCo Opt Std Gl` | $1.20 |
+
+**Meter names:** `5.6 luna` is the model, `ShortCo` a short-context request, `Inp`, `Cd Inp`, `Cd Wr`, and `Opt` the token type, `Std` standard processing, and `Gl` a Global deployment. Luna's requests are around 10,000 input tokens, far below the long-context threshold. The API's other Luna meters don't apply to this deployment: `LongCo` long-context requests (2× input, 1.5× output), `PP` [priority processing](https://learn.microsoft.com/azure/foundry/openai/concepts/priority-processing) (2×), and `DZ` Data Zone deployments (+10%).
+
+**Choosing the rates:** for each token type, the server keeps only API items that match every field below and uses the newest `retailPrice`, the list price before discounts (`unitPrice` is the same). A missing meter, or conflicting prices with the same start date, fails the refresh.
+
+| Field | Must be |
+| --- | --- |
+| `productName`, `skuName` | `Azure OpenAI GPT5`, a meter above |
+| `armRegionName` | `AZURE_LOCATION`, for example `eastus2` |
+| `currencyCode`, `type`, `unitOfMeasure` | `USD`, `Consumption` (pay as you go), `1M` (per million tokens) |
+| `isPrimaryMeterRegion`, `tierMinimumUnits` | `true`, `0` (the base price tier) |
+| `effectiveStartDate` | In the past |
+
+**Pricing a request** ([costForUsage](shared/protocol.ts)): Foundry reports input, cached, cache-write, and output tokens for each request. Cached and written tokens are part of the input, and reasoning tokens part of the output, so each token is priced once:
+
+```text
+cost = ((input − cached − written) × input rate + cached × cached-input rate
+        + written × cache-write rate + output × output rate) ÷ 1,000,000
+```
+
+A plain move of about 10,000 input and 35 output tokens costs (10,000 × $0.20 + 35 × $1.20) ÷ 1,000,000 ≈ $0.002. Input is about 98% of that, so Compression and Cache matter most: each 1,000 input tokens removed saves $0.0002, each 1,000 read from the cache saves $0.00018, and each 1,000 written to it costs $0.00005 extra.
+
+SQLite stores token counts, not dollars, so totals, savings, and **Points / cent** always follow the current rates ([room](server/room.ts)). To check the rates for your region:
+
+```powershell
+$filter = "armRegionName eq 'eastus2' and productName eq 'Azure OpenAI GPT5' and contains(skuName, '5.6 luna ShortCo') and contains(skuName, 'Std Gl')"
+(Invoke-RestMethod "https://prices.azure.com/api/retail/prices?currencyCode='USD'&`$filter=$filter").Items | Select-Object skuName, retailPrice, unitOfMeasure, effectiveStartDate
+```
+
 ### Cost and speed
 
 [![Annotated cost vs speed per Luna move on the 2 CPU game server: one move costs about $0.002. Compression costs about a quarter less than Plain and Cache about an eighth less, at about the same speed; Reasoning and MCP cost about 14% more and are 2.3 and 1.5 times slower.](docs/images/luna-cost-vs-speed-explained.png)](docs/images/luna-cost-vs-speed-explained.png)
 
-Measured in October 2026 from 50 [traces](#tracing), with each option playing the same 10 board positions at Azure retail prices. Costs are estimates, and times vary with model load. Cache lowers the price, not allowance use.
+Measured in October 2026 from 50 [traces](#tracing), with each option playing the same 10 board positions at [Azure retail prices](#pricing). Costs are estimates, and times vary with model load. Cache lowers the price, not allowance use.
 
 ### Limits and capacity
 
@@ -102,7 +143,7 @@ A deliberately small TypeScript app that shows the full path from browser game l
 | Application Insights | Azure Monitor, OpenTelemetry | One trace per Luna move, kept 30 days. |
 | azd | Azure Developer CLI, Bicep, Docker | Builds the image, creates the resources in [infra/](infra/main.bicep), and deploys. |
 
-Zod validates messages and MCP replies, js-tiktoken counts tokens, and the Azure Retail Prices API supplies live prices. Prompts are built in [tokens.ts](server/tokens.ts) from the [policy](server/policy.md).
+Zod validates messages and MCP replies, js-tiktoken counts tokens, and the Azure Retail Prices API supplies [live prices](#pricing). Prompts are built in [tokens.ts](server/tokens.ts) from the [policy](server/policy.md).
 
 ### Infra flow: `azd up`
 
