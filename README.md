@@ -49,11 +49,11 @@ Touch controls sit below the board. If keys stop responding after you type in a 
 | Option | Effect |
 | --- | --- |
 | Reasoning | Low reasoning effort: slower, with more output tokens. |
-| MCP | Two-placement lookahead, including Hold: about 14% more cost and 0.5 s of tool time per move. |
+| MCP | Two-placement lookahead, including Hold: about 15% more cost and 0.6 s of tool time per move. |
 | Compression | Packs the same board into fewer input tokens. |
 | Cache | Reuses the instructions when the provider confirms a hit. Writes can cost extra, and hits aren't guaranteed. |
 
-Options start off and apply from the next request. **Information & tools** has the prompt, cache, MCP, and cost inspectors.
+Options start off and apply from the next request. Compression and Cache combine: together they cut the cost of a move by about half ([cost and speed](#cost-and-speed)). **Information & tools** has the prompt, cache, MCP, and cost inspectors.
 
 ### Pricing
 
@@ -102,9 +102,9 @@ $filter = "armRegionName eq 'eastus2' and productName eq 'Azure OpenAI GPT5' and
 
 ### Cost and speed
 
-[![Annotated cost vs speed per Luna move on the 2 CPU game server: one move costs about $0.002. Compression costs about a quarter less than Plain and Cache about an eighth less, at about the same speed; Reasoning and MCP cost about 14% more and are 2.3 and 1.5 times slower.](docs/images/luna-cost-vs-speed-explained.png)](docs/images/luna-cost-vs-speed-explained.png)
+[![Annotated cost vs speed per Luna move on the 2 CPU game server: one move costs $0.001 to $0.002. Compression costs about a quarter less than Plain, Cache about a fifth less, and Compression and Cache together 47% less, all at about the same speed; Reasoning and MCP cost 11% and 15% more and are 1.9 and 1.8 times slower.](docs/images/luna-cost-vs-speed-explained.png)](docs/images/luna-cost-vs-speed-explained.png)
 
-Measured in October 2026 from 50 [traces](#tracing), with each option playing the same 10 board positions at [Azure retail prices](#pricing). Costs are estimates, and times vary with model load. Cache lowers the price, not allowance use.
+Measured in October 2026 from 60 [traces](#tracing), with each of the six options playing the same 10 board positions at [Azure retail prices](#pricing). Compression and Cache add up: together they cost 47% less than Plain, at the same speed. Costs are estimates, and times vary with model load. Cache lowers the price, not allowance use.
 
 ### Limits and capacity
 
