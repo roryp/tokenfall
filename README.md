@@ -87,7 +87,11 @@ cost = ((input − cached − written) × input rate + cached × cached-input ra
         + written × cache-write rate + output × output rate) ÷ 1,000,000
 ```
 
-A plain move of about 10,000 input and 35 output tokens costs (10,000 × $0.20 + 35 × $1.20) ÷ 1,000,000 ≈ $0.002. Input is about 98% of that, so Compression and Cache matter most: each 1,000 input tokens removed saves $0.0002, each 1,000 read from the cache saves $0.00018, and each 1,000 written to it costs $0.00005 extra.
+A plain move, with every option off, doesn't use the cache, so only input and output count:
+
+[![Cost of one plain Luna move: (10,000 input tokens × $0.20 + 35 output tokens × $1.20) ÷ 1,000,000 ≈ $0.002, with prices per 1M tokens. Input is $0.002000 of that and output $0.000042, so input is about 98% of the cost.](docs/images/luna-move-cost-equation.png)](docs/images/luna-move-cost-equation.png)
+
+Because input is about 98% of the cost, Compression and Cache matter most: each 1,000 input tokens removed saves $0.0002, each 1,000 read from the cache saves $0.00018, and each 1,000 written to it costs $0.00005 extra.
 
 SQLite stores token counts, not dollars, so totals, savings, and **Points / cent** always follow the current rates ([room](server/room.ts)). To check the rates for your region:
 
