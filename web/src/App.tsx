@@ -1,5 +1,5 @@
-import { useEffect, useRef, useState } from 'react';
-import { Bot, Brain, Columns2, FileJson2, History, Layers3, MessagesSquare, Pause, Play, Plug, Quote, ReceiptText, RotateCcw, ScanSearch, Trophy, Wifi, WifiOff, X } from 'lucide-react';
+import { useEffect, useMemo, useRef, useState } from 'react';
+import { Bot, Brain, Columns2, FileJson2, GitCompareArrows, History, Layers3, MessagesSquare, Pause, Play, Plug, Quote, ReceiptText, RotateCcw, ScanSearch, Trophy, Wifi, WifiOff, X } from 'lucide-react';
 import type { LucideIcon } from 'lucide-react';
 import { costForUsage, LUNA_API_PATH, lunaRequestBody, reportedTokenBalance } from '../../shared/protocol.ts';
 import type { Insight, McpLookaheadResult, TokenRates } from '../../shared/protocol.ts';
@@ -8,7 +8,7 @@ import { GameBoard, GameControls, PiecePreview } from './GameBoard.tsx';
 import { GameSetup, RoomMaintenance, RoomPanel, RoomShare } from './RoomPanel.tsx';
 import { formatMoney } from './format.ts';
 import { useGame } from './useGame.ts';
-import type { RequestRecord } from './useGame.ts';
+import type { ComparisonState, RequestRecord } from './useGame.ts';
 import './App.css';
 
 const number = (value: number) => value.toLocaleString();
@@ -25,7 +25,69 @@ function chosenPlacement(outputText: string) {
   } catch { return null; }
 }
 
-function LunaExchange({ record, rates }: { record: RequestRecord; rates: TokenRates | undefined }) {
+interface OfferedMove { id: string; piece: string; column: number; rotation: number; useHold: boolean; clearedLines: number; holes: number; maxHeight: number; gameOver: boolean }
+// The legal placements Luna was offered, with the engine's outcome for each, as listed in the request's user message.
+function offeredMoves(prompt: string) {
+  try {
+    const placements: unknown = JSON.parse(prompt).placements;
+    return new Map((Array.isArray(placements) ? placements as OfferedMove[] : []).map(move => [move.id, move]));
+  } catch { return new Map<string, OfferedMove>(); }
+}
+
+function ReasoningCompare({ record, state, rates, canCompare, onCompare }: {
+  record: RequestRecord; state: ComparisonState | undefined; rates: TokenRates | undefined; canCompare: boolean; onCompare: () => void;
+}) {
+  const { insight } = record;
+  const moves = useMemo(() => offeredMoves(insight.prompt), [insight.prompt]);
+  const flipped = insight.reasoningEnabled ? 'off' : 'low';
+  const estimate = rates ? costForUsage(insight.usage, rates).total : null;
+  const original = { source: 'This reply', placementId: chosenPlacement(insight.outputText), valid: insight.status !== 'invalid', tip: insight.tip, usage: insight.usage, latencyMs: insight.latencyMs };
+  const replay = state?.state === 'done' ? { source: 'Replay', placementId: state.comparison.placementId, valid: state.comparison.status === 'ready', tip: state.comparison.tip, usage: state.comparison.usage, latencyMs: state.comparison.latencyMs } : null;
+  const [off, low] = insight.reasoningEnabled ? [replay, original] : [original, replay];
+  const sides = off && low ? [off, low] : null;
+  const describe = (side: typeof original) => {
+    const move = side.placementId ? moves.get(side.placementId) : undefined;
+    return side.valid && move ? `${side.placementId} (${number(move.clearedLines)} ${move.clearedLines === 1 ? 'line' : 'lines'}, ${number(move.holes)} ${move.holes === 1 ? 'hole' : 'holes'}, max height ${number(move.maxHeight)})` : 'a rejected reply';
+  };
+  let verdict = '';
+  if (off && low) {
+    const tokens = low.usage.output - off.usage.output;
+    const outputCost = rates ? tokens * rates.output / 1000000 : null;
+    const seconds = (low.latencyMs - off.latencyMs) / 1000;
+    const effect = `With reasoning: ${tokens >= 0 ? '+' : '-'}${number(Math.abs(tokens))} output tokens (${signedMoney(outputCost)}), ${seconds >= 0 ? '+' : '-'}${Math.abs(seconds).toFixed(1)} s.`;
+    verdict = `${off.valid && low.valid && off.placementId === low.placementId ? `Same move, ${describe(low)}.` : `Different outcome: ${describe(off)} without reasoning, ${describe(low)} with it.`} ${effect}`;
+  }
+  return <section className="reasoning-compare" data-testid="reasoning-compare" aria-label="Reasoning comparison">
+    <header><h4><GitCompareArrows size={15} />Reasoning comparison</h4>{state?.state !== 'done' && <button type="button" className="compare-button" disabled={state?.state === 'pending' || !canCompare} onClick={onCompare}>{state?.state === 'pending' ? `Replaying with Reasoning ${flipped}...` : `Replay with Reasoning ${flipped}`}</button>}</header>
+    {state?.state !== 'done' && <p className="prompt-comparison" role={state?.state === 'pending' ? 'status' : undefined}>{state?.state === 'pending' ? `Waiting for Luna's reply with Reasoning ${flipped}. Luna's next move waits until it arrives.` : `Sends this exact request again with only Reasoning changed to ${flipped}, and shows both replies side by side. The replay is never played, but it's a paid Luna call${estimate === null ? '' : ` (about $${Number(estimate.toPrecision(1))})`} that counts toward your AI cost and allowance.`}</p>}
+    {state?.state === 'error' && <p className="field-error" role="alert" data-testid="compare-error">{state.message}</p>}
+    {sides && <>
+      <p className="compare-verdict" data-testid="compare-verdict">{verdict}</p>
+      <div className="compare-table" tabIndex={0} aria-label="Reasoning off and low replies"><table>
+        <thead><tr><th scope="col"><span className="visually-hidden">Measure</span></th>{sides.map((side, index) => <th scope="col" key={index}>Reasoning {index ? 'low' : 'off'}<small>{side.source}</small></th>)}</tr></thead>
+        <tbody>
+          <tr><th scope="row">Move</th>{sides.map((side, index) => {
+            const move = side.placementId ? moves.get(side.placementId) : undefined;
+            return <td key={index} data-testid={`compare-move-${index ? 'low' : 'off'}`}><strong>{side.valid ? side.placementId : 'Rejected'}</strong>{side.valid && move && <small>{move.piece} / column {move.column} / rotation {move.rotation}{move.useHold ? ' / Hold' : ''}{move.gameOver ? ' / game over' : ''}</small>}</td>;
+          })}</tr>
+          <tr><th scope="row">Lines / holes / max height</th>{sides.map((side, index) => {
+            const move = side.valid && side.placementId ? moves.get(side.placementId) : undefined;
+            return <td key={index}>{move ? `${number(move.clearedLines)} / ${number(move.holes)} / ${number(move.maxHeight)}` : '--'}</td>;
+          })}</tr>
+          <tr><th scope="row">Tip</th>{sides.map((side, index) => <td key={index}>{side.tip}</td>)}</tr>
+          <tr><th scope="row">Output tokens</th>{sides.map((side, index) => <td key={index} data-testid={`compare-output-${index ? 'low' : 'off'}`}>{number(side.usage.output)}<small>{side.usage.reasoning === null ? 'reasoning not reported' : `${number(side.usage.reasoning)} reasoning`}</small></td>)}</tr>
+          <tr><th scope="row">Time</th>{sides.map((side, index) => <td key={index}>{number(side.latencyMs)} ms</td>)}</tr>
+          <tr><th scope="row">Cost <small>est.</small></th>{sides.map((side, index) => <td key={index}>{formatMoney(rates ? costForUsage(side.usage, rates).total : null)}</td>)}</tr>
+        </tbody>
+      </table></div>
+      <small>Moves are scored by the game engine on the same board. Luna&apos;s reasoning itself stays hidden: the API returns only its token count.</small>
+    </>}
+  </section>;
+}
+
+function LunaExchange({ record, rates, comparison, canCompare, onCompare }: {
+  record: RequestRecord; rates: TokenRates | undefined; comparison: ComparisonState | undefined; canCompare: boolean; onCompare: () => void;
+}) {
   const { insight } = record;
   const settings = insight.request;
   const body = settings && insight.systemPrompt !== undefined ? lunaRequestBody(settings, insight.systemPrompt, insight.prompt, insight.cacheEnabled) : null;
@@ -63,6 +125,7 @@ function LunaExchange({ record, rates }: { record: RequestRecord; rates: TokenRa
         <div><dt>Output tokens</dt><dd data-testid="exchange-output">{number(insight.usage.output)} <small>{insight.usage.reasoning === null ? 'reasoning not reported' : `${number(insight.usage.reasoning)} reasoning`}</small></dd></div>
         <div><dt>Cost <small>est.</small></dt><dd>{formatMoney(cost)}</dd></div>
       </dl>
+      <ReasoningCompare record={record} state={comparison} rates={rates} canCompare={canCompare} onCompare={onCompare} />
       {insight.response && <details className="mcp-raw"><summary>Response body (JSON)</summary><pre tabIndex={0} data-testid="exchange-response-body">{JSON.stringify(insight.response, null, 2)}</pre></details>}
     </section>
   </div>;
@@ -366,7 +429,7 @@ export default function App() {
         </div>
         {exchangeRecord ? <>
           <p className="exchange-summary" data-testid="exchange-summary">Reply {replyLabel(exchangeRecord)}{pinnedReply ? ' / pinned' : ' / follows Luna live'}</p>
-          <LunaExchange record={exchangeRecord} rates={rates} />
+          <LunaExchange record={exchangeRecord} rates={rates} comparison={game.comparisons[exchangeRecord.insight.id]} canCompare={game.connected && game.joined} onCompare={() => { setPinnedReply(exchangeRecord); void game.compareReasoning(exchangeRecord.insight.id); }} />
           <small>Exact messages and settings from this tab&apos;s latest 20 Luna requests. Response bodies omit the provider&apos;s internal routing and latency diagnostics. Opening this makes no model call.</small>
         </> : <p data-testid="exchange-empty" role="status">{game.busy ? 'A Luna request is in flight. Its messages and reply appear here when the reply arrives.' : 'No Luna replies in this tab yet. Turn on Ask Luna to see each request sent to Luna and its reply.'}</p>}
       </>}

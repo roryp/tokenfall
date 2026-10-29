@@ -48,7 +48,7 @@ Touch controls sit below the board. If keys stop responding after you type in a 
 
 | Option | Effect |
 | --- | --- |
-| Reasoning | Low reasoning effort: slower, with more output tokens. |
+| Reasoning | Low reasoning effort: slower, with more output tokens. [Compare a move with and without it](#request-and-reply). |
 | MCP | Two-placement lookahead, including Hold: about 15% more cost and 0.6 s of tool time per move. |
 | Compression | Packs the same board into fewer input tokens. |
 | Cache | Reuses the instructions when the provider confirms a hit. Writes can cost extra, and hits aren't guaranteed. |
@@ -57,17 +57,20 @@ Options start off and apply from the next request. Compression and Cache combine
 
 ### Request and reply
 
-**Request & reply** in **Information & tools** shows exactly what Luna is sent and what it returns, live while it plays. It makes no model call and doesn't pause Luna.
+**Request & reply** in **Information & tools** shows exactly what Luna is sent and what it returns, live while it plays. Opening it makes no model call and doesn't pause Luna.
 
-[![The Luna request and reply inspector: the request settings, the system and user messages sent to gpt-5.6-luna, and Luna's JSON reply with its finish reason, verdict, tokens, and cost.](docs/images/luna-request-reply.png)](docs/images/luna-request-reply.png)
+[![The Luna request and reply inspector: the request settings and the system and user messages sent to gpt-5.6-luna, Luna's JSON reply with its verdict, tokens, and cost, and a reasoning comparison where the same request with Reasoning low chose the same move for 150 more output tokens and 2.1 s.](docs/images/luna-request-reply.png)](docs/images/luna-request-reply.png)
 
 | Part | Shows |
 | --- | --- |
 | Sent to Luna | The settings (`model`, `reasoning_effort`, `max_completion_tokens`, the strict `tetris_move` JSON schema, the prompt cache key), the system message (the fixed [policy](server/policy.md), plus MCP guidance with MCP on), and the user message (the board and legal placements, packed with Compression on) |
 | Luna's reply | The message Luna returned (a `placementId` and a tip), its finish reason and time, whether the server accepted the move, and its tokens and cost |
+| Reasoning comparison | **Replay with Reasoning low** (or **off**) sends the same request again with only `reasoning_effort` and its completion cap changed, then shows both replies side by side: each move with its lines, holes, and max height on the same board, the tip, output and reasoning tokens, time, and cost |
 | Full bodies | The JSON request body and Luna's response body, one click away. The response leaves out the provider's internal routing and latency diagnostics. |
 
 It follows each new reply. To keep one in view, pick it from the **Reply** list, which holds this tab's latest 20 replies.
+
+**A reasoning comparison is a paid Luna request** (about the cost of a move). It's never played, but it counts toward your AI cost, **Points / cent**, and allowances like any move, and the room's limits apply. Luna's next move waits for it, and each reply is compared once. Reasoning itself can't be shown: Chat Completions returns only a `reasoning_tokens` count, and [reasoning summaries](https://learn.microsoft.com/azure/foundry/openai/how-to/reasoning#reasoning-summary) from the Responses API came back empty for Luna's moves in October 2026 tests, even at medium effort.
 
 ### Pricing
 
@@ -257,7 +260,7 @@ Each Luna move is one trace ([tracing](server/tracing.ts)) that follows the [Ope
 
 | Span | Records |
 | --- | --- |
-| `invoke_agent Luna` | Options, reserved tokens, move status, and usage |
+| `invoke_agent Luna` | Options, reserved tokens, move status, and usage; reasoning comparisons are marked `tokenfall.ai.reasoning_replay` |
 | `execute_tool analyze_future_moves` | MCP lookahead time and result tokens |
 | `chat gpt-5.6-luna` | Response ID, finish reason, and input, output, cache, and reasoning tokens |
 

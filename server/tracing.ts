@@ -53,7 +53,7 @@ export function traceLunaRequest<T>(conversationId: string, model: string, optio
   }, run));
 }
 
-export function recordLunaResult(span: Span, insight: Insight) {
+export function recordLunaResult(span: Span, insight: Pick<Insight, 'usage' | 'status' | 'savedTokens' | 'mcpLookup'>) {
   span.setAttributes({
     ...usageAttributes(insight.usage),
     'tokenfall.move.status': insight.status,

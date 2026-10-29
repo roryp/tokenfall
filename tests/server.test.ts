@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
+import { randomUUID } from 'node:crypto';
 import { mkdtempSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -16,9 +17,9 @@ import { costForUsage, DEFAULT_TOKEN_ALLOWANCE, emptyMetrics, lunaRequestBody, r
 import type { AiOptions, Insight, JoinResult, Reply, RoomView, TokenPricing } from '../shared/protocol.ts';
 import { clientAddress, createApplication, JOINS_PER_SEAT_PER_MINUTE, SOCKET_EVENT_BURST, TOKENIZE_REQUESTS_PER_SEAT_PER_MINUTE, trustedProxy } from '../server/app.ts';
 import { DEFAULT_ROOM_CAPACITY, loadConfig, MIN_ADMIN_KEY_LENGTH } from '../server/config.ts';
-import { AI_COOLDOWN_MS, AUTOPILOT_COOLDOWN_MS, BASE_ROOM_LIMITS, deploymentLimits, EVALUATION_INTERVAL_MS, LUNA_ATTEMPT_TIMEOUT_MS, LUNA_REASONING_ATTEMPT_TIMEOUT_MS, LUNA_RETRY_DELAY_MS, LunaGateway, MAX_MCP_IN_FLIGHT, MAX_OUTPUT_TOKENS, MAX_REASONING_COMPLETION_TOKENS, ModelGate, PLAYER_REQUEST_LIMIT, PLAYER_TOKEN_BUDGET, POLICY, PREFIX_TOKENS, ROOM_EVALUATIONS_PER_SECOND, ROOM_REQUEST_LIMIT, ROOM_TOKEN_BUDGET, roomLimits } from '../server/model.ts';
-import type { ModelGateway } from '../server/model.ts';
-import { MIN_REGISTRATION_LIMIT, Room, WRITE_FLUSH_MS } from '../server/room.ts';
+import { AI_COOLDOWN_MS, AUTOPILOT_COOLDOWN_MS, BASE_ROOM_LIMITS, deploymentLimits, EVALUATION_INTERVAL_MS, LUNA_ATTEMPT_TIMEOUT_MS, LUNA_REASONING_ATTEMPT_TIMEOUT_MS, LUNA_RETRY_DELAY_MS, LunaGateway, lunaRequestSettings, MAX_MCP_IN_FLIGHT, MAX_OUTPUT_TOKENS, MAX_REASONING_COMPLETION_TOKENS, MCP_GUIDANCE, ModelGate, PLAYER_REQUEST_LIMIT, PLAYER_TOKEN_BUDGET, POLICY, PREFIX_TOKENS, ROOM_EVALUATIONS_PER_SECOND, ROOM_REQUEST_LIMIT, ROOM_TOKEN_BUDGET, roomLimits } from '../server/model.ts';
+import type { LunaReplayRequest, ModelGateway } from '../server/model.ts';
+import { MIN_REGISTRATION_LIMIT, REPLAY_LIMIT, Room, WRITE_FLUSH_MS } from '../server/room.ts';
 import { buildPrompts, countTokens, gameTokens } from '../server/tokens.ts';
 import { lookaheadSnapshot, lookupBoardFacts, lookupFutureMoves, McpLookupError, MAX_MCP_CONTEXT_TOKENS } from '../server/mcp.ts';
 import { analyzeFutureMoves, boardFactsSchema, lookaheadOutputSchema } from '../server/mcp-server.ts';
@@ -840,6 +841,84 @@ test('the gateway passes Luna\'s Hold choice unchanged and never substitutes an 
     assert.deepEqual(JSON.parse(JSON.stringify(sent)).response_format, request.response_format);
     assert.equal(mock.mock.callCount(), 2);
   } finally { rmSync(setup.dataDirectory, { recursive: true, force: true }); }
+});
+
+test('a reasoning replay resends the recorded request with only the reasoning effort and its cap changed', async context => {
+  const setup = fixture();
+  const gateway = new LunaGateway(setup.config);
+  const game = new Game('reasoning-replay');
+  const placements = placementsFor(game);
+  const sent: Record<string, unknown>[] = [];
+  let choice = placements[0].id;
+  context.mock.method(gateway['client'].chat.completions, 'create', async (request: unknown) => {
+    sent.push(JSON.parse(JSON.stringify(request)));
+    const reasoning = (request as { reasoning_effort: string }).reasoning_effort === 'low' ? 90 : 0;
+    return { id: 'chatcmpl-replay', choices: [{ index: 0, finish_reason: 'stop', message: { role: 'assistant', content: JSON.stringify({ placementId: choice, tip: 'Replayed.' }) } }], usage: { prompt_tokens: 4000, completion_tokens: 30 + reasoning, total_tokens: 4030 + reasoning, prompt_tokens_details: { cached_tokens: 0, cache_write_tokens: 0 }, completion_tokens_details: { reasoning_tokens: reasoning } }, routing: { serving_pipereplica: 'internal-replica' } };
+  });
+  try {
+    const before = game.view();
+    const original = await gateway.complete(game, { compression: true, cache: true }, 'test');
+    const recorded: LunaReplayRequest = { settings: original.request!, lookahead: false, cache: original.cacheEnabled, prompt: original.prompt };
+    const replay = await gateway.replay(recorded, true);
+    assert.deepEqual(sent[1], { ...sent[0], reasoning_effort: 'low', max_completion_tokens: MAX_REASONING_COMPLETION_TOKENS });
+    assert.deepEqual(replay.request, { ...original.request, reasoning_effort: 'low', max_completion_tokens: MAX_REASONING_COMPLETION_TOKENS });
+    assert.deepEqual({ reasoningEnabled: replay.reasoningEnabled, placementId: replay.placementId, status: replay.status, tip: replay.tip, finishReason: replay.finishReason }, { reasoningEnabled: true, placementId: choice, status: 'ready', tip: 'Replayed.', finishReason: 'stop' });
+    assert.equal(replay.usage.reasoning, 90);
+    assert.equal('routing' in replay.response!, false);
+    choice = 'not-offered';
+    const rejected = await gateway.replay(recorded, false);
+    assert.deepEqual({ status: rejected.status, placementId: rejected.placementId, effort: rejected.request.reasoning_effort }, { status: 'invalid', placementId: 'not-offered', effort: 'none' });
+    assert.equal(sent[2].max_completion_tokens, MAX_OUTPUT_TOKENS);
+    await gateway.replay({ ...recorded, settings: lunaRequestSettings('test-only', { compression: true, cache: true }, 'test', true), lookahead: true }, true);
+    assert.equal((sent[3].messages as { content: { text: string }[] }[])[0].content[0].text, POLICY + MCP_GUIDANCE);
+    assert.equal(sent[3].prompt_cache_key, 'tokenfall-policy-v4:test:lookahead-v2');
+    assert.deepEqual(game.view(), before);
+  } finally { rmSync(setup.dataDirectory, { recursive: true, force: true }); }
+});
+
+test('reasoning comparisons are metered like moves, never change the game, and run once per reply', async context => {
+  context.mock.timers.enable({ apis: ['Date'], now: 50000 });
+  const setup = fixture();
+  const replays: { request: LunaReplayRequest; reasoning: boolean }[] = [];
+  const gateway: ModelGateway = {
+    complete: async (game, options, cacheBucket) => {
+      const prompts = buildPrompts(game, placementsFor(game));
+      return { ...insightFor(game), id: randomUUID(), compression: options.compression, cacheEnabled: options.cache, reasoningEnabled: Boolean(options.reasoning), prompt: options.compression ? prompts.packed : prompts.verbose, rawTokens: prompts.rawTokens, packedTokens: prompts.packedTokens, savedTokens: options.compression ? prompts.rawTokens - prompts.packedTokens : 0, request: lunaRequestSettings('test-only', options, cacheBucket, false) };
+    },
+    replay: async (request, reasoning) => {
+      replays.push({ request, reasoning });
+      return { reasoningEnabled: reasoning, placementId: JSON.parse(request.prompt).placements[1].id, status: 'ready', tip: 'Replay fixture.', usage: { input: 2000, output: 150, total: 2150, cached: 0, cacheWrites: 0, reasoning: 120 }, latencyMs: 20, outputText: '{}', finishReason: 'stop', request: { ...request.settings, reasoning_effort: 'low', max_completion_tokens: MAX_REASONING_COMPLETION_TOKENS } };
+    },
+  };
+  const room = new Room(setup.config, gateway);
+  try {
+    room.join('Comparer', room.code, undefined, 'socket');
+    const player = room.playerFor('socket');
+    const { insight } = await room.assist(player, { compression: true, cache: false, autopilot: true });
+    const before = { view: player.game.view(), events: player.game.events.length, attempts: player.record.attempts, metrics: { ...player.metrics } };
+    await assert.rejects(room.compareReasoning(player, insight.id), { code: 'cooldown' });
+    context.mock.timers.tick(AUTOPILOT_COOLDOWN_MS);
+    const result = await room.compareReasoning(player, insight.id);
+    assert.deepEqual(replays, [{ request: { settings: insight.request, lookahead: false, cache: false, prompt: insight.prompt }, reasoning: true }]);
+    assert.equal(result.comparison.replyId, insight.id);
+    assert.equal(player.record.attempts, before.attempts + 1);
+    assert.deepEqual({ requests: result.metrics.requests, output: result.metrics.output, reasoning: result.metrics.reasoning }, { requests: before.metrics.requests + 1, output: before.metrics.output + 150, reasoning: before.metrics.reasoning + 120 });
+    assert.deepEqual(player.game.view(), before.view);
+    assert.equal(player.game.events.length, before.events);
+    const again = await room.compareReasoning(player, insight.id);
+    assert.equal(replays.length, 1, 'A compared reply is never replayed twice');
+    assert.deepEqual(again.comparison, result.comparison);
+    await assert.rejects(room.compareReasoning(player, randomUUID()), { code: 'compare-expired' });
+    context.mock.timers.tick(AUTOPILOT_COOLDOWN_MS);
+    const next = await room.assist(player, { compression: true, cache: false, autopilot: true });
+    player.record.token_limit = player.metrics.input + player.metrics.output + 100;
+    context.mock.timers.tick(AUTOPILOT_COOLDOWN_MS);
+    await assert.rejects(room.compareReasoning(player, next.insight.id), { code: 'budget' });
+    assert.equal(replays.length, 1);
+    for (let index = 0; index < REPLAY_LIMIT; index += 1) room['rememberReply'](player, { ...next.insight, id: randomUUID() });
+    assert.equal(player.replays.size, REPLAY_LIMIT);
+    assert.equal(player.replays.has(insight.id), false);
+  } finally { room.close(); rmSync(setup.dataDirectory, { recursive: true, force: true }); }
 });
 
 test('reasoning is opt-in, uses a bounded completion budget, and never bypasses legal-move validation', async context => {

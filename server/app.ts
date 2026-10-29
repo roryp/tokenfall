@@ -21,6 +21,7 @@ const inputSchema = z.object({
   events: z.array(z.object({ frame: z.number().int().nonnegative(), action: z.enum(ACTIONS) }).strict()).max(64),
 }).strict();
 const aiSchema = z.object({ cache: z.boolean(), compression: z.boolean(), reasoning: z.boolean().optional(), mcp: z.boolean().optional(), autopilot: z.boolean().optional() }).strict();
+const compareSchema = z.object({ id: z.uuid() }).strict();
 export const SOCKET_EVENT_BURST = 120;
 export const SOCKET_EVENTS_PER_SECOND = 60;
 // Audiences often share one venue address, so per-address limits grow with the room.
@@ -219,6 +220,19 @@ export function createApplication(config: AppConfig, gateway: ModelGateway = new
         socket.emit('usage', room.usage(player));
         const data = await pending;
         respond({ ok: true, data });
+      } catch (error) { respond(errorReply(error)); }
+      finally {
+        const player = [...room.players.values()].find(candidate => candidate.socketId === socket.id);
+        if (player) socket.emit('usage', room.usage(player));
+      }
+    });
+    socket.on('compare', async (payload, respond) => {
+      if (typeof respond !== 'function') return;
+      try {
+        const player = room.playerFor(socket.id);
+        const pending = room.compareReasoning(player, compareSchema.parse(payload).id);
+        socket.emit('usage', room.usage(player));
+        respond({ ok: true, data: await pending });
       } catch (error) { respond(errorReply(error)); }
       finally {
         const player = [...room.players.values()].find(candidate => candidate.socketId === socket.id);

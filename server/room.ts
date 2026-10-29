@@ -2,12 +2,13 @@ import { createHash, randomBytes, randomUUID, timingSafeEqual } from 'node:crypt
 import { chmodSync, existsSync, mkdirSync, readFileSync } from 'node:fs';
 import path from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
+import { deflateRawSync, inflateRawSync } from 'node:zlib';
 import { Game, FPS, placementsFor } from '../shared/game.ts';
 import { costForUsage, DEFAULT_TOKEN_ALLOWANCE, emptyMetrics, MAX_REQUEST_TOKENS, MAX_TOKEN_ALLOWANCE, pointsPerCent, tokenAllowance } from '../shared/protocol.ts';
-import type { AiOptions, InputAck, InputBatch, JoinResult, LeaderboardEntry, Metrics, PlayerUsage, PromptPreview, RoomResetMode, RoomResetPreview, RoomView, TokenPricing } from '../shared/protocol.ts';
+import type { AiOptions, InputAck, InputBatch, Insight, JoinResult, LeaderboardEntry, LunaRequestSettings, Metrics, PlayerUsage, PromptPreview, ReasoningComparison, RoomResetMode, RoomResetPreview, RoomView, TokenPricing } from '../shared/protocol.ts';
 import type { AppConfig } from './config.ts';
 import { DEFAULT_ROOM_CAPACITY } from './config.ts';
-import { AI_COOLDOWN_MS, AUTOPILOT_COOLDOWN_MS, MAX_OUTPUT_TOKENS, maxCompletionTokens, ModelGate, PREFIX_TOKENS, ROOM_REQUEST_LIMIT, ROOM_TOKEN_BUDGET, RequestError } from './model.ts';
+import { AI_COOLDOWN_MS, AUTOPILOT_COOLDOWN_MS, MAX_OUTPUT_TOKENS, maxCompletionTokens, MCP_GUIDANCE_TOKENS, ModelGate, PREFIX_TOKENS, ROOM_REQUEST_LIMIT, ROOM_TOKEN_BUDGET, RequestError } from './model.ts';
 import type { ModelGateway } from './model.ts';
 import { addUsage, buildPrompts, gameTokens } from './tokens.ts';
 import { MAX_MCP_CONTEXT_TOKENS, McpLookupError } from './mcp.ts';
@@ -36,6 +37,20 @@ const digest = (value: string) => createHash('sha256').update(value).digest();
 export const MIN_REGISTRATION_LIMIT = 500;
 // A commit on Azure Files blocks the event loop for about 60 ms whatever its size, so player saves are committed together.
 export const WRITE_FLUSH_MS = 500;
+// Matches the browser's request history. A compressed board prompt is a few kilobytes, so each Luna player keeps well under 100 KB.
+export const REPLAY_LIMIT = 20;
+// What a reasoning comparison needs to send a reply's request again, kept in memory with the player.
+interface StoredReplay {
+  settings: LunaRequestSettings;
+  lookahead: boolean;
+  cache: boolean;
+  compression: boolean;
+  reasoning: boolean;
+  prompt: Buffer;
+  promptTokens: number;
+  savedTokens: number;
+  comparison?: ReasoningComparison;
+}
 export interface Player {
   record: PlayerRecord;
   metrics: Metrics;
@@ -47,6 +62,7 @@ export interface Player {
   lastSeen: number;
   inputWindow: number;
   inputCount: number;
+  replays: Map<string, StoredReplay>;
 }
 
 export class Room {
@@ -347,7 +363,7 @@ export class Room {
       record = { id: randomUUID(), token_hash: tokenHash, name, name_key: key, best_score: 0, best_lines: 0, best_level: 1, metrics: JSON.stringify(emptyMetrics()), attempts: 0, updated: now, token_text: tokenText ?? '', token_limit: DEFAULT_TOKEN_ALLOWANCE };
     }
     if (!player) {
-      player = { record, metrics: { ...emptyMetrics(), ...JSON.parse(record.metrics) }, game: game ?? this.gameFor(record.token_text), runId: randomUUID(), started: now, sequence: 0, socketId: null, lastSeen: now, inputWindow: now, inputCount: 0 };
+      player = { record, metrics: { ...emptyMetrics(), ...JSON.parse(record.metrics) }, game: game ?? this.gameFor(record.token_text), runId: randomUUID(), started: now, sequence: 0, socketId: null, lastSeen: now, inputWindow: now, inputCount: 0, replays: new Map() };
       this.players.set(record.id, player);
     } else if (game) {
       player.game = game;
@@ -496,6 +512,7 @@ export class Room {
         const bucket = parseInt(player.record.id.slice(0, 2), 16) % 8;
         const insight = await this.gateway.complete(player.game, options, `${this.code}:${bucket}`);
         player.metrics = addUsage(player.metrics, insight.usage, insight.savedTokens, options.cache);
+        this.rememberReply(player, insight);
         const current = player.game.view();
         if (insight.status === 'ready' && (runId !== player.runId || insight.pieceId !== current.pieceId || current.status === 'over')) insight.status = 'stale';
         recordLunaResult(span, insight);
@@ -510,6 +527,55 @@ export class Room {
           throw new RequestError(error.message, error.reason === 'context' ? 'mcp-context' : 'mcp');
         }
         throw error;
+      } finally { this.pendingTokens.delete(player.record.id); release(); this.followDeploymentLimits(); }
+    });
+  }
+
+  private rememberReply(player: Player, insight: Insight) {
+    if (!insight.request || !this.gateway.replay) return;
+    player.replays.set(insight.id, {
+      settings: insight.request, lookahead: Boolean(insight.mcpLookup), cache: insight.cacheEnabled, compression: insight.compression,
+      reasoning: Boolean(insight.reasoningEnabled), prompt: deflateRawSync(insight.prompt),
+      promptTokens: insight.compression ? insight.packedTokens : insight.rawTokens, savedTokens: insight.savedTokens,
+    });
+    for (const id of player.replays.keys()) {
+      if (player.replays.size <= REPLAY_LIMIT) break;
+      player.replays.delete(id);
+    }
+  }
+
+  // Sends one of the player's recent requests again with only Reasoning flipped, through the same gate, budgets and metering as a move.
+  // The reply is never played, and each reply is compared once; asking again returns the first comparison without another call.
+  async compareReasoning(player: Player, replyId: string) {
+    this.assertAvailable(player);
+    const stored = player.replays.get(replyId);
+    const replay = this.gateway.replay?.bind(this.gateway);
+    if (!stored || !replay) throw new RequestError(`Only your latest ${REPLAY_LIMIT} Luna replies can be compared. Pick a newer reply.`, 'compare-expired');
+    if (stored.comparison) return { comparison: stored.comparison, ...this.usage(player) };
+    const now = Date.now();
+    this.gate.admit(player.record.id, now, true);
+    const totals = this.totals();
+    if (totals.attempts >= ROOM_REQUEST_LIMIT) throw new RequestError(`The room AI request allowance is used: 0 of ${ROOM_REQUEST_LIMIT.toLocaleString()} requests left. Manual play is still available.`, 'room-requests');
+    const options: AiOptions = { cache: stored.cache, compression: stored.compression, reasoning: !stored.reasoning, mcp: stored.lookahead };
+    const reservation = PREFIX_TOKENS + (stored.lookahead ? MCP_GUIDANCE_TOKENS : 0) + stored.promptTokens + maxCompletionTokens(options) + 1024;
+    const allowance = this.usage(player).allowance;
+    const roomAllowance = this.roomAllowance(totals);
+    // No MCP process runs: the recorded prompt already holds the lookahead.
+    const release = this.gate.acquire(player.record.id, reservation, allowance.used + allowance.unconfirmed, roomAllowance.used + roomAllowance.unconfirmed, now, true, allowance.limit, false);
+    this.pendingTokens.set(player.record.id, reservation);
+    player.record.attempts += 1;
+    return traceLunaRequest(player.runId, this.config.deployment, options, reservation, async span => {
+      try {
+        span.setAttribute('tokenfall.ai.reasoning_replay', true);
+        this.save(player);
+        const reply = await replay({ settings: stored.settings, lookahead: stored.lookahead, cache: stored.cache, prompt: inflateRawSync(stored.prompt).toString('utf8') }, !stored.reasoning);
+        player.metrics = addUsage(player.metrics, reply.usage, stored.savedTokens, stored.cache);
+        recordLunaResult(span, { usage: reply.usage, status: reply.status, savedTokens: stored.savedTokens });
+        stored.comparison = { replyId, ...reply };
+        this.save(player);
+        this.pendingTokens.delete(player.record.id);
+        release();
+        return { comparison: stored.comparison, ...this.usage(player) };
       } finally { this.pendingTokens.delete(player.record.id); release(); this.followDeploymentLimits(); }
     });
   }

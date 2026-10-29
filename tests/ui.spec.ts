@@ -10,7 +10,7 @@ import { chromium } from 'playwright-core';
 import type { Browser, BrowserContext, Locator, Page } from 'playwright-core';
 import { createApplication } from '../server/app.ts';
 import { lunaRequestSettings, maxCompletionTokens, MCP_GUIDANCE, POLICY, PREFIX_TOKENS, RequestError } from '../server/model.ts';
-import type { ModelGateway } from '../server/model.ts';
+import type { LunaReplayRequest, ModelGateway } from '../server/model.ts';
 import { buildPrompts, countTokens, gameTokens, tokenChips, unpackBoard } from '../server/tokens.ts';
 import { lookaheadSnapshot, lookupFutureMoves, McpLookupError, mcpPromptContext } from '../server/mcp.ts';
 import { Game, placementsFor, tokenLabel, tokenShape } from '../shared/game.ts';
@@ -40,6 +40,7 @@ async function fixture(viewport = { width: 1366, height: 768 }, autoJoin = true,
   const events = new EventEmitter();
   const releases: (() => void)[] = [];
   const calls: { options: AiOptions; usage: Usage; prompt: string; systemPrompt: string; outputText: string; verbose: string; packed: string; rawTokens: number; packedTokens: number; mcpLookup?: McpLookup }[] = [];
+  const replayCalls: { request: LunaReplayRequest; reasoning: boolean }[] = [];
   let cacheWarm = false;
   const gateway: ModelGateway = { complete: async (game, options) => {
     if (options.mcp && controls.mcpFail) throw new McpLookupError();
@@ -88,6 +89,26 @@ async function fixture(viewport = { width: 1366, height: 768 }, autoJoin = true,
         request: lunaRequestSettings('gpt-5.6-luna', options, 'ui-test', Boolean(mcpLookup)), finishReason,
         response: { id: `chatcmpl-ui-${calls.length}`, object: 'chat.completion', model: 'gpt-5.6-luna', choices: [{ index: 0, finish_reason: finishReason, message: { role: 'assistant', content: outputText } }], usage: { prompt_tokens: input, completion_tokens: output, total_tokens: input + output, prompt_tokens_details: { cached_tokens: cached, cache_write_tokens: cacheWrites }, completion_tokens_details: { reasoning_tokens: reasoning } } },
         inputChips: [], outputChips: tokenChips(outputText),
+      };
+    } finally { controls.inFlight -= 1; }
+  }, replay: async (request, reasoning) => {
+    controls.inFlight += 1;
+    controls.maxInFlight = Math.max(controls.maxInFlight, controls.inFlight);
+    replayCalls.push({ request, reasoning });
+    try {
+      const pending = controls.hold ? new Promise<void>(resolve => releases.push(resolve)) : null;
+      events.emit('replay');
+      if (pending) await pending;
+      // The synthetic replay picks the move the synthetic Luna ranks last, so the comparison shows a different outcome.
+      const offered = (JSON.parse(request.prompt).placements as { id: string; gameOver: boolean; holes: number; clearedLines: number; aggregateHeight: number }[]).filter(placement => !placement.gameOver);
+      const choice = [...offered].sort((first, second) => first.holes - second.holes || second.clearedLines - first.clearedLines || first.aggregateHeight - second.aggregateHeight).at(-1)!;
+      const outputText = JSON.stringify({ placementId: choice.id, tip: 'Synthetic replay, not a live model.' });
+      const input = countTokens(POLICY + (request.lookahead ? MCP_GUIDANCE : '')) + countTokens(request.prompt);
+      const output = 20 + (reasoning ? 256 : 0);
+      return {
+        reasoningEnabled: reasoning, placementId: choice.id, status: 'ready' as const, tip: 'Synthetic replay, not a live model.',
+        usage: { input, output, cached: 0, cacheWrites: 0, total: input + output, reasoning: reasoning ? 256 : 0 }, latencyMs: 60, outputText, finishReason: 'stop',
+        request: { ...request.settings, reasoning_effort: reasoning ? 'low' as const : 'none' as const, max_completion_tokens: maxCompletionTokens({ cache: request.cache, compression: true, reasoning }) },
       };
     } finally { controls.inFlight -= 1; }
   } };
@@ -163,8 +184,9 @@ async function fixture(viewport = { width: 1366, height: 768 }, autoJoin = true,
   }
   const player = () => [...application.room.players.values()].find(candidate => candidate.socketId)!;
   return {
-    page, controls, calls, application, errors, admittedAt, player,
+    page, controls, calls, replayCalls, application, errors, admittedAt, player,
     waitForCalls: async (count: number) => { while (calls.length < count) await once(events, 'request', { signal: AbortSignal.timeout(8000) }); },
+    waitForReplays: async (count: number) => { while (replayCalls.length < count) await once(events, 'replay', { signal: AbortSignal.timeout(8000) }); },
     waitForGame: async (predicate: (game: Game) => boolean) => { while (!predicate(player().game)) await once(events, 'inputs', { signal: AbortSignal.timeout(8000) }); },
     release: () => { const release = releases.shift(); assert.ok(release, 'Expected a pending model fixture'); release(); },
     close: async () => { controls.hold = false; releases.splice(0).forEach(release => release()); await context.close(); await application.close(); rmSync(dataDirectory, { recursive: true, force: true }); },
@@ -955,6 +977,64 @@ test('the request and reply inspector shows the exact messages sent to Luna and 
   await page.keyboard.press('Escape');
   await dialog.waitFor({ state: 'hidden' });
   assert.equal(setup.calls.length, 5);
+  assert.deepEqual(setup.errors, []);
+});
+
+test('reasoning comparison replays a reply with Reasoning flipped and shows both side by side without playing it', { timeout: 30000 }, async context => {
+  const setup = await fixture(undefined, true, false, { compression: true, cache: true });
+  context.after(setup.close);
+  const { page } = setup;
+  const launcher = page.getByRole('region', { name: 'Information & tools', exact: true }).getByRole('button', { name: 'Inspect Luna request and reply', exact: true });
+  const dialog = page.getByRole('dialog', { name: 'Luna request & reply', exact: true });
+  const compare = dialog.getByRole('region', { name: 'Reasoning comparison', exact: true });
+  setup.controls.hold = true;
+  await page.getByRole('checkbox', { name: 'Ask Luna', exact: true }).check();
+  await setup.waitForCalls(1);
+  setup.release();
+  await waitPieces(page, 1);
+  await setup.waitForCalls(2);
+  await launcher.click();
+  await dialog.getByTestId('exchange-summary').filter({ hasText: /^Reply #1 / }).waitFor();
+  await compare.getByRole('button', { name: 'Replay with Reasoning low', exact: true }).click();
+  await compare.getByRole('button', { name: 'Replaying with Reasoning low...', exact: true }).waitFor();
+  await page.waitForTimeout(300);
+  assert.equal(setup.replayCalls.length, 0, 'The replay waits for the move already in flight');
+  setup.release();
+  await waitRequests(page, 2);
+  await setup.waitForReplays(1);
+  const pieces = await page.locator('.game-canvas').getAttribute('data-pieces');
+  await page.waitForTimeout(1200);
+  assert.equal(setup.calls.length, 2, 'Luna requests no move while the replay is pending');
+  assert.match(await dialog.getByTestId('exchange-summary').innerText(), /^Reply #1 .* \/ pinned$/);
+  setup.release();
+  const verdict = compare.getByTestId('compare-verdict');
+  await verdict.waitFor();
+  await waitRequests(page, 3);
+  const [first] = setup.calls;
+  const [replayed] = setup.replayCalls;
+  assert.equal(replayed.reasoning, true);
+  assert.equal(replayed.request.prompt, first.prompt);
+  assert.equal(replayed.request.cache, true);
+  assert.deepEqual(replayed.request.settings, lunaRequestSettings('gpt-5.6-luna', first.options, 'ui-test', false));
+  assert.match(await verdict.innerText(), /^Different outcome: \S+ \(\d+ lines?, \d+ holes?, max height \d+\) without reasoning, \S+ \(\d+ lines?, \d+ holes?, max height \d+\) with it\. With reasoning: \+256 output tokens \(\+\$0\.0003072\), \+0\.0 s\.$/);
+  assert.match(await compare.getByTestId('compare-move-off').innerText(), new RegExp(`^${JSON.parse(first.outputText).placementId}\\n`));
+  assert.equal(numeric((await compare.getByTestId('compare-output-off').innerText()).split('\n')[0]), 20);
+  assert.equal(numeric((await compare.getByTestId('compare-output-low').innerText()).split('\n')[0]), 276);
+  assert.equal(await page.locator('.game-canvas').getAttribute('data-pieces'), pieces, 'The replayed move is never played');
+  assert.equal(await compare.getByRole('button').count(), 0, 'A compared reply offers no second paid replay');
+  await setup.waitForCalls(3);
+
+  await page.keyboard.press('Escape');
+  await dialog.waitFor({ state: 'hidden' });
+  await launcher.click();
+  await dialog.getByRole('combobox', { name: 'Reply', exact: true }).selectOption({ index: 2 });
+  await dialog.getByTestId('exchange-summary').filter({ hasText: /^Reply #1 / }).waitFor();
+  await compare.getByTestId('compare-verdict').waitFor();
+  assert.equal(setup.replayCalls.length, 1);
+  await dialog.getByRole('button', { name: 'Stop Luna in request inspector', exact: true }).click();
+  setup.release();
+  await waitRequests(page, 4);
+  assert.equal(setup.controls.maxInFlight, 1);
   assert.deepEqual(setup.errors, []);
 });
 

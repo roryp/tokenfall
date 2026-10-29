@@ -7,7 +7,7 @@ import { z } from 'zod';
 import { placementsFor } from '../shared/game.ts';
 import type { Game } from '../shared/game.ts';
 import { LUNA_API_PATH, lunaRequestBody, MAX_TOKEN_ALLOWANCE } from '../shared/protocol.ts';
-import type { AiOptions, Insight, LunaRequestSettings } from '../shared/protocol.ts';
+import type { AiOptions, Insight, LunaRequestSettings, ReasoningComparison, Usage } from '../shared/protocol.ts';
 import { azureCredential } from './config.ts';
 import type { AppConfig } from './config.ts';
 import { buildPrompts, countTokens, normalizeUsage, tokenChips } from './tokens.ts';
@@ -18,6 +18,7 @@ import { recordChatResponse, traceChat, traceTool } from './tracing.ts';
 export const POLICY = readFileSync(new URL('./policy.md', import.meta.url), 'utf8');
 export const PREFIX_TOKENS = countTokens(POLICY);
 export const MCP_GUIDANCE = '\n\nMCP LOOKAHEAD\nWith MCP enabled, the optional tool supplements the immediate engine facts with two-placement simulations. Read mcpLookup.analysis before selecting your current placementId. Every original current move is included, in original order. Use survivingReplies to detect next-turn traps. lowestHolesReply and mostClearsAlternative each describe ONE achievable future path, not independent minima to combine. When analysis.replies is present, non-null forecast entries in moves are zero-based indexes into that replies table; resolve them to the same replyColumns tuples. A zero survivingReplies means no enumerated next placement avoids game over. Prefer a current move with safe continuations; compare achievable future holes, clears and height against its immediate outcome. nextMoveId belongs to a hypothetical next board and MUST NOT be returned as the current placementId. This is only two-placement lookahead, not a guarantee of survival. You still select and return one current move.';
+export const MCP_GUIDANCE_TOKENS = countTokens(MCP_GUIDANCE);
 export const MAX_OUTPUT_TOKENS = 128;
 export const MAX_REASONING_COMPLETION_TOKENS = 2048;
 export const maxCompletionTokens = (options: AiOptions) => options.reasoning ? MAX_REASONING_COMPLETION_TOKENS : MAX_OUTPUT_TOKENS;
@@ -82,9 +83,14 @@ export function roomLimits({ tokensPerMinute, requestsPerMinute }: DeploymentLim
 
 export interface ModelGateway {
   complete(game: Game, options: AiOptions, cacheBucket: string): Promise<Insight>;
+  // Sends a recorded request again with only Reasoning changed; the room never plays the reply.
+  replay?(request: LunaReplayRequest, reasoning: boolean): Promise<Omit<ReasoningComparison, 'replyId'>>;
   // The deployment's latest reported rate limits, when the provider sends them.
   readonly limits?: DeploymentLimits | null;
 }
+
+// A sent request as the room keeps it for a reasoning comparison. The system message is the policy, plus MCP guidance with lookahead.
+export interface LunaReplayRequest { settings: LunaRequestSettings; lookahead: boolean; cache: boolean; prompt: string }
 
 export class RequestError extends Error {
   code: string;
@@ -172,6 +178,17 @@ export function publicResponse(response: object) {
   return reply.usage && typeof reply.usage === 'object' ? { ...reply, usage: onlyFields(reply.usage, USAGE_FIELDS) } : reply;
 }
 
+// A reply counts only when it names an offered placement, finished normally, and used no reasoning unless Reasoning was on.
+function readMove<T extends { id: string }>(outputText: string, finishReason: string | null, usage: Usage, options: AiOptions, offered: T[]) {
+  let selection: z.infer<typeof moveSchema> | null = null;
+  try { selection = moveSchema.parse(JSON.parse(outputText)); } catch { selection = null; }
+  const allowedReasoning = options.reasoning || usage.reasoning === 0;
+  const offeredChoice = offered.find(placement => placement.id === selection?.placementId);
+  const chosen = selection && allowedReasoning && finishReason === 'stop' ? offeredChoice : undefined;
+  const tip = chosen && selection ? selection.tip : !allowedReasoning ? 'The service did not confirm zero reasoning. This move was rejected.' : finishReason === 'length' ? `The reply hit its ${maxCompletionTokens(options).toLocaleString()}-token completion cap, not your total allowance. Usage was recorded; no move was applied.` : 'The model did not return a valid legal move.';
+  return { placementId: selection?.placementId ?? null, chosen, tip };
+}
+
 export class LunaGateway implements ModelGateway {
   private client: OpenAI;
   private deployment: string;
@@ -224,16 +241,11 @@ export class LunaGateway implements ModelGateway {
     const latencyMs = Math.round(performance.now() - started);
     const outputText = result.choices[0]?.message.content ?? '';
     const finishReason = result.choices[0]?.finish_reason ?? null;
-    let selection: z.infer<typeof moveSchema> | null = null;
-    try { selection = moveSchema.parse(JSON.parse(outputText)); } catch { selection = null; }
-    const selected = placements.find(placement => placement.id === selection?.placementId);
-    const allowedReasoning = options.reasoning || usage.reasoning === 0;
-    const valid = selected && selection && allowedReasoning && finishReason === 'stop';
+    const { chosen: selected, tip } = readMove(outputText, finishReason, usage, options, placements);
     return {
       id: randomUUID(), pieceId,
-      placement: valid ? { column: selected.column, row: selected.row, rotation: selected.rotation, piece: selected.piece, useHold: selected.useHold } : null,
-      tip: valid && selection ? selection.tip : !allowedReasoning ? 'The service did not confirm zero reasoning. This move was rejected.' : finishReason === 'length' ? `The reply hit its ${maxCompletionTokens(options).toLocaleString()}-token completion cap, not your total allowance. Usage was recorded; no move was applied.` : 'The model did not return a valid legal move.',
-      status: valid ? 'ready' : 'invalid', usage, latencyMs,
+      placement: selected ? { column: selected.column, row: selected.row, rotation: selected.rotation, piece: selected.piece, useHold: selected.useHold } : null,
+      tip, status: selected ? 'ready' : 'invalid', usage, latencyMs,
       rawTokens: prompts.rawTokens, packedTokens: prompts.packedTokens,
       savedTokens: options.compression ? Math.max(0, prompts.rawTokens - prompts.packedTokens) : 0,
       compression: options.compression, cacheEnabled: options.cache, reasoningEnabled: Boolean(options.reasoning),
@@ -241,6 +253,22 @@ export class LunaGateway implements ModelGateway {
       prompt, systemPrompt, outputText, request: settings, finishReason, response: publicResponse(result),
       inputChips: tokenChips(prompt), outputChips: tokenChips(outputText),
       promptComparison: { verbose: prompts.verbose, packed: prompts.packed },
+    };
+  }
+
+  // The same messages and settings as the recorded request, with only the reasoning effort and its completion cap changed.
+  async replay({ settings, lookahead, cache, prompt }: LunaReplayRequest, reasoning: boolean): Promise<Omit<ReasoningComparison, 'replyId'>> {
+    const started = performance.now();
+    const options: AiOptions = { cache, compression: false, reasoning };
+    const request: LunaRequestSettings = { ...settings, reasoning_effort: reasoning ? 'low' : 'none', max_completion_tokens: maxCompletionTokens(options) };
+    const offered = (JSON.parse(prompt) as { placements: { id: string }[] }).placements;
+    const { result, usage } = await this.chat(lunaRequestBody(request, POLICY + (lookahead ? MCP_GUIDANCE : ''), prompt, cache), options);
+    const outputText = result.choices[0]?.message.content ?? '';
+    const finishReason = result.choices[0]?.finish_reason ?? null;
+    const { placementId, chosen, tip } = readMove(outputText, finishReason, usage, options, offered);
+    return {
+      reasoningEnabled: reasoning, placementId, status: chosen ? 'ready' : 'invalid', tip, usage,
+      latencyMs: Math.round(performance.now() - started), outputText, finishReason, request, response: publicResponse(result),
     };
   }
 

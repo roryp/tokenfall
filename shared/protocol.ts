@@ -165,6 +165,20 @@ export interface Insight {
   inputChips: TokenChip[];
   outputChips: TokenChip[];
 }
+// Luna's reply when an earlier request is sent again with only Reasoning flipped. It's metered like any request but never played.
+export interface ReasoningComparison {
+  replyId: string;
+  reasoningEnabled: boolean;
+  placementId: string | null;
+  status: 'ready' | 'invalid';
+  tip: string;
+  usage: Usage;
+  latencyMs: number;
+  outputText: string;
+  finishReason: string | null;
+  request: LunaRequestSettings;
+  response?: object;
+}
 export interface LeaderboardEntry {
   id: string;
   name: string;
@@ -247,5 +261,6 @@ export interface ClientEvents {
   configure: (data: { text: string }, reply: (result: Reply<JoinResult>) => void) => void;
   inspect: (reply: (result: Reply<PromptPreview>) => void) => void;
   assist: (options: AiOptions, reply: (result: Reply<{ insight: Insight } & PlayerUsage>) => void) => void;
+  compare: (data: { id: string }, reply: (result: Reply<{ comparison: ReasoningComparison } & PlayerUsage>) => void) => void;
 }
 export type { GameView };

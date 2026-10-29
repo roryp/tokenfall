@@ -5,11 +5,12 @@ import type { Socket } from 'socket.io-client';
 import { Game, FPS, refreshPlacement } from '../../shared/game.ts';
 import type { Action, GameView } from '../../shared/game.ts';
 import { costForUsage, emptyMetrics, MCP_LOOKUP_TIMEOUT_MS } from '../../shared/protocol.ts';
-import type { AiOptions, ClientEvents, Insight, InputAck, InputBatch, JoinResult, Metrics, PlayerUsage, Reply, RoomResetMode, RoomView, ServerEvents, TokenAllowance } from '../../shared/protocol.ts';
+import type { AiOptions, ClientEvents, Insight, InputAck, InputBatch, JoinResult, Metrics, PlayerUsage, ReasoningComparison, Reply, RoomResetMode, RoomView, ServerEvents, TokenAllowance } from '../../shared/protocol.ts';
 
 type GameSocket = Socket<ServerEvents, ClientEvents>;
 interface Session { token: string; name: string; room: string }
 export interface RequestRecord { number: number; receivedAt: string; insight: Insight }
+export type ComparisonState = { state: 'pending' } | { state: 'done'; comparison: ReasoningComparison } | { state: 'error'; message: string };
 const ADMIN_KEY_STORAGE = 'tokenfall-admin-key';
 
 function savedSession(): Session | null {
@@ -58,6 +59,7 @@ export function useGame() {
   const [allowance, setAllowance] = useState<TokenAllowance | null>(null);
   const [insight, setInsight] = useState<Insight | null>(null);
   const [requestHistory, setRequestHistory] = useState<RequestRecord[]>([]);
+  const [comparisons, setComparisons] = useState<Record<string, ComparisonState>>({});
   const historyPlayer = useRef('');
   const [busy, setBusy] = useState(false);
   const [notice, setNotice] = useState('');
@@ -88,6 +90,7 @@ export function useGame() {
   const retryCount = useRef(0);
   const pilotBlocked = useRef(false);
   const inspection = useRef(false);
+  const comparing = useRef(false);
 
   useEffect(() => {
     try { sessionStorage.setItem('tetris-luna-options', JSON.stringify(options)); } catch { return; }
@@ -165,6 +168,7 @@ export function useGame() {
     setRequestOptions(null);
     setInsight(null);
     setRequestHistory([]);
+    setComparisons({});
     setView(new Game('preview').view());
     setResetVersion(version => version + 1);
     if (mode === 'all') {
@@ -214,7 +218,7 @@ export function useGame() {
     setUnmeteredRequests(data.unmeteredRequests);
     setMetrics(data.metrics);
     setAllowance(data.allowance ?? null);
-    if (historyPlayer.current !== data.playerId) setRequestHistory([]);
+    if (historyPlayer.current !== data.playerId) { setRequestHistory([]); setComparisons({}); }
     historyPlayer.current = data.playerId;
     setJoined(true);
     setJoining(false);
@@ -366,7 +370,7 @@ export function useGame() {
   }
 
   async function requestMove() {
-    if (requestPending.current || joiningRef.current || pilotBlocked.current || inspection.current || Date.now() < nextRequestAt.current || !pilotActive.current || document.hidden || !game.current || !active.current || !socket.current?.connected) return;
+    if (requestPending.current || joiningRef.current || pilotBlocked.current || inspection.current || comparing.current || Date.now() < nextRequestAt.current || !pilotActive.current || document.hidden || !game.current || !active.current || !socket.current?.connected) return;
     if (game.current.status === 'over') { stopAutopilot(); return; }
     requestPending.current = true;
     const serial = ++requestSerial.current;
@@ -410,6 +414,41 @@ export function useGame() {
         if (game.current?.status === 'over') stopAutopilot();
       }
     });
+  }
+
+  // Sends one reply's request again with only Reasoning flipped. Luna's next move waits for it; a move already in flight finishes first.
+  async function compareReasoning(replyId: string) {
+    if (comparing.current || !socket.current?.connected || !active.current) return;
+    comparing.current = true;
+    const owner = historyPlayer.current;
+    setComparisons(current => ({ ...current, [replyId]: { state: 'pending' } }));
+    let result: ComparisonState = { state: 'error', message: 'Luna is still choosing a move. Try again in a moment.' };
+    try {
+      for (let waited = 0; requestPending.current && waited < 300; waited += 1) await new Promise(resolve => setTimeout(resolve, 100));
+      for (let attempt = 0; !requestPending.current && attempt < 3; attempt += 1) {
+        const connection = socket.current;
+        const reply = connection?.connected ? await new Promise<Reply<{ comparison: ReasoningComparison } & PlayerUsage> | null>(resolve => {
+          connection.timeout(65000).emit('compare', { id: replyId }, (error: Error | null, response: Reply<{ comparison: ReasoningComparison } & PlayerUsage>) => resolve(error ? null : response));
+        }) : null;
+        if (!reply) { result = { state: 'error', message: 'The comparison did not finish. Any provider charges will still be recorded.' }; break; }
+        if (reply.ok) {
+          if (historyPlayer.current === owner) {
+            setMetrics(reply.data.metrics);
+            setAllowance(reply.data.allowance ?? null);
+            setUnmeteredRequests(reply.data.unmeteredRequests);
+          }
+          result = { state: 'done', comparison: reply.data.comparison };
+          break;
+        }
+        result = { state: 'error', message: reply.error };
+        // Luna's last move can still hold the player's single request slot or its one-second cooldown.
+        if ((reply.code !== 'busy' && reply.code !== 'cooldown') || (reply.retryAfterMs ?? 0) > 5000) break;
+        await new Promise(resolve => setTimeout(resolve, Math.max(250, reply.retryAfterMs ?? 1000)));
+      }
+    } finally {
+      comparing.current = false;
+      if (historyPlayer.current === owner) setComparisons(current => ({ ...current, [replyId]: result }));
+    }
   }
 
   async function restart(text?: string): Promise<boolean> {
@@ -517,5 +556,5 @@ export function useGame() {
 
   const rates = room?.pricing.snapshot?.usdPerMillion;
   const cost = rates ? costForUsage(metrics, rates) : null;
-  return { room, connected, joined, joining, player, sessionName, adminAccess: adminKey !== null, view, metrics, allowance, insight, requestHistory, cost, busy, notice, setNotice, options, setOptions, autopilot, autopilotStatus, inspectionPaused, pauseForInspection, resumeAfterInspection, prepareMaintenance, resetVersion, retryAutopilot, toggleAutopilot, requestOptions, unmeteredRequests, join, switchPlayer, act, restart };
+  return { room, connected, joined, joining, player, sessionName, adminAccess: adminKey !== null, view, metrics, allowance, insight, requestHistory, comparisons, compareReasoning, cost, busy, notice, setNotice, options, setOptions, autopilot, autopilotStatus, inspectionPaused, pauseForInspection, resumeAfterInspection, prepareMaintenance, resetVersion, retryAutopilot, toggleAutopilot, requestOptions, unmeteredRequests, join, switchPlayer, act, restart };
 }
