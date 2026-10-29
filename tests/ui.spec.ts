@@ -9,12 +9,12 @@ import { after, before, test } from 'node:test';
 import { chromium } from 'playwright-core';
 import type { Browser, BrowserContext, Locator, Page } from 'playwright-core';
 import { createApplication } from '../server/app.ts';
-import { maxCompletionTokens, MCP_GUIDANCE, POLICY, PREFIX_TOKENS, RequestError } from '../server/model.ts';
+import { lunaRequestSettings, maxCompletionTokens, MCP_GUIDANCE, POLICY, PREFIX_TOKENS, RequestError } from '../server/model.ts';
 import type { ModelGateway } from '../server/model.ts';
 import { buildPrompts, countTokens, gameTokens, tokenChips, unpackBoard } from '../server/tokens.ts';
 import { lookaheadSnapshot, lookupFutureMoves, McpLookupError, mcpPromptContext } from '../server/mcp.ts';
 import { Game, placementsFor, tokenLabel, tokenShape } from '../shared/game.ts';
-import { costForUsage, emptyMetrics } from '../shared/protocol.ts';
+import { costForUsage, emptyMetrics, lunaRequestBody } from '../shared/protocol.ts';
 import type { AiOptions, McpLookup, Usage } from '../shared/protocol.ts';
 
 const jsQR = createRequire(import.meta.url)('jsqr') as typeof import('jsqr').default;
@@ -39,7 +39,7 @@ async function fixture(viewport = { width: 1366, height: 768 }, autoJoin = true,
   const controls = { hold: false, chooseHold: false, invalid: false, truncated: false, fail: false, mcpFail: false, cacheMiss: false, mixedCache: false, missingReasoning: false, firstPlacement: false, inFlight: 0, maxInFlight: 0 };
   const events = new EventEmitter();
   const releases: (() => void)[] = [];
-  const calls: { options: AiOptions; usage: Usage; prompt: string; verbose: string; packed: string; rawTokens: number; packedTokens: number; mcpLookup?: McpLookup }[] = [];
+  const calls: { options: AiOptions; usage: Usage; prompt: string; systemPrompt: string; outputText: string; verbose: string; packed: string; rawTokens: number; packedTokens: number; mcpLookup?: McpLookup }[] = [];
   let cacheWarm = false;
   const gateway: ModelGateway = { complete: async (game, options) => {
     if (options.mcp && controls.mcpFail) throw new McpLookupError();
@@ -67,7 +67,9 @@ async function fixture(viewport = { width: 1366, height: 768 }, autoJoin = true,
     const output = controls.truncated ? maxCompletionTokens(options) : 20 + reasoning;
     const usage = { input, output, cached, cacheWrites, total: input + output, reasoning: controls.missingReasoning ? null : reasoning };
     if (options.cache) cacheWarm = true;
-    calls.push({ options: { ...options }, usage, prompt: options.compression ? prompts.packed : prompts.verbose, verbose: prompts.verbose, packed: prompts.packed, rawTokens: prompts.rawTokens, packedTokens: prompts.packedTokens, mcpLookup });
+    const finishReason = controls.truncated ? 'length' : 'stop';
+    const outputText = controls.truncated ? '{"placementId":"' : JSON.stringify({ placementId: invalid ? 'not-a-legal-placement' : selected?.id, tip: 'Synthetic browser test, not a live model.' });
+    calls.push({ options: { ...options }, usage, prompt: options.compression ? prompts.packed : prompts.verbose, systemPrompt, outputText, verbose: prompts.verbose, packed: prompts.packed, rawTokens: prompts.rawTokens, packedTokens: prompts.packedTokens, mcpLookup });
     const pieceId = game.pieceId;
     try {
       const pending = controls.hold ? new Promise<void>(resolve => releases.push(resolve)) : null;
@@ -82,8 +84,10 @@ async function fixture(viewport = { width: 1366, height: 768 }, autoJoin = true,
         savedTokens: options.compression ? prompts.rawTokens - prompts.packedTokens : 0,
         compression: options.compression, cacheEnabled: options.cache, reasoningEnabled: Boolean(options.reasoning),
         ...(mcpLookup ? { mcpLookup } : {}),
-        prompt: options.compression ? prompts.packed : prompts.verbose, systemPrompt, promptComparison: { verbose: prompts.verbose, packed: prompts.packed }, outputText: '{}',
-        inputChips: [], outputChips: tokenChips('{}'),
+        prompt: options.compression ? prompts.packed : prompts.verbose, systemPrompt, promptComparison: { verbose: prompts.verbose, packed: prompts.packed }, outputText,
+        request: lunaRequestSettings('gpt-5.6-luna', options, 'ui-test', Boolean(mcpLookup)), finishReason,
+        response: { id: `chatcmpl-ui-${calls.length}`, object: 'chat.completion', model: 'gpt-5.6-luna', choices: [{ index: 0, finish_reason: finishReason, message: { role: 'assistant', content: outputText } }], usage: { prompt_tokens: input, completion_tokens: output, total_tokens: input + output, prompt_tokens_details: { cached_tokens: cached, cache_write_tokens: cacheWrites }, completion_tokens_details: { reasoning_tokens: reasoning } } },
+        inputChips: [], outputChips: tokenChips(outputText),
       };
     } finally { controls.inFlight -= 1; }
   } };
@@ -252,6 +256,7 @@ for (const viewport of [{ width: 1366, height: 768 }, { width: 390, height: 844 
       { button: 'Inspect MCP lookup', title: 'MCP lookup', close: 'Close MCP lookup', suspends: true },
       { button: 'Inspect cached instructions', title: 'Cache activity', close: 'Close prompt', suspends: false },
       { button: 'Inspect last prompt', title: 'Compression before / after', close: 'Close prompt', suspends: true },
+      { button: 'Inspect Luna request and reply', title: 'Luna request & reply', close: 'Close request and reply', suspends: false },
       { button: 'AI costs', title: 'AI costs & usage', close: 'Close AI costs', suspends: false },
       { button: 'Show leaderboard', title: 'Leaderboard', close: 'Close leaderboard', suspends: false },
       { button: 'Share game', title: `Join room ${application.room.code}`, close: 'Close join QR code', suspends: false },
@@ -270,7 +275,7 @@ for (const viewport of [{ width: 1366, height: 768 }, { width: 390, height: 844 
     for (const [index, action] of actions.entries()) {
       const launcher = page.getByRole('region', { name: 'Information & tools', exact: true }).getByRole('button', { name: action.button, exact: true });
       if (action.button === 'Change sentence') {
-        assert.equal(await launcher.isDisabled(), true);
+        assert.equal(await launcher.count(), 0, 'Change sentence is hidden while Luna plays');
         continue;
       }
       const requests = setup.calls.length;
@@ -404,6 +409,7 @@ for (const viewport of [{ width: 1366, height: 768 }, { width: 390, height: 844 
       { button: 'Inspect last prompt', title: 'Compression before / after', close: 'Close prompt', writes: [] },
       { button: 'Inspect MCP lookup', title: 'MCP lookup', close: 'Close MCP lookup', writes: [] },
       { button: 'Inspect cached instructions', title: 'Cache activity', close: 'Close prompt', writes: [] },
+      { button: 'Inspect Luna request and reply', title: 'Luna request & reply', close: 'Close request and reply', writes: [] },
       { button: 'AI costs', title: 'AI costs & usage', close: 'Close AI costs', writes: [] },
       { button: 'Show leaderboard', title: 'Leaderboard', close: 'Close leaderboard', writes: [] },
       { button: 'Share game', title: `Join room ${application.room.code}`, close: 'Close join QR code', writes: [] },
@@ -424,7 +430,10 @@ for (const viewport of [{ width: 1366, height: 768 }, { width: 390, height: 844 
       await page.locator('.tetris-app[data-playing="false"]').waitFor();
       assert.equal(await dialog.isVisible(), true, action.button);
       for (const name of action.writes) assert.equal(await dialog.getByRole('button', { name, exact: true }).isDisabled(), true, `${action.button}: ${name}`);
-      for (const name of ['New game', 'Change sentence', 'Room maintenance']) assert.equal(await page.getByRole('button', { name, exact: true, includeHidden: true }).isDisabled(), true, name);
+      for (const name of ['New game', 'Room maintenance']) assert.equal(await page.getByRole('button', { name, exact: true, includeHidden: true }).isDisabled(), true, name);
+      const sentence = page.getByRole('button', { name: 'Change sentence', exact: true, includeHidden: true });
+      if (action.button === 'Change sentence') assert.equal(await sentence.isDisabled(), true, 'An open sentence editor keeps its launcher, disabled');
+      else assert.equal(await sentence.count(), 0, 'Change sentence is hidden while disconnected');
       assert.equal(await dialog.getByRole('button', { name: action.close, exact: true }).isEnabled(), true);
       await dialog.getByRole('button', { name: action.close, exact: true }).click();
       await dialog.waitFor({ state: 'hidden' });
@@ -450,6 +459,7 @@ for (const viewport of [{ width: 1366, height: 768 }, { width: 390, height: 844 
 for (const control of [
   { name: 'header', launcher: null, stop: 'Stop Luna' },
   { name: 'cache', launcher: 'Inspect cached instructions', stop: 'Stop Luna in inspector' },
+  { name: 'request', launcher: 'Inspect Luna request and reply', stop: 'Stop Luna in request inspector' },
   { name: 'costs', launcher: 'AI costs', stop: 'Stop Luna in costs' },
 ]) {
   test(`the ${control.name} Stop button cancels Luna while disconnected and stays off on reconnect`, { timeout: 15000 }, async context => {
@@ -487,8 +497,9 @@ for (const control of [
 }
 
 for (const mutation of [
-  { event: 'configure', launcher: 'Change sentence', title: 'New sentence', submit: 'Start with sentence', close: 'Close sentence editor' },
-  { event: 'restart', launcher: 'New game', title: null, submit: 'New game', close: null },
+  // Change sentence is hidden while Luna plays, so with Luna on a sentence can only be submitted once Luna is blocked.
+  { event: 'configure', launcher: 'Change sentence', title: 'New sentence', submit: 'Start with sentence', close: 'Close sentence editor', blockLuna: true },
+  { event: 'restart', launcher: 'New game', title: null, submit: 'New game', close: null, blockLuna: false },
 ]) {
   test(`${mutation.submit} deduplicates double activation and blocks Luna until the result arrives`, { timeout: 20000 }, async context => {
     const setup = await fixture(undefined, true, false, { compression: true, cache: true });
@@ -512,8 +523,10 @@ for (const mutation of [
     await page.getByRole('button', { name: 'Inspect MCP lookup', exact: true }).click();
     setup.release();
     await waitRequests(page, 1);
-    await page.evaluate(() => { Object.defineProperty(document, 'hidden', { configurable: true, get: () => true }); document.dispatchEvent(new Event('visibilitychange')); });
+    if (mutation.blockLuna) application.room.assist = async () => { throw new RequestError('Test allowance requires attention.', 'budget'); };
+    else await page.evaluate(() => { Object.defineProperty(document, 'hidden', { configurable: true, get: () => true }); document.dispatchEvent(new Event('visibilitychange')); });
     await page.getByRole('button', { name: 'Close MCP lookup', exact: true }).click();
+    if (mutation.blockLuna) await page.getByRole('button', { name: 'Retry Luna', exact: true }).waitFor();
     if (mutation.title) {
       await page.getByRole('button', { name: mutation.launcher, exact: true }).click();
       await page.getByRole('dialog', { name: mutation.title, exact: true }).getByRole('textbox', { name: 'Your sentence', exact: true }).fill('Only one new run should be created.');
@@ -685,7 +698,7 @@ test('information panel exposes labelled inspectors and local admin above the ga
       const bounds = element.getBoundingClientRect();
       return { text: (element as HTMLElement).innerText.trim(), top: bounds.top, bottom: bounds.bottom, left: bounds.left, right: bounds.right, width: bounds.width, height: bounds.height };
     }));
-    assert.deepEqual(buttons.map(button => button.text.replace(/\s+/g, ' ')), ['MCP results', 'Cache activity', viewport.width <= 480 ? 'Prompts' : 'Compression', 'AI costs', viewport.width <= 480 ? 'Scores' : 'Leaderboard', 'Share game', 'Change sentence', 'Admin']);
+    assert.deepEqual(buttons.map(button => button.text.replace(/\s+/g, ' ')), ['MCP results', 'Cache activity', viewport.width <= 480 ? 'Prompts' : 'Compression', 'Request & reply', 'AI costs', viewport.width <= 480 ? 'Scores' : 'Leaderboard', 'Share game', 'Change sentence', 'Admin']);
     for (const button of buttons) assert.ok(button.top >= 0 && button.bottom <= viewport.height && button.left >= 0 && button.right <= viewport.width && button.width >= 44 && button.height >= 44, JSON.stringify({ viewport, button }));
     const bounds = await page.evaluate(() => ({ gameBottom: document.querySelector('.tetris-app')!.getBoundingClientRect().bottom, controlsBottom: document.querySelector('.game-controls')!.getBoundingClientRect().bottom, roomTop: document.querySelector('.room-panel')!.getBoundingClientRect().top }));
     assert.ok(bounds.controlsBottom <= bounds.gameBottom + 1, JSON.stringify({ viewport, bounds }));
@@ -696,6 +709,9 @@ test('information panel exposes labelled inspectors and local admin above the ga
   assert.equal(await page.getByRole('dialog', { name: 'MCP lookup', exact: true }).isVisible(), true);
   assert.match(await page.getByTestId('mcp-empty').innerText(), /No MCP results/);
   await page.getByRole('button', { name: 'Close MCP lookup', exact: true }).click();
+  await panel.getByRole('button', { name: 'Inspect Luna request and reply', exact: true }).click();
+  assert.match(await page.getByTestId('exchange-empty').innerText(), /No Luna replies in this tab yet/);
+  await page.getByRole('button', { name: 'Close request and reply', exact: true }).click();
   await panel.getByRole('button', { name: 'Show leaderboard', exact: true }).click();
   assert.equal(await page.getByRole('dialog', { name: 'Leaderboard', exact: true }).isVisible(), true);
   await page.keyboard.press('Escape');
@@ -805,6 +821,7 @@ test('all populated information popups keep keyboard focus, scrolling and game s
     { button: 'Inspect MCP lookup', dialog: 'MCP lookup', content: '[data-testid="mcp-tool"]', close: 'Close MCP lookup' },
     { button: 'Inspect cached instructions', dialog: 'Cache activity', content: '[data-testid="cached-instructions"]', close: 'Close prompt' },
     { button: 'Inspect last prompt', dialog: 'Compression before / after', content: '[data-testid="sent-prompt"]', close: 'Close prompt' },
+    { button: 'Inspect Luna request and reply', dialog: 'Luna request & reply', content: '[data-testid="exchange-reply"]', close: 'Close request and reply' },
     { button: 'AI costs', dialog: 'AI costs & usage', content: '[data-testid="cache-result-label"]', close: 'Close AI costs' },
     { button: 'Show leaderboard', dialog: 'Leaderboard', content: '[data-testid="leaderboard-row"]', close: 'Close leaderboard' },
     { button: 'Share game', dialog: `Join room ${setup.application.room.code}`, content: '.invite-link input', close: 'Close join QR code' },
@@ -860,17 +877,100 @@ test('all populated information popups keep keyboard focus, scrolling and game s
   assert.deepEqual(setup.errors, []);
 });
 
+test('the request and reply inspector shows the exact messages sent to Luna and each reply, live or pinned', { timeout: 30000 }, async context => {
+  const setup = await fixture(undefined, true, false, { compression: true, cache: true });
+  context.after(setup.close);
+  const { page } = setup;
+  const panel = page.getByRole('region', { name: 'Information & tools', exact: true });
+  const launcher = panel.getByRole('button', { name: 'Inspect Luna request and reply', exact: true });
+  const sentence = panel.getByRole('button', { name: 'Change sentence', exact: true });
+  const dialog = page.getByRole('dialog', { name: 'Luna request & reply', exact: true });
+  const summary = dialog.getByTestId('exchange-summary');
+  const picker = dialog.getByRole('combobox', { name: 'Reply', exact: true });
+  await launcher.click();
+  assert.match(await dialog.getByTestId('exchange-empty').innerText(), /No Luna replies in this tab yet/);
+  assert.equal(await picker.isDisabled(), true);
+  await page.keyboard.press('Escape');
+  await dialog.waitFor({ state: 'hidden' });
+  assert.equal(await sentence.isEnabled(), true);
+
+  setup.controls.hold = true;
+  await page.getByRole('checkbox', { name: 'Ask Luna', exact: true }).check();
+  await setup.waitForCalls(1);
+  assert.equal(await sentence.count(), 0, 'Change sentence is hidden while Luna plays');
+  await launcher.click();
+  await dialog.getByTestId('exchange-empty').filter({ hasText: 'A Luna request is in flight' }).waitFor();
+  assert.equal(await dialog.getByTestId('exchange-pending').innerText(), 'Request in flight / reply pending');
+  setup.release();
+  await summary.filter({ hasText: /^Reply #1 .* \/ follows Luna live$/ }).waitFor();
+  const [first] = setup.calls;
+  assert.equal(await dialog.getByTestId('exchange-system').textContent(), first.systemPrompt);
+  assert.equal(await dialog.getByTestId('exchange-user').textContent(), first.prompt);
+  assert.equal(await dialog.getByTestId('exchange-reply').textContent(), first.outputText);
+  assert.match(await dialog.getByTestId('exchange-verdict').innerText(), /^Accepted: \S+ is a legal placement\. [IOTSZJL] piece at column \d+, row -?\d+, rotation \d/);
+  const sent = lunaRequestBody(lunaRequestSettings('gpt-5.6-luna', first.options, 'ui-test', false), first.systemPrompt, first.prompt, true);
+  assert.deepEqual(JSON.parse((await dialog.getByTestId('exchange-request-body').textContent())!), JSON.parse(JSON.stringify(sent)));
+  const settings = await dialog.getByTestId('exchange-settings').innerText();
+  for (const expected of [/gpt-5\.6-luna/, /reasoning_effort\s+none/, /max_completion_tokens\s+128/, /json_schema \/ tetris_move \/ strict/, /tokenfall-policy-v4:ui-test/, /store\s+false/]) assert.match(settings, expected);
+  const response = JSON.parse((await dialog.getByTestId('exchange-response-body').textContent())!);
+  assert.equal(response.choices[0].finish_reason, 'stop');
+  assert.equal(response.choices[0].message.content, first.outputText);
+  assert.equal(numeric((await dialog.getByTestId('exchange-input').innerText()).split(' ')[0]), first.usage.input);
+
+  // Luna keeps playing while the inspector is open, and it follows each new reply until one is pinned.
+  await setup.waitForCalls(2);
+  setup.release();
+  await summary.filter({ hasText: /^Reply #2 / }).waitFor();
+  assert.equal(await dialog.getByTestId('exchange-user').textContent(), setup.calls[1].prompt);
+  await picker.selectOption({ index: 2 });
+  await summary.filter({ hasText: /^Reply #1 .* \/ pinned$/ }).waitFor();
+  assert.equal(await dialog.getByTestId('exchange-user').textContent(), first.prompt);
+  await setup.waitForCalls(3);
+  setup.release();
+  await waitRequests(page, 3);
+  assert.match(await summary.innerText(), /^Reply #1 .* \/ pinned$/);
+  await picker.selectOption({ index: 0 });
+  await summary.filter({ hasText: /^Reply #3 .* \/ follows Luna live$/ }).waitFor();
+
+  await setup.waitForCalls(4);
+  await dialog.getByRole('button', { name: 'Stop Luna in request inspector', exact: true }).click();
+  assert.equal(await page.getByRole('checkbox', { name: 'Ask Luna', exact: true }).isChecked(), false);
+  assert.equal(await dialog.getByRole('button', { name: 'Stop Luna in request inspector', exact: true }).count(), 0);
+  setup.release();
+  await summary.filter({ hasText: /^Reply #4 / }).waitFor();
+  await page.keyboard.press('Escape');
+  await dialog.waitFor({ state: 'hidden' });
+  await sentence.waitFor();
+  assert.equal(await sentence.isEnabled(), true, 'Change sentence returns once Luna stops');
+
+  setup.controls.hold = false;
+  setup.controls.invalid = true;
+  await page.getByRole('checkbox', { name: 'Ask Luna', exact: true }).check();
+  await waitRequests(page, 5);
+  await page.getByRole('button', { name: 'Stop Luna', exact: true }).click();
+  await launcher.click();
+  await summary.filter({ hasText: /^Reply #5 .* \/ Rejected/ }).waitFor();
+  assert.equal(await dialog.getByTestId('exchange-reply').textContent(), setup.calls[4].outputText);
+  assert.match(await dialog.getByTestId('exchange-verdict').innerText(), /^Rejected, no move played: /);
+  await page.keyboard.press('Escape');
+  await dialog.waitFor({ state: 'hidden' });
+  assert.equal(setup.calls.length, 5);
+  assert.deepEqual(setup.errors, []);
+});
+
 test('touch navigation works before joining and repeatedly returns to the same game', { timeout: 30000 }, async context => {
   const setup = await fixture({ width: 390, height: 844 }, false, false, undefined, true, true);
   context.after(setup.close);
   const { page, application } = setup;
   const panel = page.getByRole('region', { name: 'Information & tools', exact: true });
   await page.getByTestId('room-code').filter({ hasText: application.room.code }).waitFor();
-  for (const name of ['Inspect cached instructions', 'Inspect last prompt', 'Change sentence']) {
+  for (const name of ['Inspect cached instructions', 'Inspect last prompt']) {
     assert.equal(await panel.getByRole('button', { name, exact: true }).isDisabled(), true, name);
   }
+  assert.equal(await panel.getByRole('button', { name: 'Change sentence', exact: true }).count(), 0, 'Change sentence is hidden before joining');
   const actions = [
     { button: 'Inspect MCP lookup', title: 'MCP lookup', close: 'Close MCP lookup' },
+    { button: 'Inspect Luna request and reply', title: 'Luna request & reply', close: 'Close request and reply' },
     { button: 'AI costs', title: 'AI costs & usage', close: 'Close AI costs' },
     { button: 'Show leaderboard', title: 'Leaderboard', close: 'Close leaderboard' },
     { button: 'Share game', title: `Join room ${application.room.code}`, close: 'Close join QR code' },

@@ -200,6 +200,31 @@ html:has(dialog:modal) { overflow: hidden; }
 .cache-content-breakdown dt { font-weight: 650; }
 .cache-content-breakdown dd { margin: 0; color: var(--cp-text-muted); }
 .activity-dialog pre { max-height: 27svh; }
+.exchange-dialog { width: min(1040px, calc(100% - 24px)); }
+.exchange-meta { align-items: center; }
+.exchange-picker { display: flex; align-items: center; gap: 8px; min-width: 0; max-width: 100%; }
+.exchange-picker select { min-width: 0; max-width: 100%; min-height: 44px; padding: 0 8px; color: var(--cp-text); background: var(--cp-surface-soft); border: 1px solid var(--cp-border); border-radius: 4px; font: 11px var(--cp-mono); }
+.prompt-dialog .exchange-summary { font: 12px/1.5 var(--cp-mono); overflow-wrap: anywhere; }
+.exchange-pair { display: grid; grid-template-columns: minmax(0, 3fr) minmax(0, 2fr); gap: 16px; padding-top: 8px; border-top: 1px solid var(--cp-border); }
+.exchange-pair > section { min-width: 0; }
+.exchange-pair header { flex-wrap: wrap; gap: 2px 10px; min-height: 32px; }
+.exchange-pair header > code { font: 11px var(--cp-mono); color: var(--cp-text-muted); overflow-wrap: anywhere; }
+.exchange-pair h4 { margin: 10px 0 4px; font: 650 12px/1.4 var(--cp-mono); overflow-wrap: anywhere; }
+.exchange-pair h4 small { margin-left: 4px; font: 400 11px var(--cp-font); color: var(--cp-text-muted); }
+.exchange-settings { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 6px 14px; margin: 6px 0 0; }
+.exchange-settings > div { min-width: 0; }
+.exchange-settings dt { font: 10px var(--cp-mono); color: var(--cp-text-muted); }
+.exchange-settings dd { margin: 1px 0 0; font: 11px/1.4 var(--cp-mono); overflow-wrap: anywhere; }
+.exchange-dialog pre { max-height: 22svh; margin: 0; }
+.exchange-dialog details pre { max-height: 30svh; }
+.prompt-dialog .exchange-verdict { font-weight: 600; overflow-wrap: anywhere; }
+.exchange-verdict.verdict-invalid { color: var(--cp-danger); }
+.exchange-usage { margin: 8px 0; }
+.exchange-usage > div { grid-template-columns: 100px minmax(0, 1fr); }
+.exchange-usage small { color: var(--cp-text-muted); }
+@media (max-width: 760px) {
+  .exchange-pair { grid-template-columns: 1fr; }
+}
 @media (max-width: 600px) {
   .prompt-pair { grid-template-columns: 1fr; gap: 8px; }
   .prompt-pair pre { height: 24svh; }

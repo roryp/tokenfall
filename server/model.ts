@@ -6,8 +6,8 @@ import { getBearerTokenProvider } from '@azure/identity';
 import { z } from 'zod';
 import { placementsFor } from '../shared/game.ts';
 import type { Game } from '../shared/game.ts';
-import { MAX_TOKEN_ALLOWANCE } from '../shared/protocol.ts';
-import type { AiOptions, Insight } from '../shared/protocol.ts';
+import { LUNA_API_PATH, lunaRequestBody, MAX_TOKEN_ALLOWANCE } from '../shared/protocol.ts';
+import type { AiOptions, Insight, LunaRequestSettings } from '../shared/protocol.ts';
 import { azureCredential } from './config.ts';
 import type { AppConfig } from './config.ts';
 import { buildPrompts, countTokens, normalizeUsage, tokenChips } from './tokens.ts';
@@ -27,6 +27,23 @@ export const LUNA_ATTEMPT_TIMEOUT_MS = 10000;
 export const LUNA_REASONING_ATTEMPT_TIMEOUT_MS = 30000;
 export const LUNA_RETRY_DELAY_MS = 500;
 export const lunaAttemptTimeout = (options: AiOptions) => options.reasoning ? LUNA_REASONING_ATTEMPT_TIMEOUT_MS : LUNA_ATTEMPT_TIMEOUT_MS;
+export function lunaRequestSettings(deployment: string, options: AiOptions, cacheBucket: string, lookahead: boolean): LunaRequestSettings {
+  return {
+    model: deployment,
+    reasoning_effort: options.reasoning ? 'low' : 'none',
+    max_completion_tokens: maxCompletionTokens(options),
+    store: false,
+    prompt_cache_key: `tokenfall-policy-v4:${cacheBucket}${lookahead ? ':lookahead-v2' : ''}`,
+    prompt_cache_options: { mode: 'explicit', ttl: '30m' },
+    response_format: {
+      type: 'json_schema',
+      json_schema: {
+        name: 'tetris_move', strict: true,
+        schema: { type: 'object', properties: { placementId: { type: 'string' }, tip: { type: 'string' } }, required: ['placementId', 'tip'], additionalProperties: false },
+      },
+    },
+  };
+}
 // 429s are not retried: a long Retry-After could outlast the browser's wait, and the room gate already paces requests.
 export const retryableLunaError = (error: unknown) => error instanceof OpenAI.APIConnectionError || error instanceof OpenAI.InternalServerError;
 export const PLAYER_TOKEN_BUDGET = 160000;
@@ -146,6 +163,14 @@ export class ModelGate {
 }
 
 const moveSchema = z.object({ placementId: z.string().max(20), tip: z.string().max(160) }).strict();
+// Browsers get the documented chat completion fields; provider-internal routing and latency diagnostics stay on the server.
+const RESPONSE_FIELDS = new Set(['id', 'object', 'created', 'model', 'choices', 'usage', 'system_fingerprint', 'service_tier', 'prompt_filter_results']);
+const USAGE_FIELDS = new Set(['prompt_tokens', 'completion_tokens', 'total_tokens', 'prompt_tokens_details', 'completion_tokens_details']);
+const onlyFields = (value: object, fields: Set<string>) => Object.fromEntries(Object.entries(value).filter(([key]) => fields.has(key)));
+export function publicResponse(response: object) {
+  const reply = onlyFields(response, RESPONSE_FIELDS);
+  return reply.usage && typeof reply.usage === 'object' ? { ...reply, usage: onlyFields(reply.usage, USAGE_FIELDS) } : reply;
+}
 
 export class LunaGateway implements ModelGateway {
   private client: OpenAI;
@@ -155,7 +180,7 @@ export class LunaGateway implements ModelGateway {
   constructor(config: AppConfig) {
     if (PREFIX_TOKENS < 1024) throw new Error('The reusable model policy is too short for prompt caching.');
     this.client = new OpenAI({
-      baseURL: `${config.endpoint.replace(/\/$/, '')}/openai/v1/`,
+      baseURL: `${config.endpoint.replace(/\/$/, '')}${LUNA_API_PATH}`,
       apiKey: getBearerTokenProvider(azureCredential(config), 'https://cognitiveservices.azure.com/.default'),
       // SDK retries stay off because chat() retries only the transient failures.
       maxRetries: 0,
@@ -193,48 +218,28 @@ export class LunaGateway implements ModelGateway {
       mcpLookup.addedInputTokens = countTokens(prompt) - originalTokens + countTokens(systemPrompt) - PREFIX_TOKENS;
       if (mcpLookup.addedInputTokens > MAX_MCP_CONTEXT_TOKENS) throw new McpLookupError('context');
     }
-    const content = {
-      type: 'text' as const,
-      text: systemPrompt,
-      ...(options.cache ? { prompt_cache_breakpoint: { mode: 'explicit' as const } } : {}),
-    };
-    const request: OpenAI.Chat.ChatCompletionCreateParamsNonStreaming = {
-      model: this.deployment,
-      reasoning_effort: options.reasoning ? 'low' : 'none',
-      max_completion_tokens: maxCompletionTokens(options),
-      store: false,
-      prompt_cache_key: `tokenfall-policy-v4:${cacheBucket}${mcpLookup ? ':lookahead-v2' : ''}`,
-      prompt_cache_options: { mode: 'explicit', ttl: '30m' },
-      messages: [
-        { role: 'system' as const, content: [content] },
-        { role: 'user' as const, content: prompt },
-      ],
-      response_format: {
-        type: 'json_schema' as const,
-        json_schema: {
-          name: 'tetris_move', strict: true,
-          schema: { type: 'object', properties: { placementId: { type: 'string' }, tip: { type: 'string' } }, required: ['placementId', 'tip'], additionalProperties: false },
-        },
-      },
-    };
+    const settings = lunaRequestSettings(this.deployment, options, cacheBucket, Boolean(mcpLookup));
+    const request: OpenAI.Chat.ChatCompletionCreateParamsNonStreaming = lunaRequestBody(settings, systemPrompt, prompt, options.cache);
     const { result, usage } = await this.chat(request, options);
     const latencyMs = Math.round(performance.now() - started);
     const outputText = result.choices[0]?.message.content ?? '';
+    const finishReason = result.choices[0]?.finish_reason ?? null;
     let selection: z.infer<typeof moveSchema> | null = null;
     try { selection = moveSchema.parse(JSON.parse(outputText)); } catch { selection = null; }
     const selected = placements.find(placement => placement.id === selection?.placementId);
     const allowedReasoning = options.reasoning || usage.reasoning === 0;
-    const valid = selected && selection && allowedReasoning && result.choices[0]?.finish_reason === 'stop';
+    const valid = selected && selection && allowedReasoning && finishReason === 'stop';
     return {
       id: randomUUID(), pieceId,
       placement: valid ? { column: selected.column, row: selected.row, rotation: selected.rotation, piece: selected.piece, useHold: selected.useHold } : null,
-      tip: valid && selection ? selection.tip : !allowedReasoning ? 'The service did not confirm zero reasoning. This move was rejected.' : result.choices[0]?.finish_reason === 'length' ? `The reply hit its ${maxCompletionTokens(options).toLocaleString()}-token completion cap, not your total allowance. Usage was recorded; no move was applied.` : 'The model did not return a valid legal move.',
+      tip: valid && selection ? selection.tip : !allowedReasoning ? 'The service did not confirm zero reasoning. This move was rejected.' : finishReason === 'length' ? `The reply hit its ${maxCompletionTokens(options).toLocaleString()}-token completion cap, not your total allowance. Usage was recorded; no move was applied.` : 'The model did not return a valid legal move.',
       status: valid ? 'ready' : 'invalid', usage, latencyMs,
       rawTokens: prompts.rawTokens, packedTokens: prompts.packedTokens,
       savedTokens: options.compression ? Math.max(0, prompts.rawTokens - prompts.packedTokens) : 0,
       compression: options.compression, cacheEnabled: options.cache, reasoningEnabled: Boolean(options.reasoning),
       ...(mcpLookup ? { mcpLookup } : {}),
-      prompt, systemPrompt, outputText, inputChips: tokenChips(prompt), outputChips: tokenChips(outputText),
+      prompt, systemPrompt, outputText, request: settings, finishReason, response: publicResponse(result),
+      inputChips: tokenChips(prompt), outputChips: tokenChips(outputText),
       promptComparison: { verbose: prompts.verbose, packed: prompts.packed },
     };
   }

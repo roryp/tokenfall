@@ -12,7 +12,7 @@ import { io as connect } from 'socket.io-client';
 import { TETROMINOES } from 'miaoda-game-fallblock-core';
 import OpenAI from 'openai';
 import { boardMetrics, Game, placementsFor } from '../shared/game.ts';
-import { costForUsage, DEFAULT_TOKEN_ALLOWANCE, emptyMetrics, reportedTokenBalance, tokenAllowance, tokenCreditsUsed } from '../shared/protocol.ts';
+import { costForUsage, DEFAULT_TOKEN_ALLOWANCE, emptyMetrics, lunaRequestBody, reportedTokenBalance, tokenAllowance, tokenCreditsUsed } from '../shared/protocol.ts';
 import type { AiOptions, Insight, JoinResult, Reply, RoomView, TokenPricing } from '../shared/protocol.ts';
 import { clientAddress, createApplication, JOINS_PER_SEAT_PER_MINUTE, SOCKET_EVENT_BURST, TOKENIZE_REQUESTS_PER_SEAT_PER_MINUTE, trustedProxy } from '../server/app.ts';
 import { DEFAULT_ROOM_CAPACITY, loadConfig, MIN_ADMIN_KEY_LENGTH } from '../server/config.ts';
@@ -680,6 +680,8 @@ test('Luna receives actual MCP lookahead with reasoning enabled in one metered r
     assert.ok(enabled.mcpLookup.addedInputTokens! > enabled.mcpLookup.resultTokens);
     assert.equal(JSON.parse(JSON.stringify(sent)).reasoning_effort, 'low');
     assert.equal(JSON.parse(JSON.stringify(sent)).messages[1].content, enabled.prompt);
+    assert.equal(JSON.stringify(lunaRequestBody(enabled.request!, enabled.systemPrompt!, enabled.prompt, enabled.cacheEnabled)), JSON.stringify(sent));
+    assert.equal(enabled.request!.prompt_cache_key, 'tokenfall-policy-v4:test:lookahead-v2');
     assert.deepEqual(JSON.parse(enabled.promptComparison!.verbose).mcpLookup, JSON.parse(enabled.promptComparison!.packed).mcpLookup);
     const originalPrompts = buildPrompts(game, placementsFor(game));
     assert.ok(enabled.packedTokens > originalPrompts.packedTokens);
@@ -690,6 +692,8 @@ test('Luna receives actual MCP lookahead with reasoning enabled in one metered r
     assert.equal(disabled.mcpLookup, undefined);
     assert.equal(disabled.prompt, originalPrompts.packed);
     assert.equal(disabled.systemPrompt, POLICY);
+    assert.equal(JSON.stringify(lunaRequestBody(disabled.request!, disabled.systemPrompt!, disabled.prompt, disabled.cacheEnabled)), JSON.stringify(sent));
+    assert.equal(disabled.request!.prompt_cache_key, 'tokenfall-policy-v4:test');
     assert.ok(enabled.usage.input > disabled.usage.input);
     assert.equal(enabled.usage.input - disabled.usage.input, enabled.mcpLookup.addedInputTokens);
     const rates = setup.pricing.snapshot!.usdPerMillion;
@@ -796,15 +800,21 @@ test('the gateway passes Luna\'s Hold choice unchanged and never substitutes an 
   const selected = candidates.find(candidate => candidate.useHold && !candidate.gameOver)!;
   let selectedId = selected.id;
   let sent: unknown;
+  let reply: unknown;
   const mock = context.mock.method(gateway['client'].chat.completions, 'create', async (request: unknown) => {
     sent = request;
-    return { choices: [{ finish_reason: 'stop', message: { content: JSON.stringify({ placementId: selectedId, tip: 'Use the held piece.' }) } }], usage: { prompt_tokens: 4000, completion_tokens: 20, total_tokens: 4020, prompt_tokens_details: { cached_tokens: 0, cache_write_tokens: 0 }, completion_tokens_details: { reasoning_tokens: 0 } } };
+    reply = { id: 'chatcmpl-test', model: 'gpt-5.6-luna', choices: [{ index: 0, finish_reason: 'stop', message: { role: 'assistant', content: JSON.stringify({ placementId: selectedId, tip: 'Use the held piece.' }) } }], usage: { prompt_tokens: 4000, completion_tokens: 20, total_tokens: 4020, prompt_tokens_details: { cached_tokens: 0, cache_write_tokens: 0 }, completion_tokens_details: { reasoning_tokens: 0 } } };
+    return { ...reply as object, routing: { serving_pipereplica: 'internal-replica' }, usage: { ...(reply as { usage: object }).usage, latency_checkpoint: { engine_ttft_ms: 97 } } };
   });
   try {
     const insight = await gateway.complete(game, { compression: true, cache: false }, 'test');
     assert.equal(insight.status, 'ready');
     assert.deepEqual(insight.placement, { column: selected.column, row: selected.row, rotation: selected.rotation, piece: selected.piece, useHold: true });
     const request = JSON.parse(JSON.stringify(sent));
+    assert.equal(JSON.stringify(lunaRequestBody(insight.request!, insight.systemPrompt!, insight.prompt, insight.cacheEnabled)), JSON.stringify(sent));
+    assert.equal(insight.finishReason, 'stop');
+    assert.deepEqual(insight.response, reply, 'Provider-internal routing and latency diagnostics never reach the browser');
+    assert.equal(JSON.parse(insight.outputText).placementId, selected.id);
     assert.equal(insight.systemPrompt, POLICY);
     assert.equal(insight.systemPrompt, request.messages[0].content[0].text);
     const comparison = buildPrompts(game, candidates);
@@ -825,6 +835,8 @@ test('the gateway passes Luna\'s Hold choice unchanged and never substitutes an 
     assert.equal(invalid.promptComparison?.verbose, JSON.parse(JSON.stringify(sent)).messages[1].content);
     assert.equal(invalid.savedTokens, 0);
     assert.deepEqual(JSON.parse(JSON.stringify(sent)).messages[0].content[0].prompt_cache_breakpoint, { mode: 'explicit' });
+    assert.equal(JSON.stringify(lunaRequestBody(invalid.request!, invalid.systemPrompt!, invalid.prompt, invalid.cacheEnabled)), JSON.stringify(sent));
+    assert.equal(invalid.finishReason, 'stop');
     assert.deepEqual(JSON.parse(JSON.stringify(sent)).response_format, request.response_format);
     assert.equal(mock.mock.callCount(), 2);
   } finally { rmSync(setup.dataDirectory, { recursive: true, force: true }); }
@@ -863,6 +875,7 @@ test('reasoning is opt-in, uses a bounded completion budget, and never bypasses 
     finishReason = 'length';
     const truncated = await gateway.complete(game, { compression: true, cache: false, reasoning: true }, 'test');
     assert.equal(truncated.status, 'invalid');
+    assert.equal(truncated.finishReason, 'length');
     assert.equal(truncated.placement, null);
     assert.equal(truncated.usage.reasoning, 128);
     assert.match(truncated.tip, /completion cap, not your total allowance/);

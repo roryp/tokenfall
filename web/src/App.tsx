@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from 'react';
-import { Bot, Brain, Columns2, FileJson2, History, Layers3, Pause, Play, Plug, Quote, ReceiptText, RotateCcw, ScanSearch, Trophy, Wifi, WifiOff, X } from 'lucide-react';
+import { Bot, Brain, Columns2, FileJson2, History, Layers3, MessagesSquare, Pause, Play, Plug, Quote, ReceiptText, RotateCcw, ScanSearch, Trophy, Wifi, WifiOff, X } from 'lucide-react';
 import type { LucideIcon } from 'lucide-react';
-import { costForUsage, reportedTokenBalance } from '../../shared/protocol.ts';
+import { costForUsage, LUNA_API_PATH, lunaRequestBody, reportedTokenBalance } from '../../shared/protocol.ts';
 import type { Insight, McpLookaheadResult, TokenRates } from '../../shared/protocol.ts';
 import type { MoveScore } from '../../shared/game.ts';
 import { GameBoard, GameControls, PiecePreview } from './GameBoard.tsx';
@@ -15,6 +15,58 @@ const number = (value: number) => value.toLocaleString();
 const signedMoney = (value: number | null) => value === null ? '--' : `${value < 0 ? '-' : value > 0 ? '+' : ''}${formatMoney(Math.abs(value))}`;
 const cacheLabel = (insight: Insight) => insight.usage.cached > 0 ? 'Hit' : insight.usage.cacheWrites > 0 ? 'Miss / written' : insight.cacheEnabled ? 'Miss' : 'Off';
 const cacheEffect = (insight: Insight, rates: TokenRates | undefined) => rates ? (insight.usage.cached * (rates.cachedInput - rates.input) + insight.usage.cacheWrites * (rates.cacheWrite - rates.input)) / 1000000 : null;
+const replyStatus = (insight: Insight) => insight.status === 'invalid' ? 'Rejected' : insight.status === 'stale' ? 'Stale move' : 'Valid move';
+const replyLabel = (record: RequestRecord) => `#${record.number} / ${new Date(record.receivedAt).toLocaleTimeString()} / ${replyStatus(record.insight)}`;
+
+function chosenPlacement(outputText: string) {
+  try {
+    const choice: unknown = JSON.parse(outputText);
+    return choice && typeof choice === 'object' && 'placementId' in choice && typeof choice.placementId === 'string' ? choice.placementId : null;
+  } catch { return null; }
+}
+
+function LunaExchange({ record, rates }: { record: RequestRecord; rates: TokenRates | undefined }) {
+  const { insight } = record;
+  const settings = insight.request;
+  const body = settings && insight.systemPrompt !== undefined ? lunaRequestBody(settings, insight.systemPrompt, insight.prompt, insight.cacheEnabled) : null;
+  const placement = insight.placement;
+  const placementId = chosenPlacement(insight.outputText);
+  const cost = rates ? costForUsage(insight.usage, rates).total : null;
+  const position = placement ? `${placement.piece ? `${placement.piece} piece` : 'Piece'} at column ${placement.column}, row ${placement.row}, rotation ${placement.rotation}${placement.useHold ? ', via Hold' : ''}` : '';
+  const verdict = insight.status === 'invalid' ? `Rejected, no move played: ${insight.tip}`
+    : insight.status === 'stale' ? `Legal placement ${placementId ?? ''}, but the board changed before the reply arrived, so it was not played.`
+    : `Accepted: ${placementId ?? 'the choice'} is a legal placement. ${position}.`;
+  return <div className="exchange-pair">
+    <section data-testid="exchange-request">
+      <header><h3>Sent to Luna</h3><code>POST {LUNA_API_PATH}chat/completions</code></header>
+      {settings ? <dl className="exchange-settings" data-testid="exchange-settings">
+        <div><dt>model</dt><dd>{settings.model}</dd></div>
+        <div><dt>reasoning_effort</dt><dd>{settings.reasoning_effort}</dd></div>
+        <div><dt>max_completion_tokens</dt><dd>{number(settings.max_completion_tokens)}</dd></div>
+        <div><dt>response_format</dt><dd>{settings.response_format.type} / {settings.response_format.json_schema.name}{settings.response_format.json_schema.strict ? ' / strict' : ''}</dd></div>
+        <div><dt>prompt_cache_key</dt><dd>{settings.prompt_cache_key}</dd></div>
+        <div><dt>store</dt><dd>{String(settings.store)}</dd></div>
+      </dl> : <p>Request settings are unavailable for this reply.</p>}
+      <h4>messages[0] / system <small>Fixed Tetris instructions{insight.cacheEnabled ? ', cache breakpoint' : ''}</small></h4>
+      {insight.systemPrompt ? <pre tabIndex={0} data-testid="exchange-system">{insight.systemPrompt}</pre> : <p>System message text is unavailable for this reply.</p>}
+      <h4>messages[1] / user <small>Board and legal placements, {insight.compression ? 'packed rows' : 'cell JSON'}{insight.mcpLookup ? ' + MCP lookahead' : ''}</small></h4>
+      <pre tabIndex={0} data-testid="exchange-user">{insight.prompt}</pre>
+      {body && <details className="mcp-raw"><summary>Full request body (JSON)</summary><pre tabIndex={0} data-testid="exchange-request-body">{JSON.stringify(body, null, 2)}</pre></details>}
+    </section>
+    <section data-testid="exchange-response">
+      <header><h3>Luna&apos;s reply</h3><code>finish_reason {insight.finishReason ?? 'not recorded'} / {number(insight.latencyMs)} ms</code></header>
+      <h4>Message content <small>assistant</small></h4>
+      <pre tabIndex={0} data-testid="exchange-reply">{insight.outputText || '(empty reply)'}</pre>
+      <p className={`exchange-verdict verdict-${insight.status}`} data-testid="exchange-verdict">{verdict}</p>
+      <dl className="mcp-receipt exchange-usage">
+        <div><dt>Input tokens</dt><dd data-testid="exchange-input">{number(insight.usage.input)} <small>{number(insight.usage.cached)} cached / {number(insight.usage.cacheWrites)} written</small></dd></div>
+        <div><dt>Output tokens</dt><dd data-testid="exchange-output">{number(insight.usage.output)} <small>{insight.usage.reasoning === null ? 'reasoning not reported' : `${number(insight.usage.reasoning)} reasoning`}</small></dd></div>
+        <div><dt>Cost <small>est.</small></dt><dd>{formatMoney(cost)}</dd></div>
+      </dl>
+      {insight.response && <details className="mcp-raw"><summary>Response body (JSON)</summary><pre tabIndex={0} data-testid="exchange-response-body">{JSON.stringify(insight.response, null, 2)}</pre></details>}
+    </section>
+  </div>;
+}
 
 function ScoreGain({ move }: { move: MoveScore }) {
   return <div className="score-gain" data-testid="score-gain" title={move.parts.map(part => `${part.label}: ${part.detail} = ${number(part.points)}`).join('\n')}>
@@ -123,9 +175,16 @@ export default function App() {
   const mcpDialog = useRef<HTMLDialogElement | null>(null);
   const [costsOpen, setCostsOpen] = useState(false);
   const costsDialog = useRef<HTMLDialogElement | null>(null);
+  const [exchangeOpen, setExchangeOpen] = useState(false);
+  const [pinnedReply, setPinnedReply] = useState<RequestRecord | null>(null);
+  const exchangeDialog = useRef<HTMLDialogElement | null>(null);
   const [rankingsOpen, setRankingsOpen] = useState(false);
   const lastLookup = game.requestHistory.find(record => record.insight.mcpLookup);
   const lookupRecord = mcpOpen ? inspectedLookup ?? lastLookup : null;
+  const exchangeRecord = game.requestHistory.length ? pinnedReply ?? game.requestHistory[0] : null;
+  const exchangeChoices = pinnedReply && !game.requestHistory.some(record => record.insight.id === pinnedReply.insight.id) ? [...game.requestHistory, pinnedReply] : game.requestHistory;
+  // Hidden rather than disabled while unavailable; Luna's requests would otherwise make it flicker. A blocked Luna can still change it.
+  const sentenceAvailable = game.joined && !game.busy && !(game.autopilot && game.autopilotStatus !== 'blocked');
   const latest = game.insight;
   const rates = game.room?.pricing.snapshot?.usdPerMillion;
   const compressionSaving = rates ? game.metrics.compressionSaved * rates.input / 1000000 : null;
@@ -148,9 +207,10 @@ export default function App() {
   useEffect(() => { if (editingSentence) sentenceDialog.current?.showModal(); }, [editingSentence]);
   useEffect(() => { if (mcpOpen) mcpDialog.current?.showModal(); }, [mcpOpen]);
   useEffect(() => { if (costsOpen) costsDialog.current?.showModal(); }, [costsOpen]);
+  useEffect(() => { if (exchangeOpen) exchangeDialog.current?.showModal(); }, [exchangeOpen]);
   useEffect(() => {
     if (!game.resetVersion) return;
-    for (const dialog of [promptDialog, sentenceDialog, mcpDialog, costsDialog]) dialog.current?.close();
+    for (const dialog of [promptDialog, sentenceDialog, mcpDialog, costsDialog, exchangeDialog]) dialog.current?.close();
   }, [game.resetVersion]);
 
   function inspect(instructions = false) {
@@ -173,6 +233,13 @@ export default function App() {
     setMcpOpen(true);
   }
 
+  // Luna keeps playing while this is open, and the latest reply replaces the shown one unless a reply is pinned.
+  function showExchange() {
+    if (!game.autopilot) game.act('pause');
+    setPinnedReply(null);
+    setExchangeOpen(true);
+  }
+
   return <main className="room-layout" data-playing={game.joined}>
     <div className="tetris-app" data-playing={game.joined} data-autopilot={game.autopilot}>
     <header className="game-header">
@@ -193,10 +260,11 @@ export default function App() {
         <button className="information-button" aria-label="Inspect MCP lookup" aria-haspopup="dialog" onClick={showMcpResults}><ScanSearch size={18} /><span>MCP results</span></button>
         <button className="information-button" aria-label="Inspect cached instructions" aria-haspopup="dialog" title={game.requestHistory.length ? 'Live cache activity and instruction text' : 'Available after a Luna reply in this tab'} disabled={!game.requestHistory.length} onClick={() => inspect(true)}><History size={18} /><span>Cache activity</span></button>
         <button className="information-button" aria-label="Inspect last prompt" aria-haspopup="dialog" title={latest ? 'Compression before / after' : 'Available after a Luna reply in this tab'} disabled={!latest} onClick={() => inspect()}><Columns2 size={18} /><span><span className="information-full-label">Compression</span><span className="information-short-label">Prompts</span></span></button>
+        <button className="information-button" aria-label="Inspect Luna request and reply" aria-haspopup="dialog" title="The messages sent to Luna and its replies" onClick={showExchange}><MessagesSquare size={18} /><span>Request &amp; reply</span></button>
         <button className="information-button" aria-haspopup="dialog" onClick={() => { if (!game.autopilot) game.act('pause'); setCostsOpen(true); }}><ReceiptText size={18} /><span>AI costs</span></button>
         <button className="information-button" aria-label="Show leaderboard" aria-haspopup="dialog" onClick={showRankings}><Trophy size={18} /><span><span className="information-full-label">Leaderboard</span><span className="information-short-label">Scores</span></span></button>
         <RoomShare game={game} />
-        <button className="information-button" aria-label="Change sentence" aria-haspopup="dialog" disabled={!game.joined || game.busy || game.joining || !game.connected} onClick={() => { game.pauseForInspection(); game.setNotice(''); setEditingSentence(true); }}><Quote size={18} /><span>Change sentence</span></button>
+        {(sentenceAvailable || editingSentence) && <button className="information-button" aria-label="Change sentence" aria-haspopup="dialog" disabled={!game.joined || game.busy || game.joining || !game.connected} onClick={() => { game.pauseForInspection(); game.setNotice(''); setEditingSentence(true); }}><Quote size={18} /><span>Change sentence</span></button>}
         {game.room?.maintenance && <RoomMaintenance game={game} />}
       </div>
     </section>
@@ -285,6 +353,23 @@ export default function App() {
     <dialog className="prompt-dialog mcp-dialog" ref={mcpDialog} aria-labelledby="mcp-title" onClose={() => { setMcpOpen(false); setInspectedLookup(null); game.resumeAfterInspection(); }}>
       <header><h2 id="mcp-title">MCP lookup</h2><button className="icon-button" aria-label="Close MCP lookup" title="Close MCP lookup" onClick={() => mcpDialog.current?.close()}><X size={19} /></button></header>
       {lookupRecord?.insight.mcpLookup ? <McpResults record={lookupRecord} rates={rates} /> : <p data-testid="mcp-empty" role="status">{game.requestOptions?.mcp ? 'MCP-enabled request in progress. Result pending.' : 'No MCP results received in this tab.'}</p>}
+    </dialog>
+    <dialog className="prompt-dialog exchange-dialog" ref={exchangeDialog} aria-labelledby="exchange-title" onClose={() => { setExchangeOpen(false); setPinnedReply(null); }}>
+      <header><h2 id="exchange-title">Luna request &amp; reply</h2><div className="inspector-actions">{game.autopilot && <button className="icon-button" aria-label="Stop Luna in request inspector" title="Stop Luna" onClick={() => game.toggleAutopilot(false)}><Pause size={19} /></button>}<button className="icon-button" aria-label="Close request and reply" title="Close request and reply" onClick={() => exchangeDialog.current?.close()}><X size={19} /></button></div></header>
+      {exchangeOpen && <>
+        <div className="activity-meta exchange-meta">
+          <label className="exchange-picker">Reply<select aria-label="Reply" value={exchangeRecord && pinnedReply ? pinnedReply.insight.id : ''} disabled={!exchangeRecord} onChange={event => setPinnedReply(exchangeChoices.find(record => record.insight.id === event.target.value) ?? null)}>
+            <option value="">Latest (live)</option>
+            {exchangeRecord && exchangeChoices.map(record => <option key={record.insight.id} value={record.insight.id}>{replyLabel(record)}</option>)}
+          </select></label>
+          <span role="status" data-testid="exchange-pending">{game.busy ? 'Request in flight / reply pending' : 'No request in flight'}</span>
+        </div>
+        {exchangeRecord ? <>
+          <p className="exchange-summary" data-testid="exchange-summary">Reply {replyLabel(exchangeRecord)}{pinnedReply ? ' / pinned' : ' / follows Luna live'}</p>
+          <LunaExchange record={exchangeRecord} rates={rates} />
+          <small>Exact messages and settings from this tab&apos;s latest 20 Luna requests. Response bodies omit the provider&apos;s internal routing and latency diagnostics. Opening this makes no model call.</small>
+        </> : <p data-testid="exchange-empty" role="status">{game.busy ? 'A Luna request is in flight. Its messages and reply appear here when the reply arrives.' : 'No Luna replies in this tab yet. Turn on Ask Luna to see each request sent to Luna and its reply.'}</p>}
+      </>}
     </dialog>
     <dialog className="prompt-dialog sentence-dialog" ref={sentenceDialog} aria-labelledby="sentence-title" onClose={() => { setEditingSentence(false); game.resumeAfterInspection(); }}>
       <header><h2 id="sentence-title">New sentence</h2><button className="icon-button" aria-label="Close sentence editor" title="Close sentence editor" onClick={() => sentenceDialog.current?.close()}><X size={19} /></button></header>

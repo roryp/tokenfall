@@ -115,6 +115,30 @@ export interface McpLookup {
   addedInputTokens?: number;
   durationMs: number;
 }
+// The OpenAI v1 API path on the Foundry resource; Luna's requests go to POST {endpoint}/openai/v1/chat/completions.
+export const LUNA_API_PATH = '/openai/v1/';
+// Every field of Luna's chat completion request except its messages.
+export interface LunaRequestSettings {
+  model: string;
+  reasoning_effort: 'none' | 'low';
+  max_completion_tokens: number;
+  store: false;
+  prompt_cache_key: string;
+  prompt_cache_options: { mode: 'explicit'; ttl: '30m' };
+  response_format: { type: 'json_schema'; json_schema: { name: string; strict: true; schema: Record<string, unknown> } };
+}
+// The server sends this exact body, and the request inspector rebuilds it from an insight, so both always match.
+export function lunaRequestBody(settings: LunaRequestSettings, systemPrompt: string, prompt: string, cache: boolean) {
+  const { response_format, ...request } = settings;
+  return {
+    ...request,
+    messages: [
+      { role: 'system' as const, content: [{ type: 'text' as const, text: systemPrompt, ...(cache ? { prompt_cache_breakpoint: { mode: 'explicit' as const } } : {}) }] },
+      { role: 'user' as const, content: prompt },
+    ],
+    response_format,
+  };
+}
 export interface Insight {
   id: string;
   pieceId: number;
@@ -134,6 +158,10 @@ export interface Insight {
   systemPrompt?: string;
   promptComparison?: { verbose: string; packed: string };
   outputText: string;
+  // The request was lunaRequestBody(request, systemPrompt, prompt, cacheEnabled); response is the provider's reply body without internal diagnostics.
+  request?: LunaRequestSettings;
+  finishReason?: string | null;
+  response?: object;
   inputChips: TokenChip[];
   outputChips: TokenChip[];
 }

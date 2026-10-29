@@ -20,7 +20,7 @@ Tetris with sentence-generated pieces, optional GPT-5.6 Luna play, and shared le
 
 ## Sentence mode
 
-Your text (up to 500 characters and 256 `o200k_base` tokens) becomes a repeating piece queue: each token ID picks a shape by `ID % 7`, so the same text always gives the same queue. Sentences aren't sent to Luna or shown in rankings.
+Your text (up to 500 characters and 256 `o200k_base` tokens) becomes a repeating piece queue: each token ID picks a shape by `ID % 7`, so the same text always gives the same queue. Sentences aren't sent to Luna or shown in rankings. **Change sentence** in **Information & tools** starts a new game with new text; it's hidden while Luna is playing, so stop Luna first.
 
 | Token ID % 7 | 0 | 1 | 2 | 3 | 4 | 5 | 6 |
 | --- | --- | --- | --- | --- | --- | --- | --- |
@@ -53,7 +53,21 @@ Touch controls sit below the board. If keys stop responding after you type in a 
 | Compression | Packs the same board into fewer input tokens. |
 | Cache | Reuses the instructions when the provider confirms a hit. Writes can cost extra, and hits aren't guaranteed. |
 
-Options start off and apply from the next request. Compression and Cache combine: together they cut the cost of a move by about half ([cost and speed](#cost-and-speed)). **Information & tools** has the prompt, cache, MCP, and cost inspectors.
+Options start off and apply from the next request. Compression and Cache combine: together they cut the cost of a move by about half ([cost and speed](#cost-and-speed)). **Information & tools** has the request, compression, cache, MCP, and cost inspectors.
+
+### Request and reply
+
+**Request & reply** in **Information & tools** shows exactly what Luna is sent and what it returns, live while it plays. It makes no model call and doesn't pause Luna.
+
+[![The Luna request and reply inspector: the request settings, the system and user messages sent to gpt-5.6-luna, and Luna's JSON reply with its finish reason, verdict, tokens, and cost.](docs/images/luna-request-reply.png)](docs/images/luna-request-reply.png)
+
+| Part | Shows |
+| --- | --- |
+| Sent to Luna | The settings (`model`, `reasoning_effort`, `max_completion_tokens`, the strict `tetris_move` JSON schema, the prompt cache key), the system message (the fixed [policy](server/policy.md), plus MCP guidance with MCP on), and the user message (the board and legal placements, packed with Compression on) |
+| Luna's reply | The message Luna returned (a `placementId` and a tip), its finish reason and time, whether the server accepted the move, and its tokens and cost |
+| Full bodies | The JSON request body and Luna's response body, one click away. The response leaves out the provider's internal routing and latency diagnostics. |
+
+It follows each new reply. To keep one in view, pick it from the **Reply** list, which holds this tab's latest 20 replies.
 
 ### Pricing
 
@@ -170,7 +184,7 @@ Provisioning writes the endpoints and Application Insights connection string to 
 | 1 | The browser sends `assist`. Before any paid work, the server checks cooldowns, budgets, and room capacity. |
 | 2-3 | With MCP on, the local MCP server runs `analyze_future_moves`. A reply that fails its schema or board hash stops the request before Luna is called. |
 | 4 | The managed identity gets an Entra ID token, cached between moves. |
-| 5-6 | `gpt-5.6-luna` gets the rules, board, and legal placements, and must reply with a `placementId` and a tip. Its rate-limit headers resize the room's limits. |
+| 5-6 | `gpt-5.6-luna` gets the rules, board, and legal placements, and must reply with a `placementId` and a tip ([request and reply](#request-and-reply)). Its rate-limit headers resize the room's limits. |
 | 7 | The server accepts only a placement it offered, then saves token usage. |
 | 8 | The browser re-checks the placement with the shared engine and plays it like any move. |
 | 9 | The trace goes to Application Insights and reaches Foundry within minutes. |
@@ -239,7 +253,7 @@ The key stays in the URL fragment, which browsers don't send to servers. The pag
 
 [![Luna traces in Microsoft Foundry: the linked tokenfall-luna agent with one trace per move and its tokens, and one trace's agent, tool, and model spans with the token waterfall and provider-reported usage.](docs/images/foundry-luna-traces.png)](docs/images/foundry-luna-traces.png)
 
-Each Luna move is one trace ([tracing](server/tracing.ts)) that follows the [OpenTelemetry GenAI conventions](https://opentelemetry.io/docs/specs/semconv/gen-ai/). Spans carry the agent ID `tokenfall-luna` and the game run as the conversation ID, and record token counts, not prompts or replies.
+Each Luna move is one trace ([tracing](server/tracing.ts)) that follows the [OpenTelemetry GenAI conventions](https://opentelemetry.io/docs/specs/semconv/gen-ai/). Spans carry the agent ID `tokenfall-luna` and the game run as the conversation ID, and record token counts, not prompts or replies; players see those in [Request & reply](#request-and-reply).
 
 | Span | Records |
 | --- | --- |
