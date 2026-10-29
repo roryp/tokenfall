@@ -36,7 +36,7 @@ after(async () => {
 
 async function fixture(viewport = { width: 1366, height: 768 }, autoJoin = true, networkJoin = false, initialOptions?: Partial<AiOptions>, localMaintenance = false, hasTouch = false) {
   const dataDirectory = mkdtempSync(path.join(os.tmpdir(), 'tetris-ui-'));
-  const controls = { hold: false, chooseHold: false, invalid: false, truncated: false, fail: false, mcpFail: false, cacheMiss: false, mixedCache: false, missingReasoning: false, firstPlacement: false, inFlight: 0, maxInFlight: 0 };
+  const controls = { hold: false, chooseHold: false, invalid: false, truncated: false, fail: false, mcpFail: false, cacheMiss: false, mixedCache: false, missingReasoning: false, firstPlacement: false, replayEquivalent: false, inFlight: 0, maxInFlight: 0 };
   const events = new EventEmitter();
   const releases: (() => void)[] = [];
   const calls: { options: AiOptions; usage: Usage; prompt: string; systemPrompt: string; outputText: string; verbose: string; packed: string; rawTokens: number; packedTokens: number; mcpLookup?: McpLookup }[] = [];
@@ -99,9 +99,13 @@ async function fixture(viewport = { width: 1366, height: 768 }, autoJoin = true,
       const pending = controls.hold ? new Promise<void>(resolve => releases.push(resolve)) : null;
       events.emit('replay');
       if (pending) await pending;
-      // The synthetic replay picks the move the synthetic Luna ranks last, so the comparison shows a different outcome.
-      const offered = (JSON.parse(request.prompt).placements as { id: string; gameOver: boolean; holes: number; clearedLines: number; aggregateHeight: number }[]).filter(placement => !placement.gameOver);
-      const choice = [...offered].sort((first, second) => first.holes - second.holes || second.clearedLines - first.clearedLines || first.aggregateHeight - second.aggregateHeight).at(-1)!;
+      // The synthetic replay picks the move the synthetic Luna ranks last, so the comparison shows a different outcome,
+      // or with replayEquivalent another placement that scores the same as the original choice.
+      const offered = (JSON.parse(request.prompt).placements as { id: string; gameOver: boolean; holes: number; clearedLines: number; maxHeight: number; aggregateHeight: number }[]).filter(placement => !placement.gameOver);
+      const originalId = JSON.parse(calls.find(call => call.prompt === request.prompt)?.outputText ?? '{}').placementId;
+      const original = offered.find(placement => placement.id === originalId);
+      const equivalent = controls.replayEquivalent && original ? offered.find(placement => placement.id !== original.id && placement.holes === original.holes && placement.clearedLines === original.clearedLines && placement.maxHeight === original.maxHeight) : undefined;
+      const choice = equivalent ?? [...offered].sort((first, second) => first.holes - second.holes || second.clearedLines - first.clearedLines || first.aggregateHeight - second.aggregateHeight).at(-1)!;
       const outputText = JSON.stringify({ placementId: choice.id, tip: 'Synthetic replay, not a live model.' });
       const input = countTokens(POLICY + (request.lookahead ? MCP_GUIDANCE : '')) + countTokens(request.prompt);
       const output = 20 + (reasoning ? 256 : 0);
@@ -1020,6 +1024,8 @@ test('reasoning comparison replays a reply with Reasoning flipped and shows both
   assert.match(await compare.getByTestId('compare-move-off').innerText(), new RegExp(`^${JSON.parse(first.outputText).placementId}\\n`));
   assert.equal(numeric((await compare.getByTestId('compare-output-off').innerText()).split('\n')[0]), 20);
   assert.equal(numeric((await compare.getByTestId('compare-output-low').innerText()).split('\n')[0]), 276);
+  assert.match(await compare.getByRole('rowheader', { name: /^Tip/ }).innerText(), /reworded on every request/);
+  assert.match(await compare.getByTestId('compare-note').innerText(), /can't separate reasoning from chance/);
   assert.equal(await page.locator('.game-canvas').getAttribute('data-pieces'), pieces, 'The replayed move is never played');
   assert.equal(await compare.getByRole('button').count(), 0, 'A compared reply offers no second paid replay');
   await setup.waitForCalls(3);
@@ -1035,6 +1041,32 @@ test('reasoning comparison replays a reply with Reasoning flipped and shows both
   setup.release();
   await waitRequests(page, 4);
   assert.equal(setup.controls.maxInFlight, 1);
+  assert.deepEqual(setup.errors, []);
+});
+
+test('reasoning comparison reports equally scored placements as the same result', { timeout: 20000 }, async context => {
+  const setup = await fixture(undefined, true, false, { compression: true, cache: true });
+  context.after(setup.close);
+  const { page } = setup;
+  setup.controls.hold = true;
+  setup.controls.replayEquivalent = true;
+  await page.getByRole('checkbox', { name: 'Ask Luna', exact: true }).check();
+  await setup.waitForCalls(1);
+  await page.getByRole('button', { name: 'Stop Luna', exact: true }).click();
+  setup.release();
+  await waitRequests(page, 1);
+  setup.controls.hold = false;
+  await page.getByRole('region', { name: 'Information & tools', exact: true }).getByRole('button', { name: 'Inspect Luna request and reply', exact: true }).click();
+  const compare = page.getByRole('dialog', { name: 'Luna request & reply', exact: true }).getByRole('region', { name: 'Reasoning comparison', exact: true });
+  await compare.getByRole('button', { name: 'Replay with Reasoning low', exact: true }).click();
+  const verdict = compare.getByTestId('compare-verdict');
+  await verdict.waitFor();
+  assert.equal(setup.replayCalls.length, 1);
+  assert.match(await verdict.innerText(), /^Different placement, same result: \S+ without reasoning and \S+ with it both leave \d+ lines?, \d+ holes?, max height \d+\. With reasoning: \+256 output tokens/);
+  const outcomes = await compare.getByRole('row', { name: /^Lines \/ holes \/ max height/ }).getByRole('cell').allInnerTexts();
+  assert.equal(outcomes.length, 2);
+  assert.equal(outcomes[0], outcomes[1]);
+  assert.notEqual(await compare.getByTestId('compare-move-off').locator('strong').innerText(), await compare.getByTestId('compare-move-low').locator('strong').innerText());
   assert.deepEqual(setup.errors, []);
 });
 

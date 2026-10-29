@@ -45,9 +45,11 @@ function ReasoningCompare({ record, state, rates, canCompare, onCompare }: {
   const replay = state?.state === 'done' ? { source: 'Replay', placementId: state.comparison.placementId, valid: state.comparison.status === 'ready', tip: state.comparison.tip, usage: state.comparison.usage, latencyMs: state.comparison.latencyMs } : null;
   const [off, low] = insight.reasoningEnabled ? [replay, original] : [original, replay];
   const sides = off && low ? [off, low] : null;
+  const result = (move: OfferedMove) => `${number(move.clearedLines)} ${move.clearedLines === 1 ? 'line' : 'lines'}, ${number(move.holes)} ${move.holes === 1 ? 'hole' : 'holes'}, max height ${number(move.maxHeight)}`;
+  const moveOf = (side: typeof original) => side.valid && side.placementId ? moves.get(side.placementId) : undefined;
   const describe = (side: typeof original) => {
-    const move = side.placementId ? moves.get(side.placementId) : undefined;
-    return side.valid && move ? `${side.placementId} (${number(move.clearedLines)} ${move.clearedLines === 1 ? 'line' : 'lines'}, ${number(move.holes)} ${move.holes === 1 ? 'hole' : 'holes'}, max height ${number(move.maxHeight)})` : 'a rejected reply';
+    const move = moveOf(side);
+    return move ? `${side.placementId} (${result(move)})` : side.valid ? `${side.placementId}` : 'a rejected reply';
   };
   let verdict = '';
   if (off && low) {
@@ -55,7 +57,13 @@ function ReasoningCompare({ record, state, rates, canCompare, onCompare }: {
     const outputCost = rates ? tokens * rates.output / 1000000 : null;
     const seconds = (low.latencyMs - off.latencyMs) / 1000;
     const effect = `With reasoning: ${tokens >= 0 ? '+' : '-'}${number(Math.abs(tokens))} output tokens (${signedMoney(outputCost)}), ${seconds >= 0 ? '+' : '-'}${Math.abs(seconds).toFixed(1)} s.`;
-    verdict = `${off.valid && low.valid && off.placementId === low.placementId ? `Same move, ${describe(low)}.` : `Different outcome: ${describe(off)} without reasoning, ${describe(low)} with it.`} ${effect}`;
+    const [offMove, lowMove] = [moveOf(off), moveOf(low)];
+    // Equally scored placements are not a change in outcome, whichever cells they use.
+    const sameResult = offMove && lowMove && offMove.clearedLines === lowMove.clearedLines && offMove.holes === lowMove.holes && offMove.maxHeight === lowMove.maxHeight && offMove.gameOver === lowMove.gameOver;
+    const lead = off.valid && low.valid && off.placementId === low.placementId ? `Same move, ${describe(low)}.`
+      : sameResult ? `Different placement, same result: ${off.placementId} without reasoning and ${low.placementId} with it both leave ${result(lowMove)}.`
+      : `Different outcome: ${describe(off)} without reasoning, ${describe(low)} with it.`;
+    verdict = `${lead} ${effect}`;
   }
   return <section className="reasoning-compare" data-testid="reasoning-compare" aria-label="Reasoning comparison">
     <header><h4><GitCompareArrows size={15} />Reasoning comparison</h4>{state?.state !== 'done' && <button type="button" className="compare-button" disabled={state?.state === 'pending' || !canCompare} onClick={onCompare}>{state?.state === 'pending' ? `Replaying with Reasoning ${flipped}...` : `Replay with Reasoning ${flipped}`}</button>}</header>
@@ -74,13 +82,13 @@ function ReasoningCompare({ record, state, rates, canCompare, onCompare }: {
             const move = side.valid && side.placementId ? moves.get(side.placementId) : undefined;
             return <td key={index}>{move ? `${number(move.clearedLines)} / ${number(move.holes)} / ${number(move.maxHeight)}` : '--'}</td>;
           })}</tr>
-          <tr><th scope="row">Tip</th>{sides.map((side, index) => <td key={index}>{side.tip}</td>)}</tr>
+          <tr><th scope="row">Tip <small>(reworded on every request)</small></th>{sides.map((side, index) => <td key={index}>{side.tip}</td>)}</tr>
           <tr><th scope="row">Output tokens</th>{sides.map((side, index) => <td key={index} data-testid={`compare-output-${index ? 'low' : 'off'}`}>{number(side.usage.output)}<small>{side.usage.reasoning === null ? 'reasoning not reported' : `${number(side.usage.reasoning)} reasoning`}</small></td>)}</tr>
           <tr><th scope="row">Time</th>{sides.map((side, index) => <td key={index}>{number(side.latencyMs)} ms</td>)}</tr>
           <tr><th scope="row">Cost <small>est.</small></th>{sides.map((side, index) => <td key={index}>{formatMoney(rates ? costForUsage(side.usage, rates).total : null)}</td>)}</tr>
         </tbody>
       </table></div>
-      <small>Moves are scored by the game engine on the same board. Luna&apos;s reasoning itself stays hidden: the API returns only its token count.</small>
+      <small data-testid="compare-note">Moves are scored by the game engine on the same board. Luna rewords its tip on every request and can pick a different placement even with the same settings, so one comparison can&apos;t separate reasoning from chance. Luna&apos;s reasoning itself stays hidden: the API returns only its token count.</small>
     </>}
   </section>;
 }

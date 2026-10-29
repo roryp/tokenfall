@@ -59,7 +59,7 @@ Options start off and apply from the next request. Compression and Cache combine
 
 **Request & reply** in **Information & tools** shows exactly what Luna is sent and what it returns, live while it plays. Opening it makes no model call and doesn't pause Luna.
 
-[![The Luna request and reply inspector: the request settings and the system and user messages sent to gpt-5.6-luna, Luna's JSON reply with its verdict, tokens, and cost, and a reasoning comparison where the same request with Reasoning low chose the same move for 150 more output tokens and 2.1 s.](docs/images/luna-request-reply.png)](docs/images/luna-request-reply.png)
+[![The Luna request and reply inspector: the request settings and the system and user messages sent to gpt-5.6-luna, Luna's JSON reply with its verdict, tokens, and cost, and a reasoning comparison where the same request with Reasoning low chose the same move with a reworded tip, for 225 more output tokens and 2.3 s.](docs/images/luna-request-reply.png)](docs/images/luna-request-reply.png)
 
 | Part | Shows |
 | --- | --- |
@@ -70,7 +70,7 @@ Options start off and apply from the next request. Compression and Cache combine
 
 It follows each new reply. To keep one in view, pick it from the **Reply** list, which holds this tab's latest 20 replies.
 
-**A reasoning comparison is a paid Luna request** (about the cost of a move). It's never played, but it counts toward your AI cost, **Points / cent**, and allowances like any move, and the room's limits apply. Luna's next move waits for it, and each reply is compared once. Reasoning itself can't be shown: Chat Completions returns only a `reasoning_tokens` count, and [reasoning summaries](https://learn.microsoft.com/azure/foundry/openai/how-to/reasoning#reasoning-summary) from the Responses API came back empty for Luna's moves in October 2026 tests, even at medium effort.
+**A reasoning comparison is a paid Luna request** (about the cost of a move). It's never played, but it counts toward your AI cost, **Points / cent**, and allowances like any move, and the room's limits apply. Luna's next move waits for it, and each reply is compared once. Luna rewords its tip on every request, even with the same settings, so a different tip alone doesn't show an effect of reasoning; different placements that leave the same lines, holes, and height are reported as the same result. Reasoning itself can't be shown: Chat Completions returns only a `reasoning_tokens` count, and [reasoning summaries](https://learn.microsoft.com/azure/foundry/openai/how-to/reasoning#reasoning-summary) from the Responses API came back empty for Luna's moves in October 2026 tests, even at medium effort.
 
 ### Pricing
 
