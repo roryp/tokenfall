@@ -451,7 +451,7 @@ export function useGame() {
     }
   }
 
-  async function restart(text?: string): Promise<boolean> {
+  async function restart(): Promise<boolean> {
     if (!socket.current?.connected || !active.current || requestPending.current || joiningRef.current) return false;
     const wasInspecting = inspection.current;
     joiningRef.current = true;
@@ -460,14 +460,12 @@ export function useGame() {
     try {
       if (!await flushAll()) return false;
       return await new Promise<boolean>(resolve => {
-        const receive = (error: Error | null, reply: Reply<JoinResult>) => {
+        socket.current!.timeout(8000).emit('restart', (error: Error | null, reply: Reply<JoinResult>) => {
           if (error || !reply.ok) { setNotice(!error && !reply.ok ? reply.error : 'Could not start a new game. Try again.'); resolve(false); return; }
           installSession(reply.data);
           setNotice('');
           resolve(true);
-        };
-        if (text === undefined) socket.current!.timeout(8000).emit('restart', receive);
-        else socket.current!.timeout(8000).emit('configure', { text }, receive);
+        });
       });
     } finally {
       joiningRef.current = false;

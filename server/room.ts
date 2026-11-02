@@ -461,14 +461,11 @@ export class Room {
     return { sequence: player.sequence, score: player.game.score, lines: player.game.lines, pieceId: player.game.pieceId, frame: player.game.frame };
   }
 
-  restart(player: Player, text?: string) {
+  restart(player: Player) {
     this.assertAvailable(player);
     const now = Date.now();
     if (now - player.started < 2000) throw new RequestError('Wait a moment before restarting.', 'cooldown', 2000);
-    if (text !== undefined && text.length === 0) throw new RequestError('Enter some text to make your token blocks.', 'token-setup');
-    const tokenText = text ?? player.record.token_text;
-    player.game = this.gameFor(tokenText);
-    player.record.token_text = tokenText;
+    player.game = this.gameFor(player.record.token_text);
     player.runId = randomUUID();
     player.started = now;
     player.sequence = 0;

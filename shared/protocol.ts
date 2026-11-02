@@ -258,7 +258,6 @@ export interface ClientEvents {
   leave: (reply: (result: Reply<null>) => void) => void;
   inputs: (data: InputBatch, reply: (result: Reply<InputAck>) => void) => void;
   restart: (reply: (result: Reply<JoinResult>) => void) => void;
-  configure: (data: { text: string }, reply: (result: Reply<JoinResult>) => void) => void;
   inspect: (reply: (result: Reply<PromptPreview>) => void) => void;
   assist: (options: AiOptions, reply: (result: Reply<{ insight: Insight } & PlayerUsage>) => void) => void;
   compare: (data: { id: string }, reply: (result: Reply<{ comparison: ReasoningComparison } & PlayerUsage>) => void) => void;

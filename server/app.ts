@@ -14,7 +14,6 @@ import { Room } from './room.ts';
 import { countTokens, tokenChips } from './tokens.ts';
 
 const nameSchema = z.string().trim().min(2).max(16).regex(/^[\p{L}\p{N} _-]+$/u, 'Use letters, numbers, spaces, underscores or hyphens.');
-const setupSchema = z.object({ text: z.string().min(1).max(500) }).strict();
 const joinSchema = z.object({ name: nameSchema, room: z.string().length(6), token: z.string().length(64).optional(), text: z.string().min(1).max(500).optional(), classic: z.boolean().optional(), adminKey: z.string().min(1).max(256).optional() }).strict();
 const inputSchema = z.object({
   runId: z.string().uuid(), sequence: z.number().int().positive(), frame: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
@@ -197,14 +196,6 @@ export function createApplication(config: AppConfig, gateway: ModelGateway = new
     socket.on('restart', respond => {
       if (typeof respond !== 'function') return;
       try { respond({ ok: true, data: room.restart(room.playerFor(socket.id)) }); }
-      catch (error) { respond(errorReply(error)); }
-    });
-    socket.on('configure', (payload, respond) => {
-      if (typeof respond !== 'function') return;
-      try {
-        const data = setupSchema.parse(payload);
-        respond({ ok: true, data: room.restart(room.playerFor(socket.id), data.text) });
-      }
       catch (error) { respond(errorReply(error)); }
     });
     socket.on('inspect', respond => {

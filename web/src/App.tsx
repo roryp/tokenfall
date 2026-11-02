@@ -1,11 +1,11 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
-import { Bot, Brain, Columns2, FileJson2, GitCompareArrows, History, Layers3, MessagesSquare, Pause, Play, Plug, Quote, ReceiptText, RotateCcw, ScanSearch, Trophy, Wifi, WifiOff, X } from 'lucide-react';
+import { Bot, Brain, Columns2, FileJson2, GitCompareArrows, History, Layers3, MessagesSquare, Pause, Play, Plug, ReceiptText, RotateCcw, ScanSearch, Trophy, Wifi, WifiOff, X } from 'lucide-react';
 import type { LucideIcon } from 'lucide-react';
 import { costForUsage, LUNA_API_PATH, lunaRequestBody, reportedTokenBalance } from '../../shared/protocol.ts';
 import type { Insight, McpLookaheadResult, TokenRates } from '../../shared/protocol.ts';
 import type { MoveScore } from '../../shared/game.ts';
 import { GameBoard, GameControls, PiecePreview } from './GameBoard.tsx';
-import { GameSetup, RoomMaintenance, RoomPanel, RoomShare } from './RoomPanel.tsx';
+import { RoomMaintenance, RoomPanel, RoomShare } from './RoomPanel.tsx';
 import { formatMoney } from './format.ts';
 import { useGame } from './useGame.ts';
 import type { ComparisonState, RequestRecord } from './useGame.ts';
@@ -239,8 +239,6 @@ export default function App() {
   const [inspectedPrompt, setInspectedPrompt] = useState<Insight | null>(null);
   const [inspectInstructions, setInspectInstructions] = useState(false);
   const promptDialog = useRef<HTMLDialogElement | null>(null);
-  const [editingSentence, setEditingSentence] = useState(false);
-  const sentenceDialog = useRef<HTMLDialogElement | null>(null);
   const [inspectedLookup, setInspectedLookup] = useState<RequestRecord | null>(null);
   const [mcpOpen, setMcpOpen] = useState(false);
   const mcpDialog = useRef<HTMLDialogElement | null>(null);
@@ -254,8 +252,6 @@ export default function App() {
   const lookupRecord = mcpOpen ? inspectedLookup ?? lastLookup : null;
   const exchangeRecord = game.requestHistory.length ? pinnedReply ?? game.requestHistory[0] : null;
   const exchangeChoices = pinnedReply && !game.requestHistory.some(record => record.insight.id === pinnedReply.insight.id) ? [...game.requestHistory, pinnedReply] : game.requestHistory;
-  // Hidden rather than disabled while unavailable; Luna's requests would otherwise make it flicker. A blocked Luna can still change it.
-  const sentenceAvailable = game.joined && !game.busy && !(game.autopilot && game.autopilotStatus !== 'blocked');
   const latest = game.insight;
   const rates = game.room?.pricing.snapshot?.usdPerMillion;
   const compressionSaving = rates ? game.metrics.compressionSaved * rates.input / 1000000 : null;
@@ -275,13 +271,12 @@ export default function App() {
   const pricing = game.room?.pricing.status;
   const status = !game.connected ? 'Connecting' : !game.joined ? 'Ready' : game.autopilot ? game.inspectionPaused || game.joining || game.autopilotStatus === 'blocked' ? 'Luna paused' : game.busy ? 'Luna is thinking' : game.autopilotStatus === 'retrying' ? 'Luna retrying' : 'Luna playing' : game.view.status === 'over' ? 'Game over' : game.view.status === 'paused' ? 'Manual paused' : 'Manual play';
   useEffect(() => { if (inspectedPrompt) promptDialog.current?.showModal(); }, [inspectedPrompt]);
-  useEffect(() => { if (editingSentence) sentenceDialog.current?.showModal(); }, [editingSentence]);
   useEffect(() => { if (mcpOpen) mcpDialog.current?.showModal(); }, [mcpOpen]);
   useEffect(() => { if (costsOpen) costsDialog.current?.showModal(); }, [costsOpen]);
   useEffect(() => { if (exchangeOpen) exchangeDialog.current?.showModal(); }, [exchangeOpen]);
   useEffect(() => {
     if (!game.resetVersion) return;
-    for (const dialog of [promptDialog, sentenceDialog, mcpDialog, costsDialog, exchangeDialog]) dialog.current?.close();
+    for (const dialog of [promptDialog, mcpDialog, costsDialog, exchangeDialog]) dialog.current?.close();
   }, [game.resetVersion]);
 
   function inspect(instructions = false) {
@@ -335,7 +330,6 @@ export default function App() {
         <button className="information-button" aria-haspopup="dialog" onClick={() => { if (!game.autopilot) game.act('pause'); setCostsOpen(true); }}><ReceiptText size={18} /><span>AI costs</span></button>
         <button className="information-button" aria-label="Show leaderboard" aria-haspopup="dialog" onClick={showRankings}><Trophy size={18} /><span><span className="information-full-label">Leaderboard</span><span className="information-short-label">Scores</span></span></button>
         <RoomShare game={game} />
-        {(sentenceAvailable || editingSentence) && <button className="information-button" aria-label="Change sentence" aria-haspopup="dialog" disabled={!game.joined || game.busy || game.joining || !game.connected} onClick={() => { game.pauseForInspection(); game.setNotice(''); setEditingSentence(true); }}><Quote size={18} /><span>Change sentence</span></button>}
         {game.room?.maintenance && <RoomMaintenance game={game} />}
       </div>
     </section>
@@ -441,11 +435,6 @@ export default function App() {
           <small>Exact messages and settings from this tab&apos;s latest 20 Luna requests. Response bodies omit the provider&apos;s internal routing and latency diagnostics. Opening this makes no model call.</small>
         </> : <p data-testid="exchange-empty" role="status">{game.busy ? 'A Luna request is in flight. Its messages and reply appear here when the reply arrives.' : 'No Luna replies in this tab yet. Turn on Ask Luna to see each request sent to Luna and its reply.'}</p>}
       </>}
-    </dialog>
-    <dialog className="prompt-dialog sentence-dialog" ref={sentenceDialog} aria-labelledby="sentence-title" onClose={() => { setEditingSentence(false); game.resumeAfterInspection(); }}>
-      <header><h2 id="sentence-title">New sentence</h2><button className="icon-button" aria-label="Close sentence editor" title="Close sentence editor" onClick={() => sentenceDialog.current?.close()}><X size={19} /></button></header>
-      {editingSentence && game.notice && <p className="field-error" role="alert">{game.notice}</p>}
-      {editingSentence && <GameSetup editing initialText={game.player?.tokenText || undefined} disabled={!game.connected} pending={game.joining} onSubmit={async setup => { if (await game.restart(setup.text)) sentenceDialog.current?.close(); }} />}
     </dialog>
     <dialog className={`prompt-dialog ${inspectInstructions ? 'activity-dialog' : 'compression-dialog'}`} ref={promptDialog} aria-labelledby="prompt-title" onClose={() => { setInspectedPrompt(null); if (!inspectInstructions) game.resumeAfterInspection(); }}>
       <header><h2 id="prompt-title">{inspectInstructions ? 'Cache activity' : 'Compression before / after'}</h2><div className="inspector-actions">{inspectInstructions && game.autopilot && <button className="icon-button" aria-label="Stop Luna in inspector" title="Stop Luna" onClick={() => game.toggleAutopilot(false)}><Pause size={19} /></button>}<button className="icon-button" aria-label="Close prompt" title="Close prompt" onClick={() => promptDialog.current?.close()}><X size={19} /></button></div></header>

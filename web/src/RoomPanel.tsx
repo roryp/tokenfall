@@ -8,13 +8,13 @@ import { PiecePreview } from './GameBoard.tsx';
 import { formatMoney } from './format.ts';
 import type { useGame } from './useGame.ts';
 
-export function GameSetup({ initialText = DEFAULT_TOKEN_TEXT, editing = false, disabled, pending, onSubmit }: {
-  initialText?: string; editing?: boolean; disabled: boolean; pending: boolean;
+export function GameSetup({ disabled, pending, onSubmit }: {
+  disabled: boolean; pending: boolean;
   onSubmit: (setup: { name: string; text?: string }) => void;
 }) {
   const id = useId();
   const [name, setName] = useState('');
-  const [text, setText] = useState(initialText);
+  const [text, setText] = useState(DEFAULT_TOKEN_TEXT);
   const [mode, setMode] = useState('sentence');
   const [preview, setPreview] = useState<{ text: string; count: number; tokens: TokenChip[] } | null>(null);
   const [failure, setFailure] = useState<{ text: string; message: string } | null>(null);
@@ -36,16 +36,16 @@ export function GameSetup({ initialText = DEFAULT_TOKEN_TEXT, editing = false, d
   }, [mode, text, retry]);
   const current = preview?.text === text ? preview : null;
   const error = failure?.text === text ? failure.message : null;
-  const validName = editing || /^[\p{L}\p{N} _-]{2,16}$/u.test(name.trim());
+  const validName = /^[\p{L}\p{N} _-]{2,16}$/u.test(name.trim());
   const validText = mode === 'classic' || Boolean(text.trim() && current && current.count > 0 && current.count <= 256 && !error);
-  return <form className="join-form" aria-label={editing ? 'Change sentence' : 'Join game'} onSubmit={event => { event.preventDefault(); if (!disabled && !pending && validName && validText) onSubmit({ name: name.trim(), ...(mode === 'sentence' ? { text } : {}) }); }}>
-    {!editing && <><h2>Join game</h2><label htmlFor={`${id}-name`}>Name</label><input id={`${id}-name`} name="name" autoComplete="nickname" placeholder="Your name" required minLength={2} maxLength={16} value={name} onChange={event => setName(event.target.value)} disabled={pending} aria-describedby={name && !validName ? `${id}-name-error` : undefined} />{name && !validName && <small id={`${id}-name-error`} className="field-error">Use 2-16 letters, numbers, spaces, _ or -.</small>}
-      <fieldset className="segmented-control"><legend>Pieces</legend>{['sentence', 'classic'].map(value => <label key={value}><input type="radio" name={`${id}-mode`} value={value} checked={mode === value} onChange={() => setMode(value)} disabled={pending} /><span>{value === 'sentence' ? 'Sentence' : 'Classic'}</span></label>)}</fieldset></>}
+  return <form className="join-form" aria-label="Join game" onSubmit={event => { event.preventDefault(); if (!disabled && !pending && validName && validText) onSubmit({ name: name.trim(), ...(mode === 'sentence' ? { text } : {}) }); }}>
+    <h2>Join game</h2><label htmlFor={`${id}-name`}>Name</label><input id={`${id}-name`} name="name" autoComplete="nickname" placeholder="Your name" required minLength={2} maxLength={16} value={name} onChange={event => setName(event.target.value)} disabled={pending} aria-describedby={name && !validName ? `${id}-name-error` : undefined} />{name && !validName && <small id={`${id}-name-error`} className="field-error">Use 2-16 letters, numbers, spaces, _ or -.</small>}
+    <fieldset className="segmented-control"><legend>Pieces</legend>{['sentence', 'classic'].map(value => <label key={value}><input type="radio" name={`${id}-mode`} value={value} checked={mode === value} onChange={() => setMode(value)} disabled={pending} /><span>{value === 'sentence' ? 'Sentence' : 'Classic'}</span></label>)}</fieldset>
     {mode === 'sentence' && <><label htmlFor={`${id}-sentence`}>Your sentence</label><textarea id={`${id}-sentence`} name="sentence" rows={3} maxLength={500} required value={text} onChange={event => setText(event.target.value)} disabled={pending} aria-describedby={`${id}-preview-status`} />
       <div className="token-preview-status" id={`${id}-preview-status`} role="status"><span>{error ?? (!text.trim() ? 'Enter a sentence.' : current ? current.count > 256 ? 'Use at most 256 tokens.' : `${current.count} tokens / o200k_base` : 'Preparing blocks...')}</span><span>{text.length}/500</span>{error && <button type="button" className="icon-button" aria-label="Retry token preview" title="Retry token preview" onClick={() => { setFailure(null); setRetry(value => value + 1); }}><RotateCcw size={17} /></button>}</div>
       {current && current.count <= 256 && <ol className="token-stream" aria-label="Sentence blocks">{current.tokens.map((chip, index) => <li key={index} data-token-id={chip.id} data-piece={tokenShape(chip.id)} title={`Token ${chip.id} / ${tokenShape(chip.id)} piece`}><PiecePreview piece={tokenShape(chip.id)} /><span>{tokenLabel(chip.text)}</span></li>)}</ol>}
     </>}
-    <button type="submit" className="primary-button" disabled={disabled || pending || !validName || !validText}><Play size={18} />{pending ? editing ? 'Starting...' : 'Joining...' : editing ? 'Start with sentence' : 'Join game'}</button>
+    <button type="submit" className="primary-button" disabled={disabled || pending || !validName || !validText}><Play size={18} />{pending ? 'Joining...' : 'Join game'}</button>
   </form>;
 }
 

@@ -417,14 +417,14 @@ test('personal AI allowances are fixed at 1 million tokens and persist across re
     assert.equal(reply.allowance.remaining, 1000000 - 23020);
     assert.equal(reply.allowance.reserved, 0);
     context.mock.timers.tick(2100);
-    const restarted = room.restart(player, 'A new sentence.');
+    const restarted = room.restart(player);
     assert.deepEqual(restarted.allowance, reply.allowance);
     room.disconnect('budget');
     room.close();
     room = new Room(setup.config, setup.gateway);
     const restored = room.join('Budget Setup', room.code, joined.token, 'restored');
     assert.deepEqual(restored.allowance, reply.allowance);
-    assert.equal(restored.tokenText, 'A new sentence.');
+    assert.equal(restored.tokenText, 'A shared token pool.');
     assert.equal(room.view().pointsLeaderboard[0].score, 987);
   } finally { room.close(); rmSync(setup.dataDirectory, { recursive: true, force: true }); }
 });
@@ -1113,10 +1113,11 @@ test('token setup is authoritative, private, replayable, and persistent without 
     assert.equal(restored.tokenText, text);
     const current = room.playerFor('restored');
     current.started -= 3000;
-    const next = room.restart(current, 'New tokens.');
-    assert.deepEqual(next.replay.tokens, gameTokens('New tokens.'));
+    const next = room.restart(current);
+    assert.deepEqual(next.replay.tokens, gameTokens(text));
+    assert.equal(next.tokenText, text);
     assert.equal(next.metrics.input, 1234);
-    assert.throws(() => room.restart(current, ''), /Wait|Enter/);
+    assert.throws(() => room.restart(current), /Wait/);
   } finally { room.close(); rmSync(setup.dataDirectory, { recursive: true, force: true }); }
 });
 
@@ -1227,8 +1228,7 @@ test('socket setup rejects forged token IDs, over-limit sequences, and invalid f
     const player = application.room.playerFor(client.id!);
     assert.equal(player.record.attempts, 0);
     player.started -= 3000;
-    const badSetup = await client.timeout(5000).emitWithAck('configure', { text: 'new', tokens: [{ id: 0, text: 'fake' }] });
-    assert.equal(badSetup.ok, false);
+    await assert.rejects(client.timeout(500).emitWithAck('configure', { text: 'new' }), 'Sentences can only be chosen when joining');
     assert.equal(player.record.token_text, 'hello world');
   } finally { client.disconnect(); await application.close(); rmSync(setup.dataDirectory, { recursive: true, force: true }); }
 });

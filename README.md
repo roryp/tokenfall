@@ -25,7 +25,7 @@ Open [the game](https://aka.ms/tokenfall), enter a name (2–16 letters, numbers
 
 ### Sentence mode
 
-Your text (up to 500 characters and 256 `o200k_base` tokens) becomes a repeating piece queue: each token ID picks a shape by `ID % 7`, so the same text always gives the same queue. Sentences aren't sent to Luna or shown in rankings. **Change sentence** in **Information & tools** starts a new game with new text; it's hidden while Luna plays, so stop Luna first.
+Your text (up to 500 characters and 256 `o200k_base` tokens) becomes a repeating piece queue: each token ID picks a shape by `ID % 7`, so the same text always gives the same queue. Sentences aren't sent to Luna or shown in rankings. You choose the sentence when you join, and **New game** keeps it.
 
 | Token ID % 7 | 0 | 1 | 2 | 3 | 4 | 5 | 6 |
 | --- | --- | --- | --- | --- | --- | --- | --- |
