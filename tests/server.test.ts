@@ -14,7 +14,7 @@ import { TETROMINOES } from 'miaoda-game-fallblock-core';
 import OpenAI from 'openai';
 import { boardMetrics, Game, placementsFor } from '../shared/game.ts';
 import { costForUsage, DEFAULT_TOKEN_ALLOWANCE, emptyMetrics, lunaRequestBody, reportedTokenBalance, tokenAllowance, tokenCreditsUsed } from '../shared/protocol.ts';
-import type { AiOptions, Insight, JoinResult, Reply, RoomView, TokenPricing } from '../shared/protocol.ts';
+import type { AiOptions, GameResult, Insight, JoinResult, Reply, RoomView, TokenPricing } from '../shared/protocol.ts';
 import { clientAddress, createApplication, JOINS_PER_SEAT_PER_MINUTE, SOCKET_EVENT_BURST, TOKENIZE_REQUESTS_PER_SEAT_PER_MINUTE, trustedProxy } from '../server/app.ts';
 import { DEFAULT_ROOM_CAPACITY, loadConfig, MIN_ADMIN_KEY_LENGTH } from '../server/config.ts';
 import { AI_COOLDOWN_MS, AUTOPILOT_COOLDOWN_MS, BASE_ROOM_LIMITS, deploymentLimits, EVALUATION_INTERVAL_MS, LUNA_ATTEMPT_TIMEOUT_MS, LUNA_REASONING_ATTEMPT_TIMEOUT_MS, LUNA_RETRY_DELAY_MS, LunaGateway, lunaRequestSettings, MAX_MCP_IN_FLIGHT, MAX_OUTPUT_TOKENS, MAX_REASONING_COMPLETION_TOKENS, MCP_GUIDANCE, ModelGate, PLAYER_REQUEST_LIMIT, PLAYER_TOKEN_BUDGET, POLICY, PREFIX_TOKENS, ROOM_EVALUATIONS_PER_SECOND, ROOM_REQUEST_LIMIT, ROOM_TOKEN_BUDGET, roomLimits } from '../server/model.ts';
@@ -62,6 +62,9 @@ for (const mode of ['all', 'scores'] as const) test(`room reset script ${mode} m
     player.record.best_level = 3;
     player.metrics = { ...emptyMetrics(), requests: 4, input: 10000, output: 100, cached: 1000, reasoning: 20 };
     player.record.attempts = 5;
+    const pastGame = { ...player.result, runId: randomUUID(), score: 4321, lines: 12, level: 3, attempts: 5, metrics: { ...player.metrics }, costUsd: 0.002 };
+    player.results.push(pastGame);
+    player.record.best_game_id = pastGame.runId;
     room.disconnect('reset');
     room.join('Zero-score player', room.code, undefined, 'zero');
     room.disconnect('zero');
@@ -97,6 +100,11 @@ for (const mode of ['all', 'scores'] as const) test(`room reset script ${mode} m
       assert.ok(room.records().every(record => record.best_score === 0 && record.best_lines === 0 && record.best_level === 1));
       assert.equal(room.join(session.name, code, session.token, 'old').metrics.requests, 4);
       assert.equal(room.view().allowance.used, 10100);
+      const games = room.records().flatMap(record => JSON.parse(record.game_results) as GameResult[]);
+      assert.equal(games.length, 1);
+      assert.deepEqual(games[0], { ...pastGame, score: 0, lines: 0, level: 1 });
+      assert.equal(room.view().leaderboard[0].score, 0);
+      assert.equal(room.records().find(record => record.id === session.playerId)!.best_game_id, '');
     }
   } finally { if (room.database.isOpen) room.close(); rmSync(setup.dataDirectory, { recursive: true, force: true }); }
 });
@@ -915,7 +923,7 @@ test('reasoning comparisons are metered like moves, never change the game, and r
     context.mock.timers.tick(AUTOPILOT_COOLDOWN_MS);
     await assert.rejects(room.compareReasoning(player, next.insight.id), { code: 'budget' });
     assert.equal(replays.length, 1);
-    for (let index = 0; index < REPLAY_LIMIT; index += 1) room['rememberReply'](player, { ...next.insight, id: randomUUID() });
+    for (let index = 0; index < REPLAY_LIMIT; index += 1) room['rememberReply'](player, { ...next.insight, id: randomUUID() }, player.runId);
     assert.equal(player.replays.size, REPLAY_LIMIT);
     assert.equal(player.replays.has(insight.id), false);
   } finally { room.close(); rmSync(setup.dataDirectory, { recursive: true, force: true }); }
@@ -1336,10 +1344,11 @@ test('single-instance rollback journal storage retains scores across process res
     const joined = room.join('Persistent Container', room.code, undefined, 'socket');
     const player = room.playerFor('socket');
     room.inputs(player, { runId: joined.runId, sequence: 1, frame: 0, events: [{ frame: 0, action: 'hardDrop' }] });
-    const score = room.view().leaderboard[0].score;
+    const score = room.view().pointsLeaderboard[0].score;
     room.close();
     room = new Room(config, setup.gateway);
-    assert.equal(room.view().leaderboard[0].score, score);
+    assert.equal(room.view().pointsLeaderboard[0].score, score);
+    assert.deepEqual(room.view().leaderboard, []);
   } finally { room.close(); rmSync(setup.dataDirectory, { recursive: true, force: true }); }
 });
 
@@ -1444,28 +1453,257 @@ test('free board comparisons use the same prompt encoding without spending token
   } finally { room.close(); rmSync(setup.dataDirectory, { recursive: true, force: true }); }
 });
 
-test('real priced usage determines the efficiency leaderboard while base scores remain intact', async () => {
+test('per-game efficiency keeps a game separate from later AI and manual games', async context => {
+  context.mock.timers.enable({ apis: ['Date'], now: Date.now() });
   const setup = fixture();
   const room = new Room(setup.config, setup.gateway);
   try {
     room.pricing = setup.pricing;
+    room.join('Game Pilot', room.code, undefined, 'per-game', undefined, true);
+    const player = room.playerFor('per-game');
+    const options = { cache: true, compression: true };
+    await room.assist(player, options);
+    context.mock.timers.tick(100);
+    room.inputs(player, { runId: player.runId, sequence: 1, frame: 1, events: [{ frame: 0, action: 'hardDrop' }] });
+    const first = room.view().leaderboard[0];
+    assert.ok(first.score > 0);
+    assert.ok(first.costUsd! > 0);
+
+    context.mock.timers.tick(AI_COOLDOWN_MS + 2001);
+    room.restart(player);
+    await room.assist(player, options);
+    assert.equal(player.metrics.requests, 2);
+    assert.equal(room.view().leaderboard[0].costUsd, first.costUsd);
+    assert.equal(room.view().leaderboard[0].challengeScore, first.challengeScore);
+
+    context.mock.timers.tick(2001);
+    room.restart(player);
+    context.mock.timers.tick(100);
+    room.inputs(player, { runId: player.runId, sequence: 1, frame: 2, events: [{ frame: 0, action: 'hardDrop' }, { frame: 1, action: 'hardDrop' }] });
+    assert.ok(room.view().pointsLeaderboard[0].score > first.score);
+    assert.equal(room.view().leaderboard[0].score, first.score);
+    assert.equal(room.view().leaderboard[0].costUsd, first.costUsd);
+    assert.equal(room.view().leaderboard[0].lines, first.lines);
+    assert.equal(room.view().metrics.requests, 2);
+  } finally { room.close(); rmSync(setup.dataDirectory, { recursive: true, force: true }); }
+});
+
+test('per-game prices freeze at admission and late replies stay with their original run', async context => {
+  context.mock.timers.enable({ apis: ['Date'], now: Date.now() });
+  const setup = fixture();
+  let finish!: () => void;
+  let room = new Room(setup.config, { complete: game => new Promise<Insight>(resolve => { finish = () => resolve(insightFor(game)); }) });
+  try {
+    room.pricing = setup.pricing;
+    room.join('Frozen Pilot', room.code, undefined, 'frozen');
+    const player = room.playerFor('frozen');
+    room.inputs(player, { runId: player.runId, sequence: 1, frame: 1, events: [{ frame: 0, action: 'hardDrop' }] }, player.started + 1000);
+    const originalRun = player.runId;
+    const originalCost = costForUsage(insightFor(player.game).usage, { ...setup.pricing.snapshot!.usdPerMillion }).total;
+    const pending = room.assist(player, { cache: true, compression: true });
+    room.pricing.snapshot!.usdPerMillion.input *= 10;
+    room.pricing.snapshot!.usdPerMillion.cachedInput *= 10;
+    room.pricing.snapshot!.usdPerMillion.output *= 10;
+    context.mock.timers.tick(2001);
+    room.restart(player);
+    assert.equal(player.result.attempts, 0);
+    assert.deepEqual(player.result.metrics, emptyMetrics());
+    assert.equal(player.result.costUsd, 0);
+    finish();
+    const completed = await pending;
+    assert.equal(completed.insight.status, 'stale');
+    assert.equal(player.results.find(result => result.runId === originalRun)!.costUsd, originalCost);
+    assert.equal(player.result.costUsd, 0);
+    assert.equal(player.metrics.requests, 1);
+    assert.equal(room.view().leaderboard[0].gameId, originalRun);
+    assert.equal(room.view().leaderboard[0].costUsd, originalCost);
+
+    context.mock.timers.tick(AI_COOLDOWN_MS + 1);
+    const next = room.assist(player, { cache: true, compression: true });
+    finish();
+    await next;
+    assert.ok(Math.abs(player.result.costUsd - originalCost * 10) < 1e-12);
+    assert.equal(player.result.metrics.requests, 1);
+    assert.equal(player.metrics.requests, 2);
+    const expected = room.view().leaderboard.map(({ online, ...entry }) => entry);
+    room.close();
+    room = new Room(setup.config, setup.gateway);
+    room.pricing = { status: 'unavailable', snapshot: null };
+    assert.deepEqual(room.view().leaderboard.map(({ online, ...entry }) => entry), expected);
+    assert.equal(room.view().metrics.requests, 2);
+    assert.equal(room.view().pointsLeaderboard[0].gameId, originalRun);
+  } finally { if (room.database.isOpen) room.close(); rmSync(setup.dataDirectory, { recursive: true, force: true }); }
+});
+
+test('per-game ranking reevaluates the whole game instead of preserving its cheapest intermediate ratio', async context => {
+  context.mock.timers.enable({ apis: ['Date'], now: Date.now() });
+  const setup = fixture();
+  const room = new Room(setup.config, setup.gateway);
+  try {
+    room.pricing = setup.pricing;
+    room.gameFor = () => new Game('value-game-cost');
+    room.join('Value Pilot', room.code, undefined, 'value');
+    const player = room.playerFor('value');
+    await room.assist(player, { cache: true, compression: true });
+    room.inputs(player, { runId: player.runId, sequence: 1, frame: 1, events: [{ frame: 0, action: 'hardDrop' }] }, player.started + 1000);
+    const first = room.view().leaderboard[0];
+    context.mock.timers.tick(AI_COOLDOWN_MS + 2001);
+    room.restart(player);
+    await room.assist(player, { cache: true, compression: true });
+    room.inputs(player, { runId: player.runId, sequence: 1, frame: 2, events: [{ frame: 0, action: 'hardDrop' }, { frame: 1, action: 'hardDrop' }] }, player.started + 1000);
+    assert.equal(room.view().leaderboard[0].gameId, player.runId);
+    assert.ok(room.view().leaderboard[0].challengeScore! > first.challengeScore!);
+    for (let request = 0; request < 2; request += 1) {
+      context.mock.timers.tick(AI_COOLDOWN_MS + 1);
+      await room.assist(player, { cache: true, compression: true });
+    }
+    assert.equal(room.view().leaderboard[0].gameId, first.gameId);
+    assert.equal(room.view().leaderboard[0].challengeScore, first.challengeScore);
+    assert.equal(player.metrics.requests, 4);
+  } finally { room.close(); rmSync(setup.dataDirectory, { recursive: true, force: true }); }
+});
+
+test('per-game leaderboards break equal scores and values by earlier achievement', () => {
+  const setup = fixture();
+  const room = new Room(setup.config, setup.gateway);
+  try {
+    const examples = [
+      { name: 'Zed Value', score: 100, lines: 0, attempts: 1, achievedAt: 100 },
+      { name: 'Amy Value', score: 200, lines: 1, attempts: 2, achievedAt: 200 },
+      { name: 'Zed Points', score: 300, lines: 0, attempts: 0, achievedAt: 100 },
+      { name: 'Amy Points', score: 300, lines: 2, attempts: 0, achievedAt: 200 },
+    ];
+    for (const example of examples) {
+      room.join(example.name, room.code, undefined, example.name);
+      const player = room.playerFor(example.name);
+      const metrics = { ...emptyMetrics(), requests: example.attempts, input: example.attempts * 2000, output: example.attempts * 20, cached: example.attempts * 1500 };
+      const result = { ...player.result, ...example, runId: randomUUID(), metrics, costUsd: costForUsage(metrics, setup.pricing.snapshot!.usdPerMillion).total };
+      player.results.push(result);
+      player.record.best_score = example.score;
+      player.record.best_lines = example.lines;
+      player.record.best_game_id = result.runId;
+      player.record.updated = example.achievedAt;
+      player.record.attempts = example.attempts;
+      player.metrics = metrics;
+      room.save(player);
+    }
+    assert.deepEqual(room.view().pointsLeaderboard.slice(0, 2).map(entry => entry.name), ['Zed Points', 'Amy Points']);
+    assert.deepEqual(room.view().leaderboard.map(entry => entry.name), ['Zed Value', 'Amy Value']);
+    assert.equal(room.view().leaderboard[0].challengeScore, room.view().leaderboard[1].challengeScore);
+  } finally { room.close(); rmSync(setup.dataDirectory, { recursive: true, force: true }); }
+});
+
+test('per-game public boards exclude E2E names and manual value entries without removing lifetime usage', async () => {
+  const setup = fixture();
+  const room = new Room(setup.config, setup.gateway);
+  try {
+    room.pricing = setup.pricing;
+    room.join('Manual Player', room.code, undefined, 'manual');
+    room.join('e2e Browser', room.code, undefined, 'e2e');
+    const manual = room.playerFor('manual');
+    const automated = room.playerFor('e2e');
+    room.inputs(manual, { runId: manual.runId, sequence: 1, frame: 1, events: [{ frame: 0, action: 'hardDrop' }] }, manual.started + 1000);
+    await room.assist(automated, { cache: true, compression: true });
+    room.inputs(automated, { runId: automated.runId, sequence: 1, frame: 1, events: [{ frame: 0, action: 'hardDrop' }] }, automated.started + 1000);
+    assert.deepEqual(room.view().pointsLeaderboard.map(entry => entry.name), ['Manual Player']);
+    assert.equal(room.view().pointsLeaderboard[0].manual, true);
+    assert.equal(room.view().pointsLeaderboard[0].costUsd, 0);
+    assert.deepEqual(room.view().leaderboard, []);
+    assert.equal(room.view().metrics.requests, 1);
+    assert.equal(room.records().length, 2);
+  } finally { room.close(); rmSync(setup.dataDirectory, { recursive: true, force: true }); }
+});
+
+test('per-game reasoning comparisons after restart charge only the original game', async context => {
+  context.mock.timers.enable({ apis: ['Date'], now: Date.now() });
+  const setup = fixture();
+  const options = { cache: true, compression: true };
+  const request = lunaRequestSettings('test-only', options, 'per-game-test', false);
+  const replayUsage = { input: 1000, output: 50, cached: 0, cacheWrites: 0, reasoning: 20, total: 1050 };
+  const room = new Room(setup.config, {
+    complete: async game => ({ ...insightFor(game), request }),
+    replay: async () => ({ reasoningEnabled: true, placementId: 'P0', status: 'ready', tip: 'Comparison fixture.', usage: replayUsage, latencyMs: 1, outputText: '{}', finishReason: 'stop', request }),
+  });
+  try {
+    room.pricing = setup.pricing;
+    room.join('Replay Pilot', room.code, undefined, 'replay');
+    const player = room.playerFor('replay');
+    const reply = await room.assist(player, options);
+    room.inputs(player, { runId: player.runId, sequence: 1, frame: 1, events: [{ frame: 0, action: 'hardDrop' }] }, player.started + 1000);
+    const original = player.result;
+    const originalCost = original.costUsd;
+    context.mock.timers.tick(AI_COOLDOWN_MS + 2001);
+    room.restart(player);
+    await room.compareReasoning(player, reply.insight.id);
+    assert.equal(original.metrics.requests, 2);
+    assert.equal(original.attempts, 2);
+    assert.equal(original.costUsd, originalCost + costForUsage(replayUsage, setup.pricing.snapshot!.usdPerMillion).total);
+    assert.equal(player.result.attempts, 0);
+    assert.deepEqual(player.result.metrics, emptyMetrics());
+    assert.equal(player.result.costUsd, 0);
+    assert.equal(player.metrics.requests, 2);
+    assert.equal(room.view().leaderboard[0].gameId, original.runId);
+    assert.equal(room.view().leaderboard[0].costUsd, original.costUsd);
+  } finally { room.close(); rmSync(setup.dataDirectory, { recursive: true, force: true }); }
+});
+
+test('per-game migration preserves legacy scores and totals without inventing efficiency history', async () => {
+  const setup = fixture();
+  let room = new Room(setup.config, setup.gateway);
+  try {
+    const session = room.join('Legacy Pilot', room.code, undefined, 'legacy');
+    const player = room.playerFor('legacy');
+    player.record.best_score = 9876;
+    player.record.best_lines = 12;
+    player.metrics = { ...emptyMetrics(), requests: 1, input: 2000, output: 20 };
+    player.record.attempts = 1;
+    room.disconnect('legacy');
+    room.close();
+    const legacy = new DatabaseSync(path.join(setup.dataDirectory, 'tokenfall.sqlite'));
+    try { legacy.exec('ALTER TABLE players DROP COLUMN game_results; ALTER TABLE players DROP COLUMN best_game_id'); }
+    finally { legacy.close(); }
+    room = new Room(setup.config, setup.gateway);
+    room.pricing = setup.pricing;
+    assert.equal(room.view().pointsLeaderboard[0].score, 9876);
+    assert.equal(room.view().leaderboard[0].rankingStatus, 'legacy');
+    assert.equal(room.view().leaderboard[0].challengeScore, null);
+    assert.equal(room.view().metrics.requests, 1);
+    assert.deepEqual(JSON.parse(room.records()[0].game_results), []);
+    room.join(session.name, room.code, session.token, 'legacy-new');
+    const resumed = room.playerFor('legacy-new');
+    await room.assist(resumed, { cache: true, compression: true });
+    room.inputs(resumed, { runId: resumed.runId, sequence: 1, frame: 1, events: [{ frame: 0, action: 'hardDrop' }] }, resumed.started + 1000);
+    assert.equal(room.view().pointsLeaderboard[0].score, 9876);
+    assert.equal(room.view().leaderboard[0].score, resumed.game.score);
+    assert.equal(room.view().leaderboard[0].rankingStatus, 'ranked');
+    assert.equal(room.view().metrics.requests, 2);
+  } finally { if (room.database.isOpen) room.close(); rmSync(setup.dataDirectory, { recursive: true, force: true }); }
+});
+
+test('real priced usage determines the efficiency leaderboard while base scores remain intact', async () => {
+  const setup = fixture();
+  const room = new Room(setup.config, { complete: async (game, options) => {
+    const insight = insightFor(game);
+    insight.usage.cached = options.cache ? 1500 : 0;
+    return insight;
+  } });
+  try {
+    room.pricing = setup.pricing;
+    room.gameFor = () => new Game('priced-ranking');
     room.join('Raw Player', room.code, undefined, 'raw');
     room.join('Efficient Player', room.code, undefined, 'efficient');
     const raw = room.playerFor('raw');
     const efficient = room.playerFor('efficient');
-    raw.record.best_score = 150;
-    raw.record.attempts = 1;
-    raw.metrics = { ...emptyMetrics(), requests: 1, input: 2000, output: 20 };
-    efficient.record.best_score = 100;
-    room.save(raw);
-    room.save(efficient);
+    await room.assist(raw, { cache: false, compression: true });
+    room.inputs(raw, { runId: raw.runId, sequence: 1, frame: 2, events: [{ frame: 0, action: 'hardDrop' }, { frame: 1, action: 'hardDrop' }] }, raw.started + 1000);
+    room.inputs(efficient, { runId: efficient.runId, sequence: 1, frame: 1, events: [{ frame: 0, action: 'hardDrop' }] }, efficient.started + 1000);
     assert.equal(room.view().leaderboard[0].name, 'Raw Player');
     await room.assist(efficient, { cache: true, compression: true });
     const winner = room.view().leaderboard[0];
     assert.equal(winner.name, 'Efficient Player');
-    assert.equal(winner.score, 100);
+    assert.equal(winner.score, efficient.game.score);
     assert.ok(Math.abs(winner.costUsd! - 0.000154) < 1e-12);
-    assert.ok(Math.abs(winner.challengeScore! - 100 * 0.01 / 0.000154) < 1e-6);
+    assert.ok(Math.abs(winner.challengeScore! - efficient.game.score * 0.01 / 0.000154) < 1e-6);
     assert.ok(winner.challengeScore! > room.view().leaderboard[1].challengeScore!);
     assert.equal(tokenCreditsUsed(efficient.metrics), 520);
   } finally { room.close(); rmSync(setup.dataDirectory, { recursive: true, force: true }); }
@@ -1483,6 +1721,7 @@ test('points ranking includes manual winners independently of the top fifty cost
       player.record.best_score = index + 1;
       player.record.attempts = 1;
       player.metrics = { ...emptyMetrics(), requests: 1, input: 100, output: 10 };
+      player.results.push({ ...player.result, runId: randomUUID(), score: index + 1, attempts: 1, metrics: { ...player.metrics }, costUsd: costForUsage(player.metrics, setup.pricing.snapshot!.usdPerMillion).total });
       room.save(player);
       room.disconnect(socketId);
     }
@@ -1498,6 +1737,7 @@ test('points ranking includes manual winners independently of the top fifty cost
     assert.equal(view.pointsLeaderboard[0].score, 5000);
     assert.equal(view.pointsLeaderboard[0].costUsd, 0);
     assert.equal(view.pointsLeaderboard[0].challengeScore, null);
+    assert.equal(view.pointsLeaderboard[0].manual, true);
   } finally { room.close(); rmSync(setup.dataDirectory, { recursive: true, force: true }); }
 });
 
@@ -1505,31 +1745,39 @@ test('missing rates, zero spend, and missing provider usage cannot produce a cos
   const setup = fixture();
   const room = new Room(setup.config, setup.gateway);
   try {
-    room.join('Cost Player', room.code, undefined, 'socket');
-    const player = room.playerFor('socket');
-    player.record.best_score = 1000;
-    room.save(player);
+    room.join('Manual Player', room.code, undefined, 'manual');
+    assert.deepEqual(room.view().leaderboard, []);
+    assert.equal(room.view().pointsLeaderboard[0].manual, true);
+    room.join('Unpriced Player', room.code, undefined, 'unpriced');
+    await room.assist(room.playerFor('unpriced'), { compression: true, cache: true });
+    assert.equal(room.view().leaderboard[0].rankingStatus, 'unpriced');
+    assert.equal(room.view().leaderboard[0].costUsd, null);
+    room.pricing = setup.pricing;
     assert.equal(room.view().leaderboard[0].costUsd, null);
     assert.equal(room.view().leaderboard[0].challengeScore, null);
-    room.pricing = setup.pricing;
-    assert.equal(room.view().leaderboard[0].costUsd, 0);
-    assert.equal(room.view().leaderboard[0].challengeScore, null);
+    room.join('Cost Player', room.code, undefined, 'socket');
+    const player = room.playerFor('socket');
     await room.assist(player, { compression: true, cache: true });
+    room.inputs(player, { runId: player.runId, sequence: 1, frame: 1, events: [{ frame: 0, action: 'hardDrop' }] }, player.started + 1000);
     const ranked = room.view().leaderboard[0].challengeScore;
     assert.ok(ranked! > 0);
     room.pricing = { ...setup.pricing, status: 'stale' };
     assert.equal(room.view().leaderboard[0].challengeScore, ranked);
     assert.equal(room.view().pricing.status, 'stale');
-    player.record.attempts += 1;
-    room.save(player);
-    assert.equal(room.view().leaderboard[0].challengeScore, null);
-    assert.equal(room.view().leaderboard[0].unmeteredRequests, 1);
+    room.join('Missing Usage', room.code, undefined, 'missing');
+    room.gateway.complete = async () => { throw new Error('Provider usage unavailable'); };
+    await assert.rejects(room.assist(room.playerFor('missing'), { compression: true, cache: true }), /usage unavailable/);
+    const missing = room.view().leaderboard.find(entry => entry.name === 'Missing Usage')!;
+    assert.equal(missing.challengeScore, null);
+    assert.equal(missing.rankingStatus, 'incomplete-usage');
+    assert.equal(missing.unmeteredRequests, 1);
     assert.equal(room.view().unmeteredRequests, 1);
     assert.ok(room.view().leaderboard[0].costUsd! > 0);
   } finally { room.close(); rmSync(setup.dataDirectory, { recursive: true, force: true }); }
 });
 
-test('an in-flight request keeps a ranked player on the efficiency leaderboard until its usage arrives', async () => {
+test('an in-flight request keeps its game visible but unranked until its usage arrives', async context => {
+  context.mock.timers.enable({ apis: ['Date'], now: Date.now() });
   const setup = fixture();
   let finish!: () => void;
   const room = new Room(setup.config, { complete: game => new Promise<Insight>(resolve => { finish = () => resolve(insightFor(game)); }) });
@@ -1537,20 +1785,23 @@ test('an in-flight request keeps a ranked player on the efficiency leaderboard u
     room.pricing = setup.pricing;
     room.join('Ranked Pilot', room.code, undefined, 'socket');
     const player = room.playerFor('socket');
-    player.record.best_score = 1000;
-    player.record.attempts = 1;
-    player.metrics = { ...emptyMetrics(), requests: 1, input: 2000, output: 20, cached: 1500 };
-    room.save(player);
+    const first = room.assist(player, { compression: true, cache: true });
+    finish();
+    await first;
+    room.inputs(player, { runId: player.runId, sequence: 1, frame: 1, events: [{ frame: 0, action: 'hardDrop' }] }, player.started + 1000);
     const ranked = room.view().leaderboard[0].challengeScore!;
     assert.ok(ranked > 0);
+    context.mock.timers.tick(AI_COOLDOWN_MS + 1);
     const pending = room.assist(player, { compression: true, cache: true });
     assert.equal(player.record.attempts, 2);
-    assert.equal(room.view().leaderboard[0].unmeteredRequests, 0);
-    assert.equal(room.view().leaderboard[0].challengeScore, ranked);
+    assert.equal(room.view().leaderboard[0].unmeteredRequests, 1);
+    assert.equal(room.view().leaderboard[0].challengeScore, null);
+    assert.equal(room.view().leaderboard[0].rankingStatus, 'incomplete-usage');
     assert.equal(room.view().unmeteredRequests, 0);
     finish();
     await pending;
     assert.ok(room.view().leaderboard[0].challengeScore! < ranked);
+    assert.equal(room.view().leaderboard[0].rankingStatus, 'ranked');
   } finally { room.close(); rmSync(setup.dataDirectory, { recursive: true, force: true }); }
 });
 
@@ -1585,7 +1836,8 @@ test('room verifies input replay, rejects speed-ups and ignores duplicate batche
     assert.equal(room.inputs(player, batch).score, client.score);
     assert.throws(() => room.inputs(player, { ...batch, sequence: 2, frame: 50000, events: [] }));
     assert.equal(player.sequence, 1);
-    assert.equal(room.view().leaderboard[0].score, client.score);
+    assert.equal(room.view().pointsLeaderboard[0].score, client.score);
+    assert.deepEqual(room.view().leaderboard, []);
     room.disconnect('socket-1');
     const resumed = room.join('Player One', room.code, joined.token, 'socket-2');
     assert.equal(resumed.playerId, joined.playerId);
@@ -1895,13 +2147,14 @@ test('live sockets broadcast verified scores to a spectator and reject score inj
     assert.equal(invalid.ok, false);
     const observed = new Promise<RoomView>((resolve, reject) => {
       const timer = setTimeout(() => reject(new Error('Leaderboard did not update.')), 3000);
-      spectator.on('room', room => { if (room.leaderboard.some((entry: { score: number }) => entry.score > 0)) { clearTimeout(timer); resolve(room); } });
+      spectator.on('room', room => { if (room.pointsLeaderboard.some((entry: { score: number }) => entry.score > 0)) { clearTimeout(timer); resolve(room); } });
     });
     const moved = await player.emitWithAck('inputs', { runId: joined.data.runId, sequence: 1, frame: 0, events: [{ frame: 0, action: 'hardDrop' }] });
     assert.equal(moved.ok, true);
     const room = await observed;
-    assert.ok(room.leaderboard[0].score > 0);
-    assert.ok(room.leaderboard[0].score < 100);
+    assert.ok(room.pointsLeaderboard[0].score > 0);
+    assert.ok(room.pointsLeaderboard[0].score < 100);
+    assert.deepEqual(room.leaderboard, []);
     const health = await fetch(`${url}/api/health`).then(response => response.json()) as { reasoning: string };
     assert.equal(health.reasoning, 'none');
   } finally { player.disconnect(); spectator.disconnect(); await application.close(); rmSync(setup.dataDirectory, { recursive: true, force: true }); }
@@ -2031,7 +2284,7 @@ test('fifty simultaneous sockets can join, play and receive the complete live le
     const observed = new Promise<RoomView>((resolve, reject) => {
       const timer = setTimeout(() => reject(new Error('The full audience leaderboard did not arrive.')), 5000);
       clients[0].on('room', room => {
-        if (room.leaderboard.length === 50 && room.leaderboard.every((entry: { score: number }) => entry.score > 0)) { clearTimeout(timer); resolve(room); }
+        if (room.pointsLeaderboard.length === 50 && room.pointsLeaderboard.every((entry: { score: number }) => entry.score > 0)) { clearTimeout(timer); resolve(room); }
       });
     });
     const acknowledgments = await Promise.all(clients.map((client, index) => {
@@ -2042,7 +2295,8 @@ test('fifty simultaneous sockets can join, play and receive the complete live le
     assert.ok(acknowledgments.every(result => result.ok));
     const broadcast = await observed;
     assert.equal(broadcast.online, 50);
-    assert.ok(broadcast.leaderboard.every(entry => entry.online));
-    assert.equal(new Set(broadcast.leaderboard.map(entry => entry.score)).size, 1);
+    assert.ok(broadcast.pointsLeaderboard.every(entry => entry.online));
+    assert.equal(new Set(broadcast.pointsLeaderboard.map(entry => entry.score)).size, 1);
+    assert.deepEqual(broadcast.leaderboard, []);
   } finally { clients.forEach(client => client.disconnect()); await application.close(); rmSync(setup.dataDirectory, { recursive: true, force: true }); }
 });

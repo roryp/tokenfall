@@ -19,9 +19,19 @@ Open [the game](https://aka.ms/tokenfall), enter a name (2–16 letters, numbers
 
 - **Score:** line clears, back-to-backs, combos, and perfect clears are multiplied by the level (a Tetris is 800 at level 1, 2,400 at level 3). Hard drops add 2 points per row and soft drops 1; the score panel shows what each piece added.
 - **Level:** 1 + lines ÷ 10, rounded down. Pieces fall faster each level, from 1 row per second at level 1 until level 20.
-- **New game** resets the board, keeps your best score and AI usage, and turns Luna off.
+- **New game** resets the board and that game's AI accounting, keeps your best scores and lifetime AI usage, and turns Luna off.
 - **Names** aren't accounts: an existing name continues its scores and AI usage, in one tab at a time. **Switch player** pauses and saves your game so someone else can join from the same tab.
-- **Rankings** sort by best score or by **Points / cent**, the best score per US cent of AI spend (unranked with zero or incomplete spend). Manual and Luna runs share them.
+- **Rankings** sort by best score or by **Points / cent**, the player's best AI-assisted game's score divided by that same game's frozen AI cost in US cents. Manual games appear on Points only.
+
+### Leaderboards
+
+**Points** keeps each player's highest game score, including manual games. Results with no Luna requests are labelled **Manual**. **Points / cent** selects each player's `bestValueGame`: a game with at least one Luna request, complete reported usage, known request-time prices, and positive AI cost. Its row shows that game's score, lines, cost, and value, never a manual best score divided by unrelated AI spend. Equal scores or values are ordered by earlier achievement, with a stable player-ID fallback.
+
+Each game stores its own token metrics, request count, dollar estimate, and result. New games and sentence changes start new accounting; reconnecting to the same active game does not. Live results update as the game progresses, so additional requests can lower that game's value; the server then selects the best eligible game again. A late reply, including a reasoning comparison requested after restarting, belongs to the original game. Failed requests with no provider usage remain incomplete, not free. Pre-inference MCP failures do not count as Luna requests.
+
+If a player has no complete eligible game, their AI game stays visible as **Unranked: incomplete usage** (or a missing-prices/history status), without a rank number. Old records with only lifetime totals retain their Points score and usage but are not assigned an invented per-game cost. A new measured game can qualify them. Names starting with `E2E`, case-insensitively after name normalization, are excluded from both public boards; their usage still counts against room limits. Automated tests use isolated databases.
+
+The stats panel retains lifetime tokens, cost estimates, cache/compression savings, and allowances. These totals do not determine leaderboard value. Scores-only maintenance clears scores inside saved game results as well as the Points record, while retaining usage and frozen costs; full maintenance removes players and their game results.
 
 ### Sentence mode
 
@@ -86,7 +96,7 @@ A plain move (every option off) uses no cache, so only input and output count:
 
 [![Cost of one plain Luna move: (10,000 input tokens × $0.20 + 35 output tokens × $1.20) ÷ 1,000,000 ≈ $0.002, with prices per 1M tokens. Input is $0.002000 of that and output $0.000042, so input is about 98% of the cost.](docs/images/luna-move-cost-equation.png)](docs/images/luna-move-cost-equation.png)
 
-Input is about 98% of a plain move's cost, so Compression and Cache matter most: each 1,000 input tokens removed saves $0.0002, each 1,000 read from the cache saves $0.00018, and each 1,000 written costs $0.00005 extra. SQLite stores token counts, not dollars, so totals and **Points / cent** follow the current rates. To check your region's rates:
+Input is about 98% of a plain move's cost, so Compression and Cache matter most: each 1,000 input tokens removed saves $0.0002, each 1,000 read from the cache saves $0.00018, and each 1,000 written costs $0.00005 extra. Lifetime stats continue to estimate token costs at the displayed rates. Game results instead persist dollars calculated from the rates captured when each request is admitted, including the last verified rates when a refresh fails. Later price changes never revalue **Points / cent**; a request admitted before any prices are available leaves that game unpriced. To check your region's rates:
 
 ```powershell
 $filter = "armRegionName eq 'eastus2' and productName eq 'Azure OpenAI GPT5' and contains(skuName, '5.6 luna ShortCo') and contains(skuName, 'Std Gl')"

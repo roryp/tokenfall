@@ -174,10 +174,11 @@ export function RoomPanel({ game, rankingsOpen, onCloseRankings, onReturn }: { g
   const room = game.room;
   const full = room !== null && room.online >= room.capacity;
   const switchButton = <button className="switch-player" title="Save this player and join with another name" disabled={game.joining} onClick={() => void game.switchPlayer()}><ArrowLeftRight size={16} />Switch player</button>;
-  const entries = (ranking === 'points' ? room?.pointsLeaderboard : room?.leaderboard?.filter(entry => entry.challengeScore !== null)) ?? [];
+  const entries = (ranking === 'points' ? room?.pointsLeaderboard : room?.leaderboard?.filter(entry => !entry.manual && (entry.challengeScore !== null || entry.rankingStatus !== undefined || entry.unmeteredRequests > 0))) ?? [];
   const pageCount = Math.max(1, Math.ceil(entries.length / 10));
   const currentPage = Math.min(page, pageCount - 1);
   const ownIndex = entries.findIndex(entry => entry.id === game.player?.id);
+  const ownUnranked = ranking !== 'points' && ownIndex >= 0 && entries[ownIndex].challengeScore === null;
   useEffect(() => {
     if (rankingsOpen) {
       rankingsDialog.current?.showModal();
@@ -189,14 +190,19 @@ export function RoomPanel({ game, rankingsOpen, onCloseRankings, onReturn }: { g
       <header><h2 id={`${id}-scores`} tabIndex={-1}><Trophy size={19} />Leaderboard</h2><span className={game.connected ? 'live-label' : ''}>{game.connected ? 'Live' : 'Offline'}</span>{rankingsOpen && <button className="icon-button" aria-label="Close leaderboard" title="Close leaderboard" onClick={() => rankingsDialog.current?.close()}><X size={19} /></button>}</header>
       <fieldset className="segmented-control"><legend className="visually-hidden">Rank by</legend>{['points', 'efficiency'].map(value => <label key={value}><input type="radio" name={`${id}-ranking`} checked={ranking === value} onChange={() => { setRanking(value); setPage(0); }} /><span>{value === 'points' ? 'Points' : 'Points / cent'}</span></label>)}</fieldset>
       <table><caption className="visually-hidden">Top 50 by {ranking === 'points' ? 'best Tetris score' : 'points per estimated US cent'}</caption><thead><tr><th scope="col">#</th><th scope="col">Player</th><th scope="col">{ranking === 'points' ? 'Points' : 'Pts / cent'}</th></tr></thead><tbody>
-        {entries.slice(currentPage * 10, (currentPage + 1) * 10).map((entry, index) => <tr key={entry.id} data-testid="leaderboard-row" data-player-id={entry.id} aria-current={entry.id === game.player?.id ? 'true' : undefined}>
-          <td className="rank-number">{currentPage * 10 + index + 1}</td><th scope="row"><div className="rank-player"><i className={entry.online ? 'player-online' : ''} aria-label={entry.online ? 'Online' : 'Offline'} title={entry.online ? 'Online' : 'Offline'} /><span>{entry.name}</span>{entry.id === game.player?.id && <small>You</small>}</div><small className="rank-cost">{formatMoney(entry.costUsd)} est.{entry.unmeteredRequests > 0 ? ' / usage pending' : ''}</small></th>
-          <td className="rank-score"><strong>{(ranking === 'points' ? entry.score : entry.challengeScore!).toLocaleString(undefined, { maximumFractionDigits: ranking === 'points' ? 0 : 1 })}</strong><small>{entry.lines.toLocaleString()} lines</small></td>
-        </tr>)}
+        {entries.slice(currentPage * 10, (currentPage + 1) * 10).map((entry, index) => {
+          const unranked = ranking !== 'points' && entry.challengeScore === null;
+          const manual = entry.manual ?? (entry.costUsd === 0 && entry.unmeteredRequests === 0);
+          const status = entry.rankingStatus === 'unpriced' ? 'Unranked: prices unavailable' : entry.rankingStatus === 'legacy' ? 'Unranked: game history unavailable' : entry.rankingStatus === 'zero-cost' ? 'Unranked: no AI cost' : 'Unranked: incomplete usage';
+          return <tr key={entry.id} data-testid="leaderboard-row" data-player-id={entry.id} aria-current={entry.id === game.player?.id ? 'true' : undefined}>
+            <td className="rank-number">{unranked ? '--' : currentPage * 10 + index + 1}</td><th scope="row"><div className="rank-player"><i className={entry.online ? 'player-online' : ''} aria-label={entry.online ? 'Online' : 'Offline'} title={entry.online ? 'Online' : 'Offline'} /><span>{entry.name}</span>{entry.id === game.player?.id && <small>You</small>}</div><small className="rank-cost">{ranking === 'points' && manual ? 'Manual' : <>{formatMoney(entry.costUsd)} est.{entry.unmeteredRequests > 0 ? ' / usage incomplete' : ''}</>}</small>{unranked && <small className="rank-cost rank-status">{status}</small>}</th>
+            <td className="rank-score"><strong>{unranked ? '--' : (ranking === 'points' ? entry.score : entry.challengeScore!).toLocaleString(undefined, { maximumFractionDigits: ranking === 'points' ? 0 : 1 })}</strong><small>{ranking !== 'points' && <>{entry.score.toLocaleString()} points / </>}{entry.lines.toLocaleString()} lines</small></td>
+          </tr>;
+        })}
         {!entries.length && <tr><td colSpan={3} className="empty-ranking">{!room ? 'Connecting to the room...' : ranking === 'points' ? 'No players yet.' : 'No ranked scores yet.'}</td></tr>}
       </tbody></table>
       <footer><span>{entries.length} listed / top 50</span><div><button className="icon-button" aria-label="Previous leaderboard page" title="Previous page" disabled={currentPage === 0} onClick={() => setPage(currentPage - 1)}><ChevronLeft size={18} /></button><span data-testid="leaderboard-page">{currentPage + 1}/{pageCount}</span><button className="icon-button" aria-label="Next leaderboard page" title="Next page" disabled={currentPage + 1 >= pageCount} onClick={() => setPage(currentPage + 1)}><ChevronRight size={18} /></button></div></footer>
-      {game.joined && <div className="own-rank"><span>Your position <b data-testid="own-rank">{ownIndex >= 0 ? `#${ownIndex + 1}` : ranking === 'points' ? 'Outside top 50' : 'Unranked'}</b></span><button className="icon-button" aria-label="Show my ranking" title="Show my ranking" disabled={ownIndex < 0} onClick={() => setPage(Math.floor(ownIndex / 10))}><LocateFixed size={18} /></button></div>}
+      {game.joined && <div className="own-rank"><span>Your position <b data-testid="own-rank">{ownUnranked ? 'Unranked' : ownIndex >= 0 ? `#${ownIndex + 1}` : ranking === 'points' ? 'Outside top 50' : 'Unranked'}</b></span><button className="icon-button" aria-label="Show my ranking" title="Show my ranking" disabled={ownIndex < 0} onClick={() => setPage(Math.floor(ownIndex / 10))}><LocateFixed size={18} /></button></div>}
     </section>;
   return <aside className="room-panel" aria-label="Game room">
     <header className="room-heading"><div><span>ROOM <b data-testid="room-code">{room?.code ?? '------'}</b></span><small><Users size={14} />{game.connected ? `${room?.online ?? 0}/${room?.capacity ?? '--'} online` : 'Reconnecting'}</small></div>{game.joined && <button className="icon-button" aria-label="Back to game" title="Back to game" onClick={onReturn}><ArrowUp size={19} /></button>}</header>

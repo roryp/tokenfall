@@ -16,6 +16,7 @@ import { lookaheadSnapshot, lookupFutureMoves, McpLookupError, mcpPromptContext 
 import { Game, placementsFor, tokenLabel, tokenShape } from '../shared/game.ts';
 import { costForUsage, emptyMetrics, lunaRequestBody } from '../shared/protocol.ts';
 import type { AiOptions, McpLookup, Usage } from '../shared/protocol.ts';
+import { formatMoney } from '../web/src/format.ts';
 
 const jsQR = createRequire(import.meta.url)('jsqr') as typeof import('jsqr').default;
 let browser: Browser;
@@ -1624,6 +1625,94 @@ test('sentence preview recovers from failure and blocks invalid names and oversi
   assert.deepEqual(setup.errors, []);
 });
 
+test('per-game leaderboard shows frozen game costs, manual labels and incomplete entries across layouts', { timeout: 45000 }, async context => {
+  const setup = await fixture();
+  context.after(setup.close);
+  const { page, application, controls } = setup;
+  await page.getByRole('button', { name: 'Pause game', exact: true }).click();
+  await setup.waitForGame(game => game.status === 'paused');
+  controls.hold = true;
+  await page.getByRole('checkbox', { name: 'Ask Luna', exact: true }).check();
+  await setup.waitForCalls(1);
+  await page.getByRole('button', { name: 'Stop Luna', exact: true }).click();
+  controls.hold = false;
+  setup.release();
+  await page.waitForFunction(total => Number(document.querySelector('[data-testid="ai-tokens"]')?.textContent?.replace(/\D/g, '')) === total, setup.calls[0].usage.total);
+  await page.getByRole('button', { name: 'Resume game', exact: true }).click();
+  await page.getByRole('button', { name: 'Hard drop (Space)', exact: true }).click();
+  await waitPieces(page, 1);
+  await page.getByRole('button', { name: 'Pause game', exact: true }).click();
+  await setup.waitForGame(game => game.status === 'paused' && game.pieces === 1);
+  const player = setup.player();
+  const first = application.room.view().leaderboard.find(entry => entry.id === player.record.id)!;
+  assert.ok(first.score > 0 && first.costUsd! > 0);
+  const lifetimeTokens = player.metrics.input + player.metrics.output;
+  player.started -= 3000;
+  await page.getByRole('button', { name: 'New game', exact: true }).click();
+  await page.waitForFunction(() => document.querySelector('.game-canvas')?.getAttribute('data-pieces') === '0');
+  await page.getByRole('button', { name: 'Hard drop (Space)', exact: true }).click();
+  await waitPieces(page, 1);
+  await page.getByRole('button', { name: 'Hard drop (Space)', exact: true }).click();
+  await waitPieces(page, 2);
+  await page.getByRole('button', { name: 'Pause game', exact: true }).click();
+  await setup.waitForGame(game => game.status === 'paused' && game.pieces === 2);
+  assert.ok(player.record.best_score > first.score);
+  assert.equal(player.metrics.input + player.metrics.output, lifetimeTokens);
+  assert.equal(numeric(await page.getByTestId('ai-tokens').innerText()), lifetimeTokens);
+  assert.equal(application.room.view().leaderboard.find(entry => entry.id === player.record.id)!.gameId, first.gameId);
+
+  application.room.join('Only Manual', application.room.code, undefined, 'only-manual');
+  const manual = application.room.playerFor('only-manual');
+  application.room.inputs(manual, { runId: manual.runId, sequence: 1, frame: 1, events: [{ frame: 0, action: 'hardDrop' }] }, manual.started + 1000);
+  application.room.disconnect('only-manual');
+  application.room.join('Incomplete Game', application.room.code, undefined, 'incomplete');
+  const incomplete = application.room.playerFor('incomplete');
+  controls.fail = true;
+  await assert.rejects(application.room.assist(incomplete, { cache: false, compression: true }), /unavailable/);
+  controls.fail = false;
+  application.room.disconnect('incomplete');
+  application.room.join('E2E Hidden', application.room.code, undefined, 'e2e-hidden');
+  application.room.disconnect('e2e-hidden');
+
+  await page.getByRole('button', { name: 'Show leaderboard', exact: true }).click();
+  const dialog = page.getByRole('dialog', { name: 'Leaderboard', exact: true });
+  await dialog.locator(`[data-player-id="${manual.record.id}"] .rank-cost`).filter({ hasText: /^Manual$/ }).waitFor();
+  assert.equal(await dialog.locator(`[data-player-id="${player.record.id}"] .rank-cost`).innerText(), 'Manual');
+  assert.equal(await dialog.getByText('E2E Hidden', { exact: true }).count(), 0);
+  await dialog.getByRole('radio', { name: 'Points / cent', exact: true }).check();
+  const row = dialog.locator(`[data-player-id="${player.record.id}"]`);
+  const costText = await row.locator('.rank-cost').innerText();
+  assert.equal(costText, `${formatMoney(first.costUsd)} est.`);
+  const expectedValue = await page.evaluate(value => value.toLocaleString(undefined, { maximumFractionDigits: 1 }), first.challengeScore!);
+  assert.equal(await row.locator('.rank-score strong').innerText(), expectedValue);
+  assert.match(await row.locator('.rank-score small').innerText(), new RegExp(`${first.score} points / ${first.lines} lines`));
+  assert.equal(await dialog.locator(`[data-player-id="${manual.record.id}"]`).count(), 0);
+  const missingRow = dialog.locator(`[data-player-id="${incomplete.record.id}"]`);
+  assert.equal(await missingRow.locator('.rank-status').innerText(), 'Unranked: incomplete usage');
+  assert.equal(await missingRow.locator('.rank-number').innerText(), '--');
+  assert.equal(await missingRow.locator('.rank-score strong').innerText(), '--');
+  application.room.pricing.snapshot!.usdPerMillion.input *= 10;
+  application.room.pricing.snapshot!.usdPerMillion.output *= 10;
+  application.room.pricing.snapshot!.checkedAt = new Date().toISOString();
+  for (const width of [1366, 390, 320]) for (const theme of ['light', 'dark']) {
+    await page.setViewportSize({ width, height: width === 1366 ? 900 : width === 390 ? 844 : 710 });
+    await page.evaluate(value => document.documentElement.setAttribute('data-theme', value), theme);
+    assert.equal(await row.locator('.rank-cost').innerText(), costText);
+    const bounds = await dialog.evaluate(element => {
+      const rectangle = element.getBoundingClientRect();
+      return { left: rectangle.left, right: rectangle.right, top: rectangle.top, bottom: rectangle.bottom, viewportWidth: innerWidth, viewportHeight: innerHeight, overflow: element.scrollWidth > element.clientWidth + 1 };
+    });
+    assert.ok(bounds.left >= 0 && bounds.right <= bounds.viewportWidth + 1 && bounds.top >= 0 && bounds.bottom <= bounds.viewportHeight + 1 && !bounds.overflow, JSON.stringify(bounds));
+    await page.screenshot({ path: path.join(screenshots, `per-game-leaderboard-${theme}-${width}.png`), animations: 'disabled' });
+  }
+  await page.reload();
+  await page.getByRole('button', { name: 'Show leaderboard', exact: true }).click();
+  await page.getByRole('dialog', { name: 'Leaderboard', exact: true }).getByRole('radio', { name: 'Points / cent', exact: true }).check();
+  await page.locator(`[data-player-id="${player.record.id}"] .rank-cost`).filter({ hasText: costText }).waitFor();
+  assert.equal(player.metrics.requests, 1);
+  assert.deepEqual(setup.errors, []);
+});
+
 test('shared leaderboard joins independent players, updates scores, pages all entries, and preserves ranking order', async context => {
   const setup = await fixture();
   context.after(setup.close);
@@ -1637,6 +1726,9 @@ test('shared leaderboard joins independent players, updates scores, pages all en
     player.record.best_lines = index + 1;
     player.record.attempts = 1;
     player.metrics = { ...emptyMetrics(), requests: 1, input: (12 - index) ** 2 * 1000 };
+    const result = { ...player.result, runId: randomUUID(), score: player.record.best_score, lines: player.record.best_lines, attempts: 1, metrics: { ...player.metrics }, costUsd: costForUsage(player.metrics, application.room.pricing.snapshot!.usdPerMillion).total };
+    player.results.push(result);
+    player.record.best_game_id = result.runId;
     application.room.disconnect(socketId);
   }
   await page.getByTestId('leaderboard-page').filter({ hasText: '1/2' }).waitFor();

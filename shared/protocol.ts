@@ -70,6 +70,19 @@ export interface Metrics {
   cacheBypassed: number;
 }
 export const emptyMetrics = (): Metrics => ({ requests: 0, input: 0, output: 0, cached: 0, cacheWrites: 0, reasoning: 0, compressionSaved: 0, cacheHits: 0, cacheMisses: 0, cacheBypassed: 0 });
+export interface GameResult {
+  runId: string;
+  startedAt: number;
+  achievedAt: number;
+  finishedAt: number | null;
+  score: number;
+  lines: number;
+  level: number;
+  metrics: Metrics;
+  attempts: number;
+  costUsd: number;
+  unpricedRequests: number;
+}
 export const tokenCreditsUsed = (usage: Pick<Usage, 'input' | 'output' | 'cached'>) => Math.max(0, usage.input - usage.cached) + usage.output;
 export const MAX_REQUEST_TOKENS = 16000;
 export const DEFAULT_TOKEN_ALLOWANCE = 1000000;
@@ -189,6 +202,10 @@ export interface LeaderboardEntry {
   lines: number;
   level: number;
   online: boolean;
+  gameId?: string;
+  achievedAt?: number;
+  manual?: boolean;
+  rankingStatus?: 'ranked' | 'manual' | 'incomplete-usage' | 'unpriced' | 'zero-cost' | 'legacy';
 }
 export type RoomResetMode = 'all' | 'scores';
 export interface RoomMaintenanceStatus { online: number; activeGames: number; pendingRequests: number; resetting: boolean }

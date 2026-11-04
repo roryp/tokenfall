@@ -74,12 +74,26 @@ export async function resetRoom(options: ResetOptions) {
     assert.equal(fingerprint(rowsFor(database)), fingerprint(before), 'Players changed during reset; retry when idle.');
     assert.equal(fingerprint(settingsFor(database)), fingerprint(settings), 'Settings changed during reset.');
     if (mode === 'all') database.exec('DELETE FROM players');
-    else database.exec('UPDATE players SET best_score = 0, best_lines = 0, best_level = 1');
+    else {
+      database.exec('UPDATE players SET best_score = 0, best_lines = 0, best_level = 1');
+      const columns = database.prepare('PRAGMA table_info(players)').all().map(column => column.name);
+      if (columns.includes('best_game_id')) database.exec("UPDATE players SET best_game_id = ''");
+      if (columns.includes('game_results')) {
+        const update = database.prepare('UPDATE players SET game_results = ? WHERE id = ?');
+        for (const record of before) {
+          const games = JSON.parse(String(record.game_results)) as Record<string, unknown>[];
+          update.run(JSON.stringify(games.map(game => ({ ...game, score: 0, lines: 0, level: 1 }))), record.id);
+        }
+      }
+    }
     const after = rowsFor(database);
     if (mode === 'all') assert.equal(after.length, 0, 'Leaderboard must be empty.');
     else {
       assert.ok(after.every(record => record.best_score === 0 && record.best_lines === 0 && record.best_level === 1));
-      const withoutScores = (rows: typeof after) => rows.map(({ best_score, best_lines, best_level, ...record }) => record);
+      const withoutScores = (rows: typeof after) => rows.map(({ best_score, best_lines, best_level, best_game_id, game_results, ...record }) => ({
+        ...record,
+        ...(game_results === undefined ? {} : { game_results: (JSON.parse(String(game_results)) as Record<string, unknown>[]).map(({ score, lines, level, ...game }) => game) }),
+      }));
       assert.equal(fingerprint(withoutScores(after)), fingerprint(withoutScores(before)));
     }
     assert.equal(fingerprint(settingsFor(database)), fingerprint(settings), 'Room settings must be preserved.');

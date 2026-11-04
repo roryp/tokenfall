@@ -5,7 +5,7 @@ import { DatabaseSync } from 'node:sqlite';
 import { deflateRawSync, inflateRawSync } from 'node:zlib';
 import { Game, FPS, placementsFor } from '../shared/game.ts';
 import { costForUsage, DEFAULT_TOKEN_ALLOWANCE, emptyMetrics, MAX_REQUEST_TOKENS, MAX_TOKEN_ALLOWANCE, pointsPerCent, tokenAllowance } from '../shared/protocol.ts';
-import type { AiOptions, InputAck, InputBatch, Insight, JoinResult, LeaderboardEntry, LunaRequestSettings, Metrics, PlayerUsage, PromptPreview, ReasoningComparison, RoomResetMode, RoomResetPreview, RoomView, TokenPricing } from '../shared/protocol.ts';
+import type { AiOptions, GameResult, InputAck, InputBatch, Insight, JoinResult, LeaderboardEntry, LunaRequestSettings, Metrics, PlayerUsage, PromptPreview, ReasoningComparison, RoomResetMode, RoomResetPreview, RoomView, TokenPricing, TokenRates, Usage } from '../shared/protocol.ts';
 import type { AppConfig } from './config.ts';
 import { DEFAULT_ROOM_CAPACITY } from './config.ts';
 import { AI_COOLDOWN_MS, AUTOPILOT_COOLDOWN_MS, MAX_OUTPUT_TOKENS, maxCompletionTokens, MCP_GUIDANCE_TOKENS, ModelGate, PREFIX_TOKENS, ROOM_REQUEST_LIMIT, ROOM_TOKEN_BUDGET, RequestError } from './model.ts';
@@ -23,12 +23,17 @@ interface PlayerRecord {
   best_score: number;
   best_lines: number;
   best_level: number;
+  best_game_id: string;
   metrics: string;
   attempts: number;
   updated: number;
   token_text: string;
   token_limit: number;
+  game_results: string;
 }
+
+const gamesFor = (record: PlayerRecord): GameResult[] => JSON.parse(record.game_results);
+const newGameResult = (runId: string, now: number): GameResult => ({ runId, startedAt: now, achievedAt: now, finishedAt: null, score: 0, lines: 0, level: 1, metrics: emptyMetrics(), attempts: 0, costUsd: 0, unpricedRequests: 0 });
 
 // Names identify players, so matching ignores case, Unicode width variants and repeated spaces.
 export const nameKey = (name: string) => name.normalize('NFKC').trim().replace(/\s+/gu, ' ').toLowerCase();
@@ -41,6 +46,7 @@ export const WRITE_FLUSH_MS = 500;
 export const REPLAY_LIMIT = 20;
 // What a reasoning comparison needs to send a reply's request again, kept in memory with the player.
 interface StoredReplay {
+  runId: string;
   settings: LunaRequestSettings;
   lookahead: boolean;
   cache: boolean;
@@ -56,6 +62,8 @@ export interface Player {
   metrics: Metrics;
   game: Game;
   runId: string;
+  result: GameResult;
+  results: GameResult[];
   started: number;
   sequence: number;
   socketId: string | null;
@@ -109,6 +117,8 @@ export class Room {
     `);
     if (!this.database.prepare('PRAGMA table_info(players)').all().some(column => column.name === 'token_text')) this.database.exec("ALTER TABLE players ADD COLUMN token_text TEXT NOT NULL DEFAULT ''");
     if (!this.database.prepare('PRAGMA table_info(players)').all().some(column => column.name === 'token_limit')) this.database.exec('ALTER TABLE players ADD COLUMN token_limit INTEGER NOT NULL DEFAULT 1000000');
+    if (!this.database.prepare('PRAGMA table_info(players)').all().some(column => column.name === 'game_results')) this.database.exec("ALTER TABLE players ADD COLUMN game_results TEXT NOT NULL DEFAULT '[]'");
+    if (!this.database.prepare('PRAGMA table_info(players)').all().some(column => column.name === 'best_game_id')) this.database.exec("ALTER TABLE players ADD COLUMN best_game_id TEXT NOT NULL DEFAULT ''");
     this.migratePlayerNames();
     this.columns = this.database.prepare('PRAGMA table_info(players)').all().map(column => String(column.name));
     const saved = this.database.prepare("SELECT value FROM settings WHERE key = 'room'").get() as { value: string } | undefined;
@@ -138,7 +148,7 @@ export class Room {
       const groups = groupRows();
       if (repeated(groups) && !backedUp) throw new Error('Player names changed while starting. Restart to back up and merge repeated names.');
       const rename = this.database.prepare('UPDATE players SET name_key = ? WHERE id = ?');
-      const merge = this.database.prepare('UPDATE players SET name_key = ?, metrics = ?, attempts = ?, token_limit = ? WHERE id = ?');
+      const merge = this.database.prepare('UPDATE players SET name_key = ?, metrics = ?, attempts = ?, token_limit = ?, game_results = ? WHERE id = ?');
       const remove = this.database.prepare('DELETE FROM players WHERE id = ?');
       for (const [key, [primary, ...duplicates]] of groups) {
         if (!duplicates.length) { rename.run(key, primary.id); continue; }
@@ -151,7 +161,8 @@ export class Room {
         const attempts = group.reduce((sum, row) => sum + row.attempts, 0);
         const tokenLimit = Math.min(MAX_TOKEN_ALLOWANCE, group.reduce((sum, row) => sum + row.token_limit, 0));
         for (const duplicate of duplicates) remove.run(duplicate.id);
-        merge.run(key, JSON.stringify(metrics), attempts, tokenLimit, primary.id);
+        const results = [...new Map(group.flatMap(row => gamesFor(row).map(result => [result.runId, result] as const))).values()];
+        merge.run(key, JSON.stringify(metrics), attempts, tokenLimit, JSON.stringify(results), primary.id);
       }
       // Partial so inserts from an older revision (which leave the key empty) keep working until the next startup repairs them.
       this.database.exec("CREATE UNIQUE INDEX IF NOT EXISTS players_name_key ON players (name_key) WHERE name_key <> ''");
@@ -191,7 +202,7 @@ export class Room {
 
   // The row a commit would store, in the shape SQLite returns, so overlays compare and fingerprint like stored rows.
   private storedRow(player: Player) {
-    const values: Record<string, unknown> = { ...player.record, metrics: JSON.stringify(player.metrics) };
+    const values: Record<string, unknown> = { ...player.record, metrics: JSON.stringify(player.metrics), game_results: JSON.stringify(player.results) };
     const row: Record<string, unknown> = Object.create(null);
     for (const column of this.columns) row[column] = values[column];
     return row as unknown as PlayerRecord;
@@ -258,7 +269,42 @@ export class Room {
 
   save(player: Player) {
     this.assertAvailable(player);
+    this.captureGameResult(player);
     this.queueWrite(player);
+  }
+
+  private captureGameResult(player: Player, now = Date.now()) {
+    const result = player.result;
+    let changed = false;
+    if (result.score !== player.game.score || result.lines !== player.game.lines || result.level !== player.game.level) {
+      result.score = player.game.score;
+      result.lines = player.game.lines;
+      result.level = player.game.level;
+      result.achievedAt = now;
+      changed = true;
+    }
+    if (player.game.status === 'over' && result.finishedAt === null) { result.finishedAt = now; changed = true; }
+    if ((result.attempts > 0 || result.score > 0) && !player.results.includes(result)) { player.results.push(result); changed = true; }
+    return changed;
+  }
+
+  private replaceGame(player: Player, game: Game, now: number) {
+    this.captureGameResult(player, now);
+    player.result.finishedAt ??= now;
+    player.game = game;
+    player.runId = randomUUID();
+    player.result = newGameResult(player.runId, now);
+    player.started = now;
+    player.sequence = 0;
+    player.inputCount = 0;
+    player.inputWindow = now;
+  }
+
+  private recordGameUsage(result: GameResult, usage: Usage, savedTokens: number, cache: boolean, rates: TokenRates | null) {
+    result.metrics = addUsage(result.metrics, usage, savedTokens, cache);
+    if (rates) result.costUsd += costForUsage(usage, rates).total;
+    else result.unpricedRequests += 1;
+    result.achievedAt = Date.now();
   }
 
   private queueWrite(player: Player) {
@@ -280,12 +326,13 @@ export class Room {
 
   private write(player: Player) {
     player.record.metrics = JSON.stringify(player.metrics);
+    player.record.game_results = JSON.stringify(player.results);
     const record = player.record;
-    this.database.prepare(`INSERT INTO players (id, token_hash, name, name_key, best_score, best_lines, best_level, metrics, attempts, updated, token_text, token_limit)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    this.database.prepare(`INSERT INTO players (id, token_hash, name, name_key, best_score, best_lines, best_level, metrics, attempts, updated, token_text, token_limit, game_results, best_game_id)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       ON CONFLICT(id) DO UPDATE SET token_hash=excluded.token_hash, name=excluded.name, name_key=excluded.name_key, best_score=excluded.best_score, best_lines=excluded.best_lines,
-      best_level=excluded.best_level, metrics=excluded.metrics, attempts=excluded.attempts, updated=excluded.updated, token_text=excluded.token_text, token_limit=excluded.token_limit`)
-      .run(record.id, record.token_hash, record.name, record.name_key, record.best_score, record.best_lines, record.best_level, record.metrics, record.attempts, record.updated, record.token_text, record.token_limit);
+      best_level=excluded.best_level, metrics=excluded.metrics, attempts=excluded.attempts, updated=excluded.updated, token_text=excluded.token_text, token_limit=excluded.token_limit, game_results=excluded.game_results, best_game_id=excluded.best_game_id`)
+      .run(record.id, record.token_hash, record.name, record.name_key, record.best_score, record.best_lines, record.best_level, record.metrics, record.attempts, record.updated, record.token_text, record.token_limit, record.game_results, record.best_game_id);
   }
 
   // Commits every queued player in one transaction. A row the database rejects is skipped so it cannot block everyone else's saves.
@@ -360,18 +407,14 @@ export class Room {
     const registering = !record;
     if (!record) {
       if (this.registrationCount() >= this.registrationLimit && !this.reclaimRegistration() && !admin) throw new RequestError('This workshop has reached its registration limit.', 'full');
-      record = { id: randomUUID(), token_hash: tokenHash, name, name_key: key, best_score: 0, best_lines: 0, best_level: 1, metrics: JSON.stringify(emptyMetrics()), attempts: 0, updated: now, token_text: tokenText ?? '', token_limit: DEFAULT_TOKEN_ALLOWANCE };
+      record = { id: randomUUID(), token_hash: tokenHash, name, name_key: key, best_score: 0, best_lines: 0, best_level: 1, best_game_id: '', metrics: JSON.stringify(emptyMetrics()), attempts: 0, updated: now, token_text: tokenText ?? '', token_limit: DEFAULT_TOKEN_ALLOWANCE, game_results: '[]' };
     }
     if (!player) {
-      player = { record, metrics: { ...emptyMetrics(), ...JSON.parse(record.metrics) }, game: game ?? this.gameFor(record.token_text), runId: randomUUID(), started: now, sequence: 0, socketId: null, lastSeen: now, inputWindow: now, inputCount: 0, replays: new Map() };
+      const runId = randomUUID();
+      player = { record, metrics: { ...emptyMetrics(), ...JSON.parse(record.metrics) }, game: game ?? this.gameFor(record.token_text), runId, result: newGameResult(runId, now), results: gamesFor(record), started: now, sequence: 0, socketId: null, lastSeen: now, inputWindow: now, inputCount: 0, replays: new Map() };
       this.players.set(record.id, player);
     } else if (game) {
-      player.game = game;
-      player.runId = randomUUID();
-      player.started = now;
-      player.sequence = 0;
-      player.inputWindow = now;
-      player.inputCount = 0;
+      this.replaceGame(player, game, now);
     }
     if (tokenText !== undefined) player.record.token_text = tokenText;
     player.record.token_hash = tokenHash;
@@ -451,9 +494,11 @@ export class Room {
       player.record.best_score = player.game.score;
       player.record.best_lines = player.game.lines;
       player.record.best_level = player.game.level;
+      player.record.best_game_id = player.runId;
       player.record.updated = now;
       this.queueWrite(player);
     }
+    if (this.captureGameResult(player, now)) this.queueWrite(player);
     return this.ack(player);
   }
 
@@ -465,12 +510,7 @@ export class Room {
     this.assertAvailable(player);
     const now = Date.now();
     if (now - player.started < 2000) throw new RequestError('Wait a moment before restarting.', 'cooldown', 2000);
-    player.game = this.gameFor(player.record.token_text);
-    player.runId = randomUUID();
-    player.started = now;
-    player.sequence = 0;
-    player.inputCount = 0;
-    player.inputWindow = now;
+    this.replaceGame(player, this.gameFor(player.record.token_text), now);
     this.save(player);
     return this.joinResult(player);
   }
@@ -501,15 +541,19 @@ export class Room {
     const roomAllowance = this.roomAllowance(totals);
     const release = this.gate.acquire(player.record.id, reservation, allowance.used + allowance.unconfirmed, roomAllowance.used + roomAllowance.unconfirmed, now, options.autopilot, allowance.limit, Boolean(options.mcp));
     const runId = player.runId;
+    const result = player.result;
+    const rates = this.pricing.snapshot ? { ...this.pricing.snapshot.usdPerMillion } : null;
     this.pendingTokens.set(player.record.id, reservation);
     player.record.attempts += 1;
+    result.attempts += 1;
     return traceLunaRequest(runId, this.config.deployment, options, reservation, async span => {
       try {
         this.save(player);
         const bucket = parseInt(player.record.id.slice(0, 2), 16) % 8;
         const insight = await this.gateway.complete(player.game, options, `${this.code}:${bucket}`);
         player.metrics = addUsage(player.metrics, insight.usage, insight.savedTokens, options.cache);
-        this.rememberReply(player, insight);
+        this.recordGameUsage(result, insight.usage, insight.savedTokens, options.cache, rates);
+        this.rememberReply(player, insight, runId);
         const current = player.game.view();
         if (insight.status === 'ready' && (runId !== player.runId || insight.pieceId !== current.pieceId || current.status === 'over')) insight.status = 'stale';
         recordLunaResult(span, insight);
@@ -520,6 +564,7 @@ export class Room {
       } catch (error) {
         if (error instanceof McpLookupError) {
           player.record.attempts -= 1;
+          result.attempts -= 1;
           this.save(player);
           throw new RequestError(error.message, error.reason === 'context' ? 'mcp-context' : 'mcp');
         }
@@ -528,9 +573,10 @@ export class Room {
     });
   }
 
-  private rememberReply(player: Player, insight: Insight) {
+  private rememberReply(player: Player, insight: Insight, runId: string) {
     if (!insight.request || !this.gateway.replay) return;
     player.replays.set(insight.id, {
+      runId,
       settings: insight.request, lookahead: Boolean(insight.mcpLookup), cache: insight.cacheEnabled, compression: insight.compression,
       reasoning: Boolean(insight.reasoningEnabled), prompt: deflateRawSync(insight.prompt),
       promptTokens: insight.compression ? insight.packedTokens : insight.rawTokens, savedTokens: insight.savedTokens,
@@ -550,6 +596,9 @@ export class Room {
     if (!stored || !replay) throw new RequestError(`Only your latest ${REPLAY_LIMIT} Luna replies can be compared. Pick a newer reply.`, 'compare-expired');
     if (stored.comparison) return { comparison: stored.comparison, ...this.usage(player) };
     const now = Date.now();
+    const result = player.results.find(game => game.runId === stored.runId);
+    if (!result) throw new RequestError('The original game is no longer available for comparison.', 'compare-expired');
+    const rates = this.pricing.snapshot ? { ...this.pricing.snapshot.usdPerMillion } : null;
     this.gate.admit(player.record.id, now, true);
     const totals = this.totals();
     if (totals.attempts >= ROOM_REQUEST_LIMIT) throw new RequestError(`The room AI request allowance is used: 0 of ${ROOM_REQUEST_LIMIT.toLocaleString()} requests left. Manual play is still available.`, 'room-requests');
@@ -561,12 +610,14 @@ export class Room {
     const release = this.gate.acquire(player.record.id, reservation, allowance.used + allowance.unconfirmed, roomAllowance.used + roomAllowance.unconfirmed, now, true, allowance.limit, false);
     this.pendingTokens.set(player.record.id, reservation);
     player.record.attempts += 1;
-    return traceLunaRequest(player.runId, this.config.deployment, options, reservation, async span => {
+    result.attempts += 1;
+    return traceLunaRequest(stored.runId, this.config.deployment, options, reservation, async span => {
       try {
         span.setAttribute('tokenfall.ai.reasoning_replay', true);
         this.save(player);
         const reply = await replay({ settings: stored.settings, lookahead: stored.lookahead, cache: stored.cache, prompt: inflateRawSync(stored.prompt).toString('utf8') }, !stored.reasoning);
         player.metrics = addUsage(player.metrics, reply.usage, stored.savedTokens, stored.cache);
+        this.recordGameUsage(result, reply.usage, stored.savedTokens, stored.cache, rates);
         recordLunaResult(span, { usage: reply.usage, status: reply.status, savedTokens: stored.savedTokens });
         stored.comparison = { replyId, ...reply };
         this.save(player);
@@ -604,22 +655,31 @@ export class Room {
   }
 
   view(): RoomView {
-    const rates = this.pricing.snapshot?.usdPerMillion;
     const records = this.records();
     const totals = this.totals(records);
-    const entries: LeaderboardEntry[] = records.map(record => {
-      const metrics: Metrics = { ...emptyMetrics(), ...JSON.parse(record.metrics) };
-      // An in-flight request has not reported usage yet; only completed requests without usage leave spend incomplete.
-      const unmeteredRequests = Math.max(0, record.attempts - metrics.requests - Number(this.pendingTokens.has(record.id)));
-      const costUsd = rates ? costForUsage(metrics, rates).total : null;
-      return {
-        id: record.id, name: record.name, score: record.best_score, costUsd, unmeteredRequests,
-        challengeScore: costUsd !== null && unmeteredRequests === 0 ? pointsPerCent(record.best_score, costUsd) : null,
-        lines: record.best_lines, level: record.best_level, online: Boolean(this.players.get(record.id)?.socketId),
+    const points: LeaderboardEntry[] = [];
+    const values: LeaderboardEntry[] = [];
+    const achievementOrder = (first: LeaderboardEntry, second: LeaderboardEntry) => first.achievedAt! - second.achievedAt! || first.id.localeCompare(second.id);
+    for (const record of records) {
+      if (nameKey(record.name).startsWith('e2e')) continue;
+      const games = gamesFor(record);
+      const entryFor = (game: GameResult): LeaderboardEntry => {
+        const unmeteredRequests = Math.max(0, game.attempts - game.metrics.requests);
+        const rankingStatus = game.attempts === 0 ? 'manual' : unmeteredRequests > 0 ? 'incomplete-usage' : game.unpricedRequests > 0 ? 'unpriced' : game.costUsd > 0 ? 'ranked' : 'zero-cost';
+        return { id: record.id, name: record.name, score: game.score, lines: game.lines, level: game.level, online: Boolean(this.players.get(record.id)?.socketId), costUsd: game.unpricedRequests > 0 ? null : game.costUsd, challengeScore: rankingStatus === 'ranked' ? pointsPerCent(game.score, game.costUsd) : null, unmeteredRequests, gameId: game.runId, achievedAt: game.achievedAt, manual: game.attempts === 0, rankingStatus };
       };
-    });
-    const leaderboard = [...entries].sort((first, second) => (second.challengeScore ?? -1) - (first.challengeScore ?? -1) || second.score - first.score || second.lines - first.lines).slice(0, 50);
-    const pointsLeaderboard = entries.sort((first, second) => second.score - first.score || second.lines - first.lines).slice(0, 50);
+      const bestPointsGame = games.find(game => game.runId === record.best_game_id);
+      const pointEntry: LeaderboardEntry = bestPointsGame ? entryFor(bestPointsGame) : { id: record.id, name: record.name, score: record.best_score, lines: record.best_lines, level: record.best_level, online: Boolean(this.players.get(record.id)?.socketId), costUsd: record.attempts === 0 ? 0 : null, challengeScore: null, unmeteredRequests: 0, manual: record.attempts === 0, rankingStatus: record.attempts === 0 ? 'manual' : 'legacy' };
+      pointEntry.achievedAt = record.updated;
+      points.push(pointEntry);
+      const assisted = games.filter(game => game.attempts > 0).map(entryFor);
+      const bestValueGame = assisted.filter(entry => entry.challengeScore !== null).sort((first, second) => second.challengeScore! - first.challengeScore! || achievementOrder(first, second))[0];
+      const unranked = assisted.sort((first, second) => second.score - first.score || achievementOrder(first, second))[0];
+      if (bestValueGame || unranked) values.push(bestValueGame ?? unranked!);
+      else if (record.attempts > 0) values.push({ ...pointEntry, challengeScore: null, costUsd: null, manual: false, rankingStatus: 'legacy' });
+    }
+    const leaderboard = values.sort((first, second) => (second.challengeScore ?? -1) - (first.challengeScore ?? -1) || achievementOrder(first, second)).slice(0, 50);
+    const pointsLeaderboard = points.sort((first, second) => second.score - first.score || achievementOrder(first, second)).slice(0, 50);
     return {
       code: this.code, online: this.online, capacity: this.capacity, leaderboard, pointsLeaderboard, metrics: totals.metrics,
       joinUrl: this.publicUrl(), model: this.config.deployment, prefixTokens: PREFIX_TOKENS,
